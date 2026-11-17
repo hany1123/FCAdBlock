@@ -1,0 +1,8 @@
+Package: cn.fc.adblock
+Name: FCAdBlock
+Version: 1.0.0
+Architecture: iphoneos-arm64
+Description: Ad blocker for HiveConsumer (Fengchao) 6.48.1. Pure/dynamic two variants.
+Maintainer: hany1123
+Author: hany1123
+Section: Tweaks

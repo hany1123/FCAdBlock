@@ -1,0 +1,100 @@
+# FCAdBlock —— 丰巢 6.48.1 去广告插件
+#   FC-Pure  A 版：零 hook，纯视图扫描（主交付）
+#   FC-Deep  B 版：额外 swizzle 宿主自有广告类（实验对照，仍不碰系统类）
+# 两版都不链接 CydiaSubstrate、install name 改 @rpath、字节级零越狱指纹
+name: 编译丰巢去广告插件
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: 拉取源码
+        uses: actions/checkout@v4
+
+      - name: 安装 Theos / ldid / dpkg
+        run: |
+          brew install ldid dpkg || true
+          git clone --depth 1 --recursive https://github.com/theos/theos.git "$HOME/theos"
+          echo "THEOS=$HOME/theos" >> "$GITHUB_ENV"
+          echo "$HOME/theos/bin" >> "$GITHUB_PATH"
+          mkdir -p "$HOME/theos/lib" out/deb
+
+      - name: 选择 Xcode
+        run: sudo xcode-select -s /Applications/Xcode.app/Contents/Developer || true
+
+      - name: 读取版本号
+        id: ver
+        run: echo "value=$(cat VERSION | tr -d '[:space:]')" >> "$GITHUB_OUTPUT"
+
+      - name: 编译两个变体
+        run: |
+          set -e
+          export THEOS="$HOME/theos"
+          # B 版：额外 swizzle 宿主自有广告类
+          make clean
+          FC_VARIANT=deep make package FINALPACKAGE=1
+          cp .theos/obj/FCAdBlock.dylib out/FC_Deep_raw.dylib
+          # A 版：零 hook（主交付，deb 也用它）
+          make clean
+          make package FINALPACKAGE=1
+          cp .theos/obj/FCAdBlock.dylib out/FC_Pure_raw.dylib
+          cp packages/*.deb out/deb/ 2>/dev/null || true
+
+      - name: 清理指纹并校验
+        run: |
+          set -e
+          V="${{ steps.ver.outputs.value }}"
+          echo "================ 清理 MobileSubstrate install name ================"
+          python3 tools/strip_substrate.py out/FC_Pure_raw.dylib -o "out/FCAdBlock_Pure_v${V}.dylib"
+          python3 tools/strip_substrate.py out/FC_Deep_raw.dylib -o "out/FCAdBlock_Deep_v${V}.dylib"
+          echo "================ 重签 ================"
+          for f in out/FCAdBlock_Pure_v${V}.dylib out/FCAdBlock_Deep_v${V}.dylib; do
+            ldid -S "$f"
+          done
+          echo "================ 依赖复核 ================"
+          for f in out/FCAdBlock_Pure_v${V}.dylib out/FCAdBlock_Deep_v${V}.dylib; do
+            python3 tools/strip_substrate.py "$f" --report
+          done
+          echo "================ 指纹字符串扫描（整文件字节） ================"
+          for f in out/FCAdBlock_Pure_v${V}.dylib out/FCAdBlock_Deep_v${V}.dylib; do
+            echo "== $f =="
+            if LC_ALL=C grep -a -iE 'CydiaSubstrate|MobileSubstrate|DynamicLibraries|MSHook|_logos_|libsubstrate' "$f"; then
+              echo "  ↑ 有命中，构建失败"; exit 1
+            else
+              echo "  (无命中)"
+            fi
+          done
+          echo "================ 零 hook 断言（A 版不得出现 swizzle 符号） ================"
+          if nm -u out/FC_Pure_raw.dylib | grep -qiE 'method_setImplementation|class_replaceMethod|MSHook'; then
+            echo "A 版出现了 hook 符号，构建失败"; exit 1
+          fi
+          echo "A 版确认：无 method_setImplementation / 无 Substrate hook"
+          echo "================ Mach-O 头 ================"
+          python3 - <<'PY'
+          import glob, os, struct
+          for p in sorted(glob.glob('out/FCAdBlock_*.dylib')):
+              with open(p, 'rb') as f:
+                  d = f.read(8)
+              print(p, 'magic=', d[:4].hex(),
+                    'cputype=', hex(struct.unpack('<I', d[4:8])[0]),
+                    'size=', os.path.getsize(p))
+          PY
+
+      - name: 上传 A / 零 hook 版（主交付）
+        uses: actions/upload-artifact@v4
+        with:
+          name: FC-Pure
+          path: out/FCAdBlock_Pure_v*.dylib
+          if-no-files-found: error
+
+      - name: 上传 B / 深度拦截版（实验对照）
+        uses: actions/upload-artifact@v4
+        with:
+          name: FC-Deep
+          path: out/FCAdBlock_Deep_v*.dylib
+          if-no-files-found: error
