@@ -50,18 +50,18 @@ jobs:
           set -e
           V="${{ steps.ver.outputs.value }}"
           echo "================ 清理 MobileSubstrate install name ================"
-          python3 tools/strip_substrate.py out/FC_Pure_raw.dylib -o "out/FCAdBlock_Pure_v${V}.dylib"
-          python3 tools/strip_substrate.py out/FC_Deep_raw.dylib -o "out/FCAdBlock_Deep_v${V}.dylib"
+          python3 tools/strip_substrate.py out/FC_Pure_raw.dylib -o "out/FCAdBlock_Pure_${V}.dylib"
+          python3 tools/strip_substrate.py out/FC_Deep_raw.dylib -o "out/FCAdBlock_Deep_${V}.dylib"
           echo "================ 重签 ================"
-          for f in out/FCAdBlock_Pure_v${V}.dylib out/FCAdBlock_Deep_v${V}.dylib; do
+          for f in out/FCAdBlock_Pure_${V}.dylib out/FCAdBlock_Deep_${V}.dylib; do
             ldid -S "$f"
           done
           echo "================ 依赖复核 ================"
-          for f in out/FCAdBlock_Pure_v${V}.dylib out/FCAdBlock_Deep_v${V}.dylib; do
+          for f in out/FCAdBlock_Pure_${V}.dylib out/FCAdBlock_Deep_${V}.dylib; do
             python3 tools/strip_substrate.py "$f" --report
           done
           echo "================ 指纹字符串扫描（整文件字节） ================"
-          for f in out/FCAdBlock_Pure_v${V}.dylib out/FCAdBlock_Deep_v${V}.dylib; do
+          for f in out/FCAdBlock_Pure_${V}.dylib out/FCAdBlock_Deep_${V}.dylib; do
             echo "== $f =="
             if LC_ALL=C grep -a -iE 'CydiaSubstrate|MobileSubstrate|DynamicLibraries|MSHook|_logos_|libsubstrate' "$f"; then
               echo "  ↑ 有命中，构建失败"; exit 1
