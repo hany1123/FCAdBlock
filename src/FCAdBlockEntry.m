@@ -1,5 +1,18 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v35（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v36（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v36 相对 v35（老大 v35 同页真机：截图+诊断都在首页推荐tab——[源头拦截]secondfloor_10
+//    首次命中，但搜索栏下白块仍在（天猫入口+淘宝秒杀卡片还在）；且诊断[白块候选]报「无」
+//    与截图白块矛盾——诊断判据把自己过滤瞎了）：
+//    【诊断三修·不改任何拦截/压0逻辑，零功能风险】老大选「修诊断再精准打」：
+//    ①放宽 FCAppendBlankContainerDiag：UIScrollView/UICollectionView/UITableView 不再排除、
+//      子树文字阈值 2→8（白块右侧秒杀卡片多文字被挡）、已压0容器也列出并标 originalFrame；
+//    ②新增 FCAppendCoordinateProbe：对白块采样点(x中心,y=200/350/500)遍历全树，
+//      列覆盖它的大容器(面积小→大),类名+frame+压0+alpha+模板名——按坐标抓无文字大容器；
+//    ③新增 FCAppendZeroedList：列所有高度≥100的压0记录 originalFrame→当前frame，
+//      专抓「压0后 DX 重设 frame 回来」撑白块那层。
+//    ④修误导提示：深扫未捕获secondfloor=源头拦截生效(正常)，不再提示进「我的淘宝」页。
+//    例行 __fcadVer 35→36。
 //
 //  v35 相对 v34（老大 v34 真机：second_pit 源头拦截命中+源头压0容器4个，但首页
 //    搜索栏下白块仍在，天猫入口+轮播点还在——被压的4个容器都不含白块主体）：
@@ -339,8 +352,8 @@ static void FCPruneSourceZeros(void);   // v34：源头压0复用自愈
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===35){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=35;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===36){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=36;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -2436,50 +2449,141 @@ static NSUInteger FCCountSubTexts(UIView *v, int depth) {
     return n;
 }
 
-// v35：兜底只读诊断——列出「看起来在撑高度的大空白容器」，用于 v35 仍未消白块时精准定位。
-// 判据：宽≥90%屏、高150~600、屏幕Y在80~700、子树有效文字≤2、非明确系统/业务容器、未被压0。
-// 输出类名+frame+bridge模板名+是否命中拦截，一次截图即可锁定白块真凶，不再靠猜容器层级。
+// v36：兜底只读诊断——列出「看起来在撑高度的大容器」。
+// v36 三处修正（v35 真机误报「无」、但截图白块明摆着的根因）：
+//   ① UIScrollView/UICollectionView/UITableView 不再直接排除，只报告类名由人判断（撑高度常是它们）
+//   ② 子树有效文字阈值 2 → 8（白块右侧挂着秒杀卡片多文字，v35 被这条全挡掉）
+//   ③ 已压0容器也列出并标 originalFrame（v35 直接跳过，看不到被 DX 重设 frame 的容器）
 static void FCAppendBlankContainerDiag(void) {
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
-    CGFloat sh = [UIScreen mainScreen].bounds.size.height;
-    (void)sh;
     NSMutableArray<NSString *> *out = [NSMutableArray array];
-    NSArray *hardExclude = @[@"UIWindow", @"UICollectionView", @"UITableView", @"UITabBar",
-                             @"UINavigationBar", @"UIToolbar", @"UILabel", @"UIImageView",
-                             @"UIButton", @"WKWebView", @"UISwitch", @"UISlider", @"UIScrollView"];
+    // v36：只排除真正的系统 chrome 与叶子控件；滚动/列表容器保留为候选
+    NSArray *hardExclude = @[@"UIWindow", @"UITabBar", @"UINavigationBar", @"UIToolbar",
+                             @"UILabel", @"UIImageView", @"UIButton", @"WKWebView",
+                             @"UISwitch", @"UISlider"];
     for (UIWindow *w in FCAllWindows()) {
         NSString *wc = NSStringFromClass([w class]);
         if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
             [wc isEqualToString:@"FCDiagWindow"]) continue;
         NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
         NSUInteger idx = 0;
-        while (idx < q.count && idx < 1200 && out.count < 12) {
+        while (idx < q.count && idx < 1500 && out.count < 10) {
             UIView *v = q[idx++];
             for (UIView *sub in v.subviews) [q addObject:sub];
-            if (objc_getAssociatedObject(v, &kFCZeroRec)) continue;   // 已压0的不列为候选
             NSString *cls = NSStringFromClass([v class]);
             BOOL excluded = NO;
             for (NSString *e in hardExclude) if ([cls isEqualToString:e]) { excluded = YES; break; }
             if (excluded) continue;
             CGRect r = [v convertRect:v.bounds toView:nil];
-            if (r.size.width < sw * 0.9 || r.size.height < 150 || r.size.height > 600) continue;
-            if (r.origin.y < 80 || r.origin.y > 700) continue;
-            if (FCCountSubTexts(v, 0) > 2) continue;
+            if (r.size.width < sw * 0.75 || r.size.height < 120 || r.size.height > 700) continue;
+            if (r.origin.y < 60 || r.origin.y > 780) continue;
+            NSUInteger txt = FCCountSubTexts(v, 0);
+            if (txt > 8) continue;                       // v36：2 → 8，放宽挂了秒杀卡片的坑位
             NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:v] : nil;
             BOOL blocked = tpl.length ? FCTplIsBlocked(tpl) : NO;
+            FCFlattenRecord *zr = objc_getAssociatedObject(v, &kFCZeroRec);
+            NSString *orig = zr ? [NSString stringWithFormat:@" 原%.0fx%.0f",
+                                   zr.originalFrame.size.width, zr.originalFrame.size.height] : @"";
             [out addObject:[NSString stringWithFormat:
-                @"[白块候选] %@ | %.0f,%.0f %.0fx%.0f | 子view%lu | tpl:%@ | 拦:%@",
+                @"[白块候选] %@ | %.0f,%.0f %.0fx%.0f | 子%lu 文%lu | 压:%@%@ | tpl:%@ 拦:%@",
                 cls, r.origin.x, r.origin.y, r.size.width, r.size.height,
-                (unsigned long)v.subviews.count, tpl.length ? tpl : @"-", blocked ? @"是" : @"否"]];
+                (unsigned long)v.subviews.count, (unsigned long)txt,
+                zr ? @"是" : @"否", orig, tpl.length ? tpl : @"-", blocked ? @"是" : @"否"]];
         }
     }
-    if (!out.count) FCAppendDiagText(@"[白块候选] 无（未发现可疑大空白容器）");
+    if (!out.count) FCAppendDiagText(@"[白块候选] 无（放宽判据后仍未发现大容器）");
+    else FCAppendDiagText(@"[白块候选] 放宽判据后候选:");
     for (NSString *line in out) FCAppendDiagText(line);
+}
+
+// v36：坐标反查——白块区采样点（首页推荐tab，屏幕 y≈140~550）覆盖的所有大容器。
+// 按面积从小到大排：最小的最可能是真正撑高度的内容容器，最大的是页面根容器。
+// 这是「诊断要覆盖问题对象本身不可见」的落地：白块=无文字大容器，按坐标抓比按文字抓可靠。
+static void FCAppendCoordinateProbe(void) {
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    NSArray *pts = @[[NSValue valueWithCGPoint:CGPointMake(sw * 0.5, 200)],
+                     [NSValue valueWithCGPoint:CGPointMake(sw * 0.5, 350)],
+                     [NSValue valueWithCGPoint:CGPointMake(sw * 0.5, 500)]];
+    NSMutableArray<NSDictionary *> *items = [NSMutableArray array];
+    for (UIWindow *w in FCAllWindows()) {
+        NSString *wc = NSStringFromClass([w class]);
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
+            [wc isEqualToString:@"FCDiagWindow"]) continue;
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
+        NSUInteger idx = 0;
+        while (idx < q.count && idx < 1500) {
+            UIView *v = q[idx++];
+            for (UIView *sub in v.subviews) [q addObject:sub];
+            CGRect r = [v convertRect:v.bounds toView:nil];
+            if (r.size.width < sw * 0.5 || r.size.height < 80) continue;
+            BOOL cover = NO;
+            for (NSValue *nv in pts) if (CGRectContainsPoint(r, nv.CGPointValue)) { cover = YES; break; }
+            if (!cover) continue;
+            NSString *cls = NSStringFromClass([v class]);
+            NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:v] : nil;
+            BOOL zeroed = objc_getAssociatedObject(v, &kFCZeroRec) != nil;
+            NSString *line = [NSString stringWithFormat:
+                @"[坐标] %@ | %.0f,%.0f %.0fx%.0f | 压:%@ a%.2f | 子%lu | tpl:%@",
+                cls, r.origin.x, r.origin.y, r.size.width, r.size.height,
+                zeroed ? @"是" : @"否", v.alpha, (unsigned long)v.subviews.count,
+                tpl.length ? tpl : @"-"];
+            [items addObject:@{@"area": @(r.size.width * r.size.height), @"line": line}];
+        }
+    }
+    if (!items.count) {
+        FCAppendDiagText(@"[坐标反查] 采样点无覆盖容器");
+        return;
+    }
+    [items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        return [a[@"area"] compare:b[@"area"]];
+    }];
+    FCAppendDiagText([NSString stringWithFormat:
+        @"[坐标反查] 白块采样点(x中心,y=200/350/500)覆盖大容器 %lu 个(按面积小→大):",
+        (unsigned long)items.count]);
+    NSUInteger lim = items.count > 14 ? 14 : items.count;
+    for (NSUInteger i = 0; i < lim; i++) FCAppendDiagText(items[i][@"line"]);
+}
+
+// v36：已压0容器清单——列出所有高度≥100的压0记录，含原始frame与当前frame。
+// 专抓「压0后 DX 又重设 frame 回来」：originalFrame 是白块区域、当前 frame 却恢复成大尺寸，
+// 就说明每轮重压没压住那层，白块正是它撑的。
+static void FCAppendZeroedList(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFCFlattened) {
+        if (!rec.zeroCollapsed) continue;
+        CGRect orig = rec.originalFrame;
+        if (orig.size.height < 100) continue;
+        UIView *v = rec.view;
+        CGRect now = v ? [v convertRect:v.bounds toView:nil] : CGRectZero;
+        [out addObject:[NSString stringWithFormat:
+            @"[压0清单] %@ | 原%.0f,%.0f %.0fx%.0f → 今 %.0fx%.0f a%.2f | %@",
+            NSStringFromClass([v class]), orig.origin.x, orig.origin.y,
+            orig.size.width, orig.size.height, now.size.width, now.size.height,
+            v ? v.alpha : -1, rec.rule.length ? rec.rule : @"-"]];
+    }
+    for (FCFlattenRecord *rec in (gFCSourceZeroed ?: @[])) {
+        CGRect orig = rec.originalFrame;
+        if (orig.size.height < 100) continue;
+        UIView *v = rec.view;
+        CGRect now = v ? [v convertRect:v.bounds toView:nil] : CGRectZero;
+        [out addObject:[NSString stringWithFormat:
+            @"[压0清单·源] %@ | 原%.0f,%.0f %.0fx%.0f → 今 %.0fx%.0f a%.2f | %@",
+            NSStringFromClass([v class]), orig.origin.x, orig.origin.y,
+            orig.size.width, orig.size.height, now.size.width, now.size.height,
+            v ? v.alpha : -1, rec.rule.length ? rec.rule : @"-"]];
+    }
+    if (!out.count) FCAppendDiagText(@"[压0清单] 无高度≥100的压0记录");
+    else {
+        FCAppendDiagText([NSString stringWithFormat:@"[压0清单] 高度≥100的压0记录 %lu 条:",
+                          (unsigned long)out.count]);
+        NSUInteger lim = out.count > 12 ? 12 : out.count;
+        for (NSUInteger i = 0; i < lim; i++) FCAppendDiagText(out[i]);
+    }
 }
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v35 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v36 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2490,7 +2594,9 @@ static void FCFillDiagnose(void) {
     NSUInteger srcZero = gFCSourceZeroed ? gFCSourceZeroed.count : 0;
     FCAppendDiagText([NSString stringWithFormat:@"[压0] 当前压平 %lu 个窗口 / 源头压0容器 %lu / 累计重压 %lu 次（原生视图层，非删节点）",
         (unsigned long)zeroNow, (unsigned long)srcZero, (unsigned long)gFCZeroApplied]);
-    FCAppendBlankContainerDiag();     // v35：白块候选容器只读诊断——下次若白块还在，一段就能定位撑高度的是谁
+    FCAppendBlankContainerDiag();     // v35/v36：白块候选容器（v36 放宽判据）
+    FCAppendCoordinateProbe();        // v36：白块坐标反查——按采样点抓覆盖它的大容器(面积小→大)
+    FCAppendZeroedList();             // v36：已压0容器清单——抓「压0后DX重设frame回来」撑白块的那层
     // v22：逐条打印规则真实内容 + 类型——老大一眼看清点选到底存了文字还是 cls:/pos: 指纹
     for (NSUInteger i = 0; i < diagUserRules.count; i++) {
         NSString *rule = diagUserRules[i];
@@ -2616,7 +2722,7 @@ static void FCFillDiagnose(void) {
     if (gFCProbeDeep.count) {
         for (NSString *line in gFCProbeDeep) FCAppendDiagText([@"[深扫] " stringByAppendingString:line]);
     } else {
-        FCAppendDiagText(@"[深扫] 未扫描到 secondfloor 数据——请进「我的淘宝」页停留几秒再诊断");
+        FCAppendDiagText(@"[深扫] 未捕获 secondfloor 数据——若日志有[源头拦截]secondfloor=已掐断(正常)，否则请留在首页推荐tab几秒再诊断");
     }
 #else
     FCAppendDiagText(@"----- 源头参数取证：仅 Deep 档提供（当前 Pure 档零 hook）-----");
@@ -2942,7 +3048,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv35 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv36 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -2955,7 +3061,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv35 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv36 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2966,7 +3072,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v35"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v36"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3239,7 +3345,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v35 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v36 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
