@@ -1,5 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v26（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v27（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v27 相对 v26（老大真机诊断：命中:✓的「领券中心」「待使用」仍可见）：
+//    【停止盲改，转源头取证】v24/v25/v26 连续三版在 Pure 视图层猜「删哪层容器」均无效，
+//    诊断「命中✓仍可见」证明删掉的 DX 节点被引擎下一帧重绘恢复，视图层已到天花板。
+//    静态分析确认 DXCardModel 是 Swift 类(_TtC23TurboUIBuilderFramework11DXCardModel)，
+//    常规 ObjC method swizzle 够不着；ObjC 侧 DXBaseDataParser/DXRootView 虽存在，但没有
+//    真机方法名就无法写精准 hook。故 v27 只加「只读运行时取证」，不动任何隐藏逻辑：
+//    ①objc_copyClassList 扫全部类，列出真实 DX/TurboUI 类名（从真机反推前缀，不猜）；
+//    ②对 DXRootView/DXBaseDataParser/DXImageView/DXTextView 等关键类，列自身+两层父类
+//      的 selector 清单，定位 data/model/bind/render 入口，供 Deep 档源头拦截；
+//    ③诊断面板输出 [DX类表]/[DX方法]，精简复制同步保留。纯只读，A/B 两档均不 hook。
 //
 //  v26 相对 v25（老大真机诊断决定性证据：命中:✓的元素仍可见、留白框还在）：
 //    【纠正方向】v25「猜外层卡片整块删」是错的——诊断显示命中✓元素仍在树里可见，
@@ -228,8 +239,8 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===26){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=26;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===27){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=27;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1811,10 +1822,24 @@ static NSString *FCDiagBriefString(void) {
     NSString *full = gFCDiagText.text ?: @"";
     NSMutableString *brief = [NSMutableString string];
     NSUInteger kept = 0;
+    // v27：DX 源头取证是定位淘宝运营位的唯一新证据，先无条件收进精简版，
+    // 避免被前面大段日志（如 40 条网络请求）挤到行数上限之外。
+    for (NSString *line in [full componentsSeparatedByString:@"\n"]) {
+        if ([line hasPrefix:@"----- DX 动态化源头取证"] ||
+            [line hasPrefix:@"[DX类表]"] || [line hasPrefix:@"[DX类]"] ||
+            [line hasPrefix:@"[DX方法]"]) {
+            [brief appendFormat:@"%@\n", line];
+            kept++;
+        }
+    }
     // 每种引擎保留少量代表行，让用户从精简版也能看清页面由哪些板块技术构成
     NSMutableDictionary<NSString *, NSNumber *> *engineQuota = [NSMutableDictionary dictionary];
     const NSUInteger kPerEngine = 3;
     for (NSString *line in [full componentsSeparatedByString:@"\n"]) {
+        // v27：DX 行已在开头收录，主循环跳过避免重复占用行数
+        if ([line hasPrefix:@"----- DX 动态化源头取证"] ||
+            [line hasPrefix:@"[DX类表]"] || [line hasPrefix:@"[DX类]"] ||
+            [line hasPrefix:@"[DX方法]"]) continue;
         BOOL keep = NO;
         if ([line hasPrefix:@"====="] || [line hasPrefix:@"顶层VC"] ||
             [line hasPrefix:@"用户规则"] || [line hasPrefix:@"  规则"] ||
@@ -1836,7 +1861,7 @@ static NSString *FCDiagBriefString(void) {
         }
         if (keep) {
             [brief appendFormat:@"%@\n", line];
-            if (++kept >= 45) { [brief appendString:@"[精简已达45行上限]\n"]; break; }
+            if (++kept >= 65) { [brief appendString:@"[精简已达65行上限]\n"]; break; }
         }
     }
     return brief.length ? brief : full;
@@ -1923,9 +1948,70 @@ static UIViewController *FCHostTopVC(void) {
     return nil;
 }
 
+// v27：DX 动态化源头取证（纯只读，不 hook、不改任何运行时行为）。
+// 淘宝运营位诊断「命中✓仍可见」= DX 引擎重绘恢复，Pure 视图层删除已到天花板；静态二进制
+// 看不到 Swift/ObjC 方法名，必须运行时取证才能定位源头拦截点，不能继续猜容器层级。
+static void FCAppendDXMethodProbe(void) {
+    // ①扫全部已注册类，反推真机上 DX/动态化的真实类名（从证据反推前缀，不猜）
+    unsigned int nc = 0;
+    Class *all = objc_copyClassList(&nc);
+    NSMutableArray<NSString *> *dxClasses = [NSMutableArray array];
+    if (all) {
+        for (unsigned int i = 0; i < nc; i++) {
+            const char *raw = class_getName(all[i]);
+            if (!raw) continue;
+            NSString *cn = [NSString stringWithUTF8String:raw];
+            if (cn.length < 2) continue;
+            if ([cn hasPrefix:@"DX"] || [cn rangeOfString:@"TurboUI"].location != NSNotFound ||
+                [cn rangeOfString:@"Weex"].location != NSNotFound) {
+                if (![dxClasses containsObject:cn] && dxClasses.count < 40) [dxClasses addObject:cn];
+            }
+        }
+        free(all);                                  // objc_copyClassList 返回 malloc 数组必须 free
+    }
+    FCAppendDiagText([NSString stringWithFormat:@"[DX类表] 扫到 %lu 个 DX/动态化类:",
+                      (unsigned long)dxClasses.count]);
+    for (NSUInteger i = 0; i < dxClasses.count; i += 4) {
+        NSUInteger e = MIN(i + 4, dxClasses.count);
+        NSMutableArray *chunk = [NSMutableArray array];
+        for (NSUInteger j = i; j < e; j++) [chunk addObject:dxClasses[j]];
+        FCAppendDiagText([@"[DX类] " stringByAppendingString:[chunk componentsJoinedByString:@","]]);
+    }
+
+    // ②关键类方法清单：自身 + 两层父类 selector，定位 data/bind/render 源头入口
+    NSArray<NSString *> *keys = @[
+        @"DXRootView", @"DXRootViewWrapperView", @"DXBaseDataParser",
+        @"DXImageView", @"DXTextView", @"DXScrollerLayoutCell",
+        @"DXCardModel", @"_TtC23TurboUIBuilderFramework11DXCardModel"
+    ];
+    for (NSString *name in keys) {
+        Class c = NSClassFromString(name);
+        if (!c) {
+            FCAppendDiagText([NSString stringWithFormat:@"[DX方法] %@: 类不存在", name]);
+            continue;
+        }
+        NSMutableArray<NSString *> *sels = [NSMutableArray array];
+        Class cur = c;
+        int depth = 0;
+        while (cur && depth++ < 3 && sels.count < 45) {
+            unsigned int n = 0;
+            Method *list = class_copyMethodList(cur, &n);
+            for (unsigned int i = 0; i < n && sels.count < 45; i++) {
+                NSString *sn = NSStringFromSelector(method_getName(list[i]));
+                if (!sn.length) continue;
+                [sels addObject:([cur isEqual:c] ? sn : [sn stringByAppendingString:@"(父)"])];
+            }
+            if (list) free(list);                   // class_copyMethodList 的 Method* 也要 free
+            cur = class_getSuperclass(cur);
+        }
+        FCAppendDiagText([NSString stringWithFormat:@"[DX方法] %@(%lu): %@",
+            name, (unsigned long)sels.count, [sels componentsJoinedByString:@","]]);
+    }
+}
+
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v26 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v27 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2029,6 +2115,9 @@ static void FCFillDiagnose(void) {
     } else if (gFCNetLogOn) {
         FCAppendDiagText(@"[请求] 暂未捕获——开启后请操作 App 几秒再诊断");
     }
+    // v27：DX 源头取证——只读列类表/方法名，供 Deep 档精准 hook 定位（不改隐藏逻辑）
+    FCAppendDiagText(@"----- DX 动态化源头取证（只读）-----");
+    FCAppendDXMethodProbe();
     FCAppendDiagText(@"===== 诊断结束（点顶部「复制精简」粘贴发我，无需截图）=====");
 }
 
@@ -2348,7 +2437,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv26 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv27 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2361,7 +2450,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv26 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv27 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2372,7 +2461,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v26"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v27"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2460,7 +2549,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v26 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v27 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
