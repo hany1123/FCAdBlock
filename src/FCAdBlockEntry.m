@@ -320,6 +320,7 @@ static void FCAppendDiagText(NSString *s);
 static UIView *FCCardShellForHide(UIView *hit);   // v25：隐藏时找整块卡片外壳
 static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  // v26：空壳父容器清理
 static void FCZeroSourceRoot(UIView *root, NSString *tpl);   // v34：源头模板压0
+static void FCZeroSourceRootIfBlocked(UIView *v);            // v34：扫描阶段判定+压0
 static void FCPruneSourceZeros(void);   // v34：源头压0复用自愈
 
 #pragma mark - H5 脚本模板
@@ -1218,12 +1219,8 @@ static void FCApplyNativeRules(void) {
             if (v.tag == 9527 || v.tag == 9528) continue;
             NSString *vcls = NSStringFromClass([v class]);
             // v34：源头模板压0——hook 触发时容器可能还没布局，故在扫描阶段「有尺寸、在树里」时补压。
-            // bridge 映射由 setTemplateItem:/setData: 的 hook 建立；只对命中 tpl:/内置身份模板的根容器下手。
-            // FCZeroSourceRoot 内部幂等，已压的会直接返回。用 CLASS 判定避免误伤普通 UIView。
-            if ([v isKindOfClass:NSClassFromString(@"DXRootView")]) {
-                NSString *btpl = gFCTplBridge ? [gFCTplBridge objectForKey:v] : nil;
-                if (btpl.length && FCTplIsBlocked(btpl)) FCZeroSourceRoot(v, btpl);
-            }
+            // 判定逻辑封装在 FCZeroSourceRootIfBlocked（定义在 bridge/tpl 判定之后），内部幂等。
+            if ([v isKindOfClass:NSClassFromString(@"DXRootView")]) FCZeroSourceRootIfBlocked(v);
             // v32：已被本插件压0的元素——每轮重新压制已由 FCReapplyAllZeroFrames 统一处理，
             // 这里直接跳过命中判定，避免 alpha=0/frame=0 的元素反复计数或误判，但仍下钻子视图。
             if (objc_getAssociatedObject(v, &kFCZeroRec)) {
@@ -1687,6 +1684,13 @@ static void FCZeroSourceRoot(UIView *root, NSString *tpl) {
     FCForceZeroFrame(root);
     gFCZeroApplied++;
     FCLog(@"源头压0容器: %@ %.0fx%.0f", tpl, r.size.width, r.size.height);
+}
+
+// v34：扫描阶段——从 bridge 取该 DXRootView 的模板名，命中 tpl:/内置身份模板就压0容器。
+// 放在这里确保 gFCTplBridge / FCTplIsBlocked 已定义，避免隐式声明。
+static void FCZeroSourceRootIfBlocked(UIView *v) {
+    NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:v] : nil;
+    if (tpl.length && FCTplIsBlocked(tpl)) FCZeroSourceRoot(v, tpl);
 }
 
 // v34：每轮开头清理失效的源头压0——容器离树、或 bridge 模板已不命中（复用渲染正常卡片）→还原。
