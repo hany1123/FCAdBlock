@@ -1,5 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v30（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v31（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v31 相对 v30（老大 v30 真机——源头拦截验证成功+发现点选误判 bug）：
+//    【成功证据】内置命中5、日志出现两条 [源头拦截]（88_campaign/campaign_bottom_bar），
+//    hook 数据入口链路通；超级88数据被拦后剩模板空壳（留白）。
+//    【点选 bug】老大点「3张177元消费券」报「这是输入控件」——运营条按钮正是系统
+//    UITextField/UITextView，v21 加的精确输入拦截挡住了广告点选。改为只拦键盘私有容器
+//    (UIInputSet/UIKeyboard)，放行普通输入控件。
+//    【深扫定案】添加 FCProbeDeepWalk 递归8层，对 secondfloor 数据把命中广告文案的
+//    完整 key 路径打进诊断——判定文案在不在数据里：在→下版做 item 级精准删（不碰我的订单）；
+//    不在→文案写在远程模板zip，只能视图层/源头模板拦。诊断新增「secondfloor 文案深扫」段。
+//    例行 __fcadVer 30→31。
 //
 //  v30 相对 v29（老大 v29 诊断：Deep 档对了，但规则仍 10 条旧文字——没重新点选，
 //  且发现两个真 bug 让点选即使做了也可能白费）：
@@ -278,8 +289,8 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===30){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=30;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===31){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=31;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1505,12 +1516,15 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // DXTextView 内部可能继承 UITextField 渲染文字，isKindOfClass 把它们误判成输入框。
     // 改为：只有类名「精确等于」系统 UITextField/UITextView 或含点号的系统输入私有类才算
     // 输入控件；宿主自定义子类（DX* / 点号模块名）一律当业务 view，允许点选。
-    BOOL exactSystemInput = [hitCls isEqualToString:@"UITextField"] ||
-                            [hitCls isEqualToString:@"UITextView"] ||
-                            [hitCls hasPrefix:@"UIInputSet"] || [hitCls hasPrefix:@"_UIInputSet"] ||
-                            [hitCls hasPrefix:@"UIKeyboard"] || [hitCls hasPrefix:@"_UIKeyboard"];
-    if (exactSystemInput) {
-        FCShowBadgeMsg(@"这是输入控件,请点广告内容区");
+    // v31：只拦「键盘/输入容器」私有类，放行普通 UITextField/UITextView——
+    // 真机证据：淘宝运营条（3张177元消费券/领券中心）里的按钮与文字正是系统 UITextField/
+    // UITextView 渲染的，v21~v30 精确拦它们导致老大点广告一直报「这是输入控件」选不中。
+    // 键盘容器不会是广告内容，仍拦；普通输入控件在点选模式下当普通业务 view 处理。
+    BOOL keyboardChrome = [hitCls hasPrefix:@"UIInputSet"] || [hitCls hasPrefix:@"_UIInputSet"] ||
+                          [hitCls hasPrefix:@"UIKeyboard"] || [hitCls hasPrefix:@"_UIKeyboard"] ||
+                          [hitCls rangeOfString:@"Keyboard"].location != NSNotFound;
+    if (keyboardChrome) {
+        FCShowBadgeMsg([NSString stringWithFormat:@"是键盘容器(%@),请点广告内容区", hitCls]);
         return;
     }
     UIView *card = FCCardContainerFrom(hit);
@@ -2188,12 +2202,13 @@ static void FCAppendDXMethodProbe(void) {
 #ifdef FC_DEEP_HOOKS
 static NSMutableArray<NSString *> *gFCProbeLog = nil;
 static NSMutableArray<NSString *> *gFCProbeHits = nil;
+static NSMutableArray<NSString *> *gFCProbeDeep = nil;   // v31：secondfloor 深层文案路径取证
 static NSUInteger gFCProbeDropped = 0;
 #endif
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v30 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v31 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2318,6 +2333,13 @@ static void FCFillDiagnose(void) {
     if (gFCProbeDropped)
         FCAppendDiagText([NSString stringWithFormat:@"[取证] 另有 %lu 条重复/超限未记",
                           (unsigned long)gFCProbeDropped]);
+    // v31：secondfloor 深层文案路径——判定广告文案能否在数据层精准删除
+    FCAppendDiagText(@"----- secondfloor 文案深扫（判定item级过滤）-----");
+    if (gFCProbeDeep.count) {
+        for (NSString *line in gFCProbeDeep) FCAppendDiagText([@"[深扫] " stringByAppendingString:line]);
+    } else {
+        FCAppendDiagText(@"[深扫] 未扫描到 secondfloor 数据——请进「我的淘宝」页停留几秒再诊断");
+    }
 #else
     FCAppendDiagText(@"----- 源头参数取证：仅 Deep 档提供（当前 Pure 档零 hook）-----");
 #endif
@@ -2640,7 +2662,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv30 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv31 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2653,7 +2675,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv30 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv31 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2664,7 +2686,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v30"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v31"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2777,6 +2799,33 @@ static NSString *FCProbeDesc(id obj, int depth, NSString *path) {
     return [NSString stringWithFormat:@"<%p %@:%@>", obj, NSStringFromClass([obj class]), ds];
 }
 
+// v31：深层文案路径取证——递归到第8层，把命中用户广告规则的字符串连同完整 key 路径
+// 打出来。目的：判断「领券中心/待使用/消费券」文案在不在 setData 数据里；在→可做 item 级
+// 精准删除（只删那张券不碰我的订单），不在→文案写死在远程模板 zip 里，只能视图层处理。
+static void FCProbeDeepWalk(id obj, int depth, NSString *path, NSMutableArray *out, NSUInteger *count) {
+    if (!obj || *count >= 24 || depth > 8) return;
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        if (s.length < 2 || s.length > 120) return;
+        NSString *flag = FCProbeFlagOf(s);
+        if (!flag) return;
+        [out addObject:[NSString stringWithFormat:@"%@ = \"%@\"  <<命中:%@",
+                        path, s.length > 40 ? [s substringToIndex:40] : s, flag]];
+        (*count)++;
+    } else if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)obj;
+        for (NSUInteger i = 0; i < a.count && *count < 24; i++)
+            FCProbeDeepWalk(a[i], depth+1, [path stringByAppendingFormat:@"[%lu]", (unsigned long)i], out, count);
+    } else if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        for (id key in d) {
+            if (*count >= 24) break;
+            NSString *ks = [[key description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+            FCProbeDeepWalk(d[key], depth+1, [path stringByAppendingFormat:@".%@", ks], out, count);
+        }
+    }
+}
+
 static void FCProbeRecord(NSString *tag, id value) {
     NSString *info = [FCProbeDesc(value, 0, @"data") stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
     if (info.length > 240) info = [info substringToIndex:240];
@@ -2810,6 +2859,7 @@ static Method FCOwnMethod(Class c, NSString *name) {
 static IMP gFCOrigSetData = nil;
 static IMP gFCOrigSetTemplate = nil;
 static IMP gFCOrigSetViewModel = nil;
+static BOOL gFCDeepScanned = NO;   // v31：secondfloor 深扫只做一次，避免刷屏
 
 static void FCHookSetData(id self, SEL _cmd, id data) {
     // v29：源头拦截——模板名命中 tpl: 规则就不把数据喂给 DX 引擎，卡片无从渲染/重绘。
@@ -2821,6 +2871,14 @@ static void FCHookSetData(id self, SEL _cmd, id data) {
         FCProbeRecord(@"源头拦截", tpl);
         FCLog(@"源头拦截模板: %@", tpl);
         return;
+    }
+    // v31：secondfloor 深扫一次——把广告文案的完整 key 路径打出来，判定能否 item 级精准删
+    if (!gFCDeepScanned && tpl && [tpl rangeOfString:@"secondfloor"].location != NSNotFound) {
+        gFCDeepScanned = YES;
+        NSMutableArray *deep = [NSMutableArray array];
+        NSUInteger cnt = 0;
+        @try { FCProbeDeepWalk(data, 0, tpl, deep, &cnt); } @catch (NSException *e) { }
+        gFCProbeDeep = deep.count ? deep : [NSMutableArray arrayWithObject:@"(数据里未找到广告文案——文案写在远程模板zip,需视图层处理)"];
     }
     @try { FCProbeRecord(@"DXRootView.setData", data); } @catch (NSException *e) { }
     if (gFCOrigSetData) ((void (*)(id, SEL, id))gFCOrigSetData)(self, _cmd, data);
@@ -2882,7 +2940,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v30 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v31 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
