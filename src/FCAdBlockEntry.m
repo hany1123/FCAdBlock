@@ -1,5 +1,17 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v27（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v28（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v28 相对 v27（老大回传 v27 真机 DX 类表/方法名——取证成功）：
+//    【拿到的证据】DXRootView 确有 setData:/setTemplateItem: 数据入口；Swift 类
+//    _TtC23TurboUIBuilderFramework11DXCardModel 真机存在但自身仅 init/.cxx_destruct，
+//    业务方法不暴露 ObjC 运行时 → 印证 swizzle 够不着，静态判断被真机证实。
+//    【仍缺一环】不知道 setData: 传进来的数据形态，无法判断广告文案在不在数据里；
+//    猜着写过滤会清空整页数据（黑屏）。故 v28 只在 Deep 档加「源头参数取证」hook：
+//    ①hook DXRootView setData:/setTemplateItem: 与 DXScrollerLayoutCell setViewModel:，
+//      只旁听参数、先记后调原 IMP，不改返回值与调用顺序；
+//    ②递归摘要(深度≤3/层6键3元素/单条单行≤700字)+去重40条上限，防日志爆炸；
+//    ③扫描用户文字规则，命中即打【命中广告:xxx】——一眼判定源头可否精准过滤。
+//    Pure 档保持零 hook 不变；诊断面板输出取证段，精简复制优先收录。
 //
 //  v27 相对 v26（老大真机诊断：命中:✓的「领券中心」「待使用」仍可见）：
 //    【停止盲改，转源头取证】v24/v25/v26 连续三版在 Pure 视图层猜「删哪层容器」均无效，
@@ -239,8 +251,8 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===27){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=27;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===28){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=28;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1827,7 +1839,10 @@ static NSString *FCDiagBriefString(void) {
     for (NSString *line in [full componentsSeparatedByString:@"\n"]) {
         if ([line hasPrefix:@"----- DX 动态化源头取证"] ||
             [line hasPrefix:@"[DX类表]"] || [line hasPrefix:@"[DX类]"] ||
-            [line hasPrefix:@"[DX方法]"]) {
+            [line hasPrefix:@"[DX方法]"] ||
+            [line hasPrefix:@"----- 源头参数取证"] || [line hasPrefix:@"[取证]"] ||
+            [line hasPrefix:@"[DXRootView.setData]"] || [line hasPrefix:@"[DXRootView.setTemplateItem]"] ||
+            [line hasPrefix:@"[DXScrollerLayoutCell.setViewModel]"]) {
             [brief appendFormat:@"%@\n", line];
             kept++;
         }
@@ -1839,7 +1854,10 @@ static NSString *FCDiagBriefString(void) {
         // v27：DX 行已在开头收录，主循环跳过避免重复占用行数
         if ([line hasPrefix:@"----- DX 动态化源头取证"] ||
             [line hasPrefix:@"[DX类表]"] || [line hasPrefix:@"[DX类]"] ||
-            [line hasPrefix:@"[DX方法]"]) continue;
+            [line hasPrefix:@"[DX方法]"] ||
+            [line hasPrefix:@"----- 源头参数取证"] || [line hasPrefix:@"[取证]"] ||
+            [line hasPrefix:@"[DXRootView.setData]"] || [line hasPrefix:@"[DXRootView.setTemplateItem]"] ||
+            [line hasPrefix:@"[DXScrollerLayoutCell.setViewModel]"]) continue;
         BOOL keep = NO;
         if ([line hasPrefix:@"====="] || [line hasPrefix:@"顶层VC"] ||
             [line hasPrefix:@"用户规则"] || [line hasPrefix:@"  规则"] ||
@@ -1861,7 +1879,7 @@ static NSString *FCDiagBriefString(void) {
         }
         if (keep) {
             [brief appendFormat:@"%@\n", line];
-            if (++kept >= 65) { [brief appendString:@"[精简已达65行上限]\n"]; break; }
+            if (++kept >= 70) { [brief appendString:@"[精简已达70行上限]\n"]; break; }
         }
     }
     return brief.length ? brief : full;
@@ -2009,9 +2027,16 @@ static void FCAppendDXMethodProbe(void) {
     }
 }
 
+// v28：源头参数取证日志——Deep 档 hook 写入、诊断面板读取，提前定义避免前向引用
+#ifdef FC_DEEP_HOOKS
+static NSMutableArray<NSString *> *gFCProbeLog = nil;
+static NSMutableArray<NSString *> *gFCProbeHits = nil;
+static NSUInteger gFCProbeDropped = 0;
+#endif
+
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v27 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v28 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2118,6 +2143,27 @@ static void FCFillDiagnose(void) {
     // v27：DX 源头取证——只读列类表/方法名，供 Deep 档精准 hook 定位（不改隐藏逻辑）
     FCAppendDiagText(@"----- DX 动态化源头取证（只读）-----");
     FCAppendDXMethodProbe();
+#ifdef FC_DEEP_HOOKS
+    // v28：源头参数取证——确认广告文案到底在不在 DX 数据里（只旁听，不改行为）
+    FCAppendDiagText(@"----- 源头参数取证（Deep档·只读）-----");
+    if (gFCProbeHits.count) {
+        FCAppendDiagText([NSString stringWithFormat:@"[取证] ★命中广告数据 %lu 条:",
+                          (unsigned long)gFCProbeHits.count]);
+        for (NSString *line in gFCProbeHits) FCAppendDiagText(line);
+    }
+    if (gFCProbeLog.count) {
+        FCAppendDiagText([NSString stringWithFormat:@"[取证] 普通参数 %lu 条:",
+                          (unsigned long)gFCProbeLog.count]);
+        for (NSString *line in gFCProbeLog) FCAppendDiagText(line);
+    }
+    if (!gFCProbeHits.count && !gFCProbeLog.count)
+        FCAppendDiagText(@"[取证] 未捕获——请打开有广告的页面停留几秒再诊断");
+    if (gFCProbeDropped)
+        FCAppendDiagText([NSString stringWithFormat:@"[取证] 另有 %lu 条重复/超限未记",
+                          (unsigned long)gFCProbeDropped]);
+#else
+    FCAppendDiagText(@"----- 源头参数取证：仅 Deep 档提供（当前 Pure 档零 hook）-----");
+#endif
     FCAppendDiagText(@"===== 诊断结束（点顶部「复制精简」粘贴发我，无需截图）=====");
 }
 
@@ -2437,7 +2483,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv27 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv28 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2450,7 +2496,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv27 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv28 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2461,7 +2507,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v27"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v28"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2521,6 +2567,122 @@ static void FCSwizzleOwnMethods(NSString *clsName, NSArray<NSString *> *sels) {
     }
 }
 
+// v28：源头参数取证 hook（仅 Deep 档）——只旁听参数、不改任何行为。
+// 真机证据：DXRootView setData:/setTemplateItem: 是数据入口；Swift DXCardModel 业务方法
+// 不暴露 ObjC，源头过滤只能盯这几个 ObjC 方法。先记后调原 IMP，不改返回值/调用顺序。
+static NSMutableSet<NSString *> *gFCProbeSeen = nil;
+
+// 只认用户点选的「文字规则」(≥3字)做命中，cls:/pos:/sel:/img: 指纹与短词不参与，防误报
+static NSString *FCProbeFlagOf(NSString *s) {
+    if (s.length < 3 || s.length > 200) return nil;
+    for (NSString *r in FCUserRules()) {
+        if ([r hasPrefix:@"cls:"] || [r hasPrefix:@"pos:"] ||
+            [r hasPrefix:@"sel:"] || [r hasPrefix:@"img:"] || r.length < 3) continue;
+        if ([s rangeOfString:r].location != NSNotFound) return r;
+    }
+    return nil;
+}
+
+// 递归摘要：深度≤2、每层≤4键/2元素、单条单行≤240字；遇命中文案打标记
+static NSString *FCProbeDesc(id obj, int depth, NSString *path) {
+    if (!obj) return @"(nil)";
+    if (depth > 2) return @"…";
+    if ([obj isKindOfClass:[NSString class]]) {
+        NSString *s = (NSString *)obj;
+        NSString *flag = FCProbeFlagOf(s);
+        return flag ? [NSString stringWithFormat:@"\"%@\"<<<【命中广告:%@】", s, flag]
+                    : (s.length <= 120 ? [NSString stringWithFormat:@"\"%@\"", s]
+                                       : [NSString stringWithFormat:@"<文本%lu字>", (unsigned long)s.length]);
+    }
+    if ([obj isKindOfClass:[NSNumber class]]) return [obj description];
+    if ([obj isKindOfClass:[NSArray class]]) {
+        NSArray *a = (NSArray *)obj;
+        NSMutableString *m = [NSMutableString stringWithFormat:@"数组(%lu)", (unsigned long)a.count];
+        for (NSUInteger i = 0; i < MIN(a.count, 2); i++)
+            [m appendFormat:@" %@[%lu]=%@", path, (unsigned long)i,
+             FCProbeDesc(a[i], depth+1, [path stringByAppendingFormat:@"[%lu]", (unsigned long)i])];
+        return m;
+    }
+    if ([obj isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *d = (NSDictionary *)obj;
+        NSMutableString *m = [NSMutableString stringWithFormat:@"字典(%lu键)", (unsigned long)d.count];
+        NSUInteger k = 0;
+        for (id key in d) {
+            if (k++ >= 4) break;
+            NSString *ks = [[key description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+            [m appendFormat:@" %@.%@=%@", path, ks,
+             FCProbeDesc(d[key], depth+1, [path stringByAppendingFormat:@".%@", ks])];
+        }
+        return m;
+    }
+    NSString *ds = [[obj description] stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    if (ds.length > 80) ds = [ds substringToIndex:80];
+    return [NSString stringWithFormat:@"<%p %@:%@>", obj, NSStringFromClass([obj class]), ds];
+}
+
+static void FCProbeRecord(NSString *tag, id value) {
+    NSString *info = [FCProbeDesc(value, 0, @"data") stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+    if (info.length > 240) info = [info substringToIndex:240];
+    if (!gFCProbeSeen) gFCProbeSeen = [NSMutableSet set];
+    if (gFCProbeSeen.count > 500) return;                 // 去重表上限，防长会话内存膨胀
+    NSString *key = [tag stringByAppendingString:info];
+    if ([gFCProbeSeen containsObject:key]) return;
+    [gFCProbeSeen addObject:key];
+    NSString *line = [NSString stringWithFormat:@"[%@] %@", tag, info];
+    BOOL hit = [info rangeOfString:@"【命中广告:"].location != NSNotFound;
+    NSMutableArray *bucket = hit ? gFCProbeHits : gFCProbeLog;
+    NSUInteger cap = hit ? 10 : 12;
+    if (!bucket) {
+        if (hit) gFCProbeHits = [NSMutableArray array]; else gFCProbeLog = [NSMutableArray array];
+        bucket = hit ? gFCProbeHits : gFCProbeLog;
+    }
+    if (bucket.count < cap) [bucket addObject:line]; else gFCProbeDropped++;
+}
+
+// 只 hook 类「自身实现」的方法，避免 class_getInstanceMethod 命中父类后误改父类实现
+static Method FCOwnMethod(Class c, NSString *name) {
+    SEL s = NSSelectorFromString(name);
+    unsigned int n = 0; Method *list = class_copyMethodList(c, &n);
+    Method found = nil;
+    for (unsigned int i = 0; i < n; i++)
+        if (method_getName(list[i]) == s) { found = list[i]; break; }
+    if (list) free(list);
+    return found;
+}
+
+static IMP gFCOrigSetData = nil;
+static IMP gFCOrigSetTemplate = nil;
+static IMP gFCOrigSetViewModel = nil;
+
+static void FCHookSetData(id self, SEL _cmd, id data) {
+    @try { FCProbeRecord(@"DXRootView.setData", data); } @catch (NSException *e) { }
+    if (gFCOrigSetData) ((void (*)(id, SEL, id))gFCOrigSetData)(self, _cmd, data);
+}
+static void FCHookSetTemplate(id self, SEL _cmd, id tpl) {
+    @try { FCProbeRecord(@"DXRootView.setTemplateItem", tpl); } @catch (NSException *e) { }
+    if (gFCOrigSetTemplate) ((void (*)(id, SEL, id))gFCOrigSetTemplate)(self, _cmd, tpl);
+}
+static void FCHookSetViewModel(id self, SEL _cmd, id vm) {
+    @try { FCProbeRecord(@"DXScrollerLayoutCell.setViewModel", vm); } @catch (NSException *e) { }
+    if (gFCOrigSetViewModel) ((void (*)(id, SEL, id))gFCOrigSetViewModel)(self, _cmd, vm);
+}
+
+static void FCInstallProbeHooks(void) {
+    Class root = NSClassFromString(@"DXRootView");
+    if (root) {
+        Method m = FCOwnMethod(root, @"setData:");
+        if (m) { gFCOrigSetData = method_getImplementation(m); method_setImplementation(m, (IMP)FCHookSetData); }
+        Method t = FCOwnMethod(root, @"setTemplateItem:");
+        if (t) { gFCOrigSetTemplate = method_getImplementation(t); method_setImplementation(t, (IMP)FCHookSetTemplate); }
+    }
+    Class cell = NSClassFromString(@"DXScrollerLayoutCell");
+    if (cell) {
+        Method m = FCOwnMethod(cell, @"setViewModel:");
+        if (m) { gFCOrigSetViewModel = method_getImplementation(m); method_setImplementation(m, (IMP)FCHookSetViewModel); }
+    }
+    FCLog(@"v28 源头取证钩子 root=%d cell=%d", root != nil, cell != nil);
+}
+
 static void FCInstallDeepHooks(void) {
     NSArray *table = @[
         @[@"FCSplashADSManager", @[@"show",@"start",@"requestSplashAd",@"loadSplashAd",@"showSplashAd"]],
@@ -2541,6 +2703,7 @@ static void FCInstallDeepHooks(void) {
         @[@"AKTsAlimamaAdAbility",        @[@"show",@"load",@"request"]],
     ];
     for (NSArray *row in table) FCSwizzleOwnMethods(row[0], row[1]);
+    FCInstallProbeHooks();   // v28：源头参数取证（只旁听、不改行为）
 }
 #endif
 
@@ -2549,7 +2712,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v27 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v28 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
