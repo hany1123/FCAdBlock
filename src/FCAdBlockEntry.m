@@ -114,8 +114,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===15){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=15;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===16){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=16;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -612,8 +612,46 @@ static UIViewController *FCTopViewController(void) {
 
 #pragma mark - 原生规则定时扫描（v5：双向匹配 + 强制重扫）
 
+// v16：塌陷移除记录——把命中的运营位从视图树摘掉，让下方元素自动补齐；规则删除时可插回
+@interface FCFlattenRecord : NSObject
+@property (nonatomic, strong) UIView *view;
+@property (nonatomic, weak) UIView *superview;
+@property (nonatomic, assign) NSUInteger index;
+@property (nonatomic, copy) NSString *rule;
+@end
+@implementation FCFlattenRecord
+@end
+static NSMutableArray<FCFlattenRecord *> *gFCFlattened = nil;
+
+// v16：检查已塌陷的 view——规则还在就保持移除，规则删了就插回原位（可逆）
+static void FCRestoreFlattenedIfNeeded(NSArray<NSString *> *rules) {
+    if (!gFCFlattened.count) return;
+    NSMutableArray *gone = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFCFlattened) {
+        BOOL still = NO;
+        for (NSString *r in rules) {
+            if ([r isEqualToString:rec.rule] ||
+                [r rangeOfString:rec.rule].location != NSNotFound ||
+                [rec.rule rangeOfString:r].location != NSNotFound) { still = YES; break; }
+        }
+        if (!still || !rec.superview) [gone addObject:rec];
+    }
+    for (FCFlattenRecord *rec in gone) {
+        if (rec.superview) {
+            NSUInteger i = MIN(rec.index, rec.superview.subviews.count);
+            [rec.superview insertSubview:rec.view atIndex:i];
+            rec.view.hidden = NO;
+            if ([rec.superview isKindOfClass:NSClassFromString(@"UIStackView")])
+                [rec.superview setNeedsLayout];
+        }
+        [gFCFlattened removeObject:rec];
+    }
+}
+
 static void FCApplyNativeRules(void) {
     NSArray *rules = FCEffectiveRules();   // v11：用户规则 + 内置运营广告关键词
+    if (!gFCFlattened) gFCFlattened = [NSMutableArray array];
+    FCRestoreFlattenedIfNeeded(rules);     // v16：规则删了的塌陷元素插回原位
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     static char kHiddenByFC;
     for (UIWindow *w in FCAllWindows()) {
@@ -705,10 +743,28 @@ static void FCApplyNativeRules(void) {
                     for (UIView *sub in v.subviews) [q addObject:sub];
                     continue;
                 }
-                v.hidden = YES; gFCNativeHits++;
+                gFCNativeHits++;
                 if (builtinHit) gFCBuiltinHits++;
-                // v9：存「命中的规则」而非 @YES，供恢复判定用（FCTextsOf 读不到 hidden view 的文字）
-                objc_setAssociatedObject(v, &kHiddenByFC, hitRule ?: @"", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // v16：塌陷移除——从父视图摘掉让下方元素补齐，不再留空占位。
+                // 用记录表保住 view（否则释放），规则删除时 FCRestoreFlattenedIfNeeded 插回。
+                // 只对「有 superview 的普通视图」塌陷；已记录过的跳过。
+                BOOL alreadyFlattened = NO;
+                for (FCFlattenRecord *rec in gFCFlattened) if (rec.view == v) { alreadyFlattened = YES; break; }
+                if (v.superview && !alreadyFlattened) {
+                    FCFlattenRecord *rec = [FCFlattenRecord new];
+                    rec.view = v;
+                    rec.superview = v.superview;
+                    rec.index = [v.superview.subviews indexOfObject:v];
+                    rec.rule = hitRule ?: @"";
+                    [gFCFlattened addObject:rec];
+                    [v removeFromSuperview];
+                    // 父视图是 stack/collection 时触发布局重算，下方元素自动补齐
+                    if ([v.superview isKindOfClass:NSClassFromString(@"UIStackView")] ||
+                        [v.superview isKindOfClass:[UIScrollView class]]) [v.superview setNeedsLayout];
+                } else {
+                    v.hidden = YES;   // 兜底：无父视图时用隐藏
+                    objc_setAssociatedObject(v, &kHiddenByFC, hitRule ?: @"", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                }
             }
             for (UIView *sub in v.subviews) [q addObject:sub];
         }
@@ -1554,7 +1610,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv15 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv16 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1567,7 +1623,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv15 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv16 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1577,7 +1633,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v15"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v16"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1650,11 +1706,20 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v15 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v16 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
             FCEnsureBadgeWindow();
+            // v16：加载后自动吸附右边缘收成小白条，不遮挡页面（点小白条仍可展开操作）
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
+                           dispatch_get_main_queue(), ^{
+                if (!gFCBadgeCollapsed && !gFCBadgeWindow.picking) {
+                    gFCBadgeSide = 1;
+                    [gFCBadgeWindow collapseToEdge];
+                    FCLog(@"浮标已自动吸附右边缘");
+                }
+            });
             // v10：App 从后台回前台/冷启动激活时，页面是新建 view，强制重扫+重注入，恢复隐藏
             [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
                 object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
@@ -1667,18 +1732,31 @@ static void FCAdBlockInit(void) {
                     FCLog(@"前台激活：强制重扫完成，规则 %lu 条", (unsigned long)FCUserRules().count);
                 });
             }];
+            // v16：修「进页面闪一下才消失」——fast 从 8 秒(80次)延到 120 秒(1200次)，
+            // slow 从 0.30s→0.12s；页面切换通知立即补扫，把可见窗口压到 ≈0.1s。
             __block NSInteger fastTicks = 0;
-            NSTimer *fast = [NSTimer scheduledTimerWithTimeInterval:0.10 repeats:YES
-                              block:^(NSTimer *t){ FCScanOnce(); if (++fastTicks > 80) [t invalidate]; }];
+            NSTimer *fast = [NSTimer scheduledTimerWithTimeInterval:0.08 repeats:YES
+                              block:^(NSTimer *t){ FCScanOnce(); if (++fastTicks > 1200) [t invalidate]; }];
             [[NSRunLoop mainRunLoop] addTimer:fast forMode:NSRunLoopCommonModes];
             __block NSInteger slowTicks = 0;
-            NSTimer *slow = [NSTimer scheduledTimerWithTimeInterval:0.30 repeats:YES
+            NSTimer *slow = [NSTimer scheduledTimerWithTimeInterval:0.12 repeats:YES
                               block:^(NSTimer *t){
                 FCScanOnce();
-                if (++slowTicks % 5 == 0) FCInjectWebViews(NO);
+                if (++slowTicks % 8 == 0) FCInjectWebViews(NO);
                 FCUpdateBadge();
             }];
             [[NSRunLoop mainRunLoop] addTimer:slow forMode:NSRunLoopCommonModes];
+            // v16：页面 push/pop/tab 切换后立即重扫（视图刚创建是最容易闪现的时刻）
+            [[NSNotificationCenter defaultCenter] addObserverForName:@"UINavigationControllerDidShowViewControllerNotification"
+                object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ FCScanOnce(); });
+            }];
+            [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
+                object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.05 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{ FCScanOnce(); });
+            }];
 #ifdef FC_DEEP_HOOKS
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.4 * NSEC_PER_SEC)),
                            dispatch_get_main_queue(), ^{ FCInstallDeepHooks(); });
