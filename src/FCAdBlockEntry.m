@@ -1,7 +1,12 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v9
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v10
 //
-//  v9 相对 v8（真机八次反馈：规则要标元素类型+左滑编辑删除、隐藏重启后失效）：
+//  v10 相对 v9（真机九次反馈：App 退出重开后隐藏失效）：
+//    两个方向同时堵死——①数据丢失：规则 NSUserDefaults + Library/plist 双保险，互为兜底；
+//    ②重开没重扫：监听 UIApplicationDidBecomeActive，前台激活延迟 0.6s 强制重扫+重注入
+//      （冷启动时页面 view 全新、无隐藏标记，必须重建隐藏态）。浮标「规则N」供诊断。
+//
+//  v9：修隐藏元素跳动/失效真因（FCTextsOf 读不到 hidden view）+ 规则类型标记与左滑编辑删除。
 //    ①修复隐藏「失效」真因：v7 的可逆判定对 hidden view 调 FCTextsOf 读文字，但
 //      FCCollectText 见 hidden 直接 return → 读到空 → 每 0.3s 误判「规则已删」自动恢复显示。
 //      v9 改为隐藏时把「命中的规则串」存 associatedObject，恢复判定改为查该规则是否还在规则表。
@@ -131,6 +136,12 @@ static NSString * const FCPickJSFmt =
 
 static NSString * const FCUserRulesKey = @"FCAdBlockUserRules_v3";  // 保留 key，延续已存规则
 
+// v10：规则双保险文件——注入环境下 NSUserDefaults 可能被宿主清理/迁移，额外落盘一份
+static NSString *FCRulesFilePath(void) {
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSLibraryDirectory, NSUserDomainMask, YES).firstObject;
+    return [dir stringByAppendingPathComponent:@"fcadblock_rules.plist"];
+}
+
 // v7：系统通用类黑名单——这些类作规则会命中整页控件，造成「页面被吃掉」
 static BOOL FCIsUnsafeClassRule(NSString *rule) {
     if (rule.length < 2) return YES;
@@ -160,7 +171,13 @@ static BOOL FCIsUnsafeClassRule(NSString *rule) {
 
 static NSArray<NSString *> *FCUserRules(void) {
     NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:FCUserRulesKey];
-    return a ?: @[];
+    if (a.count) return a;                                                    // NSUserDefaults 优先
+    NSArray *file = [NSArray arrayWithContentsOfFile:FCRulesFilePath()];      // v10：兜底读文件
+    if (file.count) {
+        [[NSUserDefaults standardUserDefaults] setObject:file forKey:FCUserRulesKey];  // 回填
+        return file;
+    }
+    return @[];
 }
 
 // v7：启动自愈——把历史存下来的危险 class 规则剔除，避免老规则继续误伤
@@ -185,6 +202,8 @@ static void FCSetUserRules(NSArray *rules) {
     }
     [[NSUserDefaults standardUserDefaults] setObject:clean forKey:FCUserRulesKey];
     [[NSUserDefaults standardUserDefaults] synchronize];
+    // v10：双保险写文件（原子写），NSUserDefaults 被清时仍能恢复
+    [clean writeToFile:FCRulesFilePath() atomically:YES];
 }
 
 static NSString *FCJSSafe(NSString *s) {
@@ -1227,7 +1246,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv9 规则%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv10 规则%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -1239,7 +1258,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv9 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv10 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1249,7 +1268,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v9"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v10"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1310,11 +1329,23 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v9 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v10 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
             FCEnsureBadgeWindow();
+            // v10：App 从后台回前台/冷启动激活时，页面是新建 view，强制重扫+重注入，恢复隐藏
+            [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidBecomeActiveNotification
+                object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *n){
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    FCScanOnce();
+                    FCApplyNativeRules();
+                    FCInjectWebViews(YES);
+                    FCUpdateBadge();
+                    FCLog(@"前台激活：强制重扫完成，规则 %lu 条", (unsigned long)FCUserRules().count);
+                });
+            }];
             __block NSInteger fastTicks = 0;
             NSTimer *fast = [NSTimer scheduledTimerWithTimeInterval:0.10 repeats:YES
                               block:^(NSTimer *t){ FCScanOnce(); if (++fastTicks > 80) [t invalidate]; }];
