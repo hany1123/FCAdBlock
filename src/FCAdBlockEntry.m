@@ -1,5 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v22（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v23（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v23 相对 v22（老大真机：打开软件直接黑屏，浮标「原17」=17 个元素被塌陷）：
+//    【黑屏根因】v22 让「用户硬命中」绕过全部尺寸闸门，含 height>50%屏 的根容器保护；
+//    点选存的 cls: 祖先链规则命中页面根容器(DXRootView 等) → 整块 removeFromSuperview → 黑屏。
+//    修复①：大容器闸门(height>50%屏 或 width>95%屏)无条件生效，任何规则不得移除，防黑屏底线；
+//    仅小元素(height<18/width<40)的用户硬命中仍放行，保留 17pt「领券中心」可隐藏。
+//    修复②：浮标菜单 topVC 用 FCHostTopVC 兜底，黑屏/异常时仍能弹出「清空规则」自救。
+//    ③【新增】进程内网络取证（替代电脑 Fiddler）：注册 FCNetProbe(NSURLProtocol) 只读旁听
+//    App 请求 URL，canInitWithRequest 记下即 return NO——不接管/不改包/不 hook 系统方法，
+//    默认关闭、菜单主动开启；诊断面板输出「----- 网络取证」段，精简版保留。天然不受 SSL
+//    Pinning 影响（不解密只读 URL）。局限：宿主若有拦截型 protocol 先处理可能漏记。
 //
 //  v22 相对 v21（老大发来 v21 诊断文本——日志能发了，但暴露诊断口径误导 + 小元素隐藏失效）：
 //    诊断证据：领券中心=[DX动态] DXImageView 130x17 (19,663)、顶层VC:-、所有元素「命中:无」
@@ -185,8 +196,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===22){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=22;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===23){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=23;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -891,6 +902,45 @@ static NSArray<UIWindow *> *FCAllWindows(void) {
     return a;
 }
 
+#pragma mark - v23：进程内网络取证（只读旁听，不改请求、不 hook 系统方法）
+
+// 原理：注册一个 NSURLProtocol 子类，在 canInitWithRequest: 里「旁听」到 App 发出的请求 URL，
+// 记下后立即 return NO——不接管、不修改请求、不建立连接，完全不改变网络行为。默认关闭，
+// 只有用户在菜单主动开启才 registerClass。对比电脑 Fiddler：不需要代理/证书，天然不受
+// SSL Pinning 影响（我们不解密、只读 URL 字符串）。局限：若宿主自己注册了拦截型 protocol
+// 且先处理，我们的旁听可能收不到部分请求——这是可接受的诊断边界，不影响网络本身。
+static NSMutableArray<NSString *> *gFCNetLog = nil;
+static BOOL gFCNetLogOn = NO;
+
+@interface FCNetProbe : NSURLProtocol
+@end
+@implementation FCNetProbe
++ (BOOL)canInitWithRequest:(NSURLRequest *)request {
+    if (gFCNetLogOn) {
+        NSString *u = request.URL.absoluteString;
+        if (u.length > 6 && u.length <= 300 &&
+            ![u hasPrefix:@"data:"] && ![u hasPrefix:@"file:"] && ![u containsString:@"fcadblock"]) {
+            if (!gFCNetLog) gFCNetLog = [NSMutableArray array];
+            if (![gFCNetLog containsObject:u] && gFCNetLog.count < 200) [gFCNetLog addObject:u];
+        }
+    }
+    return NO;   // 关键：只旁听，绝不接管
+}
++ (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
+- (void)startLoading {}
+- (void)stopLoading {}
+@end
+
+static void FCNetProbeToggle(void) {
+    gFCNetLogOn = !gFCNetLogOn;
+    if (gFCNetLogOn) {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ [NSURLProtocol registerClass:[FCNetProbe class]]; });
+        if (!gFCNetLog) gFCNetLog = [NSMutableArray array];
+        [gFCNetLog removeAllObjects];
+    }
+}
+
 static UIViewController *FCTopViewController(void) {
     UIWindow *key = [UIApplication sharedApplication].keyWindow;
     UIViewController *vc = key.rootViewController; int guard = 0;
@@ -984,20 +1034,25 @@ static void FCApplyNativeRules(void) {
             }
 
             CGRect r = [v convertRect:v.bounds toView:nil];
-            // v22：尺寸闸门原在命中判定之前，导致用户点选的小元素（真机「领券中心」
-            // DXImageView 仅 130x17，height<18）被直接跳过、存了规则也永远隐藏不了。
-            // 改为：先判「用户规则硬命中」（类名/cls:/pos: 指纹），命中即不受尺寸闸门限制；
-            // 内置关键词等软命中仍走原闸门防误伤。
             if (v.hidden) { for (UIView *sub in v.subviews) [q addObject:sub]; continue; }
+            // v23 紧急修黑屏：v22 让「用户硬命中」绕过全部闸门（含 height>50%屏），
+            // 结果点选存的 cls: 祖先链规则命中页面根容器 → 整块塌陷 → 整页黑屏（真机原17）。
+            // 大容器闸门必须无条件生效——这是防黑屏底线，任何规则都不得移除半屏以上的 view。
+            if (r.size.height > sh * 0.5 || r.size.width > [UIScreen mainScreen].bounds.size.width * 0.95) {
+                for (UIView *sub in v.subviews) [q addObject:sub];
+                continue;
+            }
+            // v22：小元素（height<18 / width<40）若被用户明确点选的规则硬命中，仍允许隐藏，
+            // 解决真机 130x17 的「领券中心」被跳过的问题。内置词不算硬命中。
             BOOL userHardHit = NO;
             for (NSString *rule in rules) {
-                if (FCIsBuiltinAdKey(rule)) continue;   // 内置词不算用户硬命中
+                if (FCIsBuiltinAdKey(rule)) continue;
                 if (rule.length >= 5 && [rule isEqualToString:vcls]) { userHardHit = YES; break; }
                 if (FCRuleMatchesFingerprint(rule, vcls, r, [UIScreen mainScreen].bounds.size.width, sh)) {
                     userHardHit = YES; break;
                 }
             }
-            if (!userHardHit && (r.size.width < 40 || r.size.height < 18 || r.size.height > sh * 0.5)) {
+            if (!userHardHit && (r.size.width < 40 || r.size.height < 18)) {
                 for (UIView *sub in v.subviews) [q addObject:sub];
                 continue;
             }
@@ -1641,6 +1696,7 @@ static NSString *FCDiagBriefString(void) {
             [line hasPrefix:@"用户规则"] || [line hasPrefix:@"  规则"] ||
             [line hasPrefix:@"[引擎图例]"] || [line hasPrefix:@"[提示]"] ||
             [line hasPrefix:@"----- WKWebView"] || [line hasPrefix:@"[网页]"] ||
+            [line hasPrefix:@"----- 网络取证"] || [line hasPrefix:@"[请求]"] ||
             [line hasPrefix:@"[已截断]"]) keep = YES;
         if ([line rangeOfString:@"[类型:"].location != NSNotFound) keep = YES;  // 命中广告类的行
         if ([line rangeOfString:@"命中:无"].location == NSNotFound &&
@@ -1745,7 +1801,7 @@ static UIViewController *FCHostTopVC(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v22 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v23 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -1836,6 +1892,19 @@ static void FCFillDiagnose(void) {
         }
     }
     if (!found) FCAppendDiagText(@"未找到 WKWebView——运营位大概率是原生绘制");
+    // v23：进程内网络取证结果——旁听到的请求 URL（只读，不改包）
+    FCAppendDiagText([NSString stringWithFormat:@"----- 网络取证 %@ (%lu 条) -----",
+        gFCNetLogOn ? @"开" : @"关", (unsigned long)(gFCNetLog ? gFCNetLog.count : 0)]);
+    if (gFCNetLog.count) {
+        NSUInteger show = MIN(gFCNetLog.count, 40);
+        for (NSUInteger i = 0; i < show; i++)
+            FCAppendDiagText([@"[请求] " stringByAppendingString:gFCNetLog[i]]);
+        if (gFCNetLog.count > show)
+            FCAppendDiagText([NSString stringWithFormat:@"[请求] ...还有 %lu 条(全文复制可见)",
+                              (unsigned long)(gFCNetLog.count - show)]);
+    } else if (gFCNetLogOn) {
+        FCAppendDiagText(@"[请求] 暂未捕获——开启后请操作 App 几秒再诊断");
+    }
     FCAppendDiagText(@"===== 诊断结束（点顶部「复制精简」粘贴发我，无需截图）=====");
 }
 
@@ -2155,7 +2224,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv22 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv23 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2168,7 +2237,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv22 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv23 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2177,8 +2246,9 @@ static void FCShowBadgeMsg(NSString *msg) {
 // 操作菜单：用系统 UIAlertController（present 到顶层 VC），避免自绘触摸冲突
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
+    if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v22"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v23"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2187,6 +2257,13 @@ static void FCShowActionMenu(void) {
     // v14：诊断当前页面——一次看清运营位在原生还是网页、命中了什么规则
     [ac addAction:[UIAlertAction actionWithTitle:@"诊断当前页面（发给开发者）" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCShowDiagnose(); }]];
+    // v23：进程内网络取证——旁听 App 请求 URL（只读不改包，绕开 SSL Pinning）
+    [ac addAction:[UIAlertAction actionWithTitle:gFCNetLogOn ? @"关闭网络取证" : @"开启网络取证(看广告接口)"
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     FCNetProbeToggle();
+                     FCShowBadgeMsg(gFCNetLogOn ? @"网络取证已开·操作App后诊断查看" : @"网络取证已关");
+                 }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"浮标复位" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ gFCBadgeCollapsed = NO; gFCBadgeSide = 0;
                      gFCBadgeNormalFrame = FCDefaultBadgeFrame();
@@ -2259,7 +2336,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v22 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v23 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
