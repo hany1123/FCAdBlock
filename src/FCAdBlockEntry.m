@@ -531,7 +531,7 @@ static void FCInjectWebViews(BOOL force) {
 
 static UIView *gFCBadgeBar = nil;
 static UILabel *gFCBadgeLabel = nil;
-static CGRect gFCBadgeFrame = CGRectZero;
+static CGRect gFCBadgeFrame = {0};          // 不用 CGRectZero（非编译期常量）
 static FCBadgeWindow *gFCBadgeWindow = nil;
 
 @implementation FCBadgeWindow
