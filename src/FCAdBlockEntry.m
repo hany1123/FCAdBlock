@@ -1,5 +1,18 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v38（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v39（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v39 相对 v38（老大 v38 真机：白块仍在，浮标「规则3 内0 挡0 原3 压3」——压3全是老逻辑，v38 塌陷零触发）：
+//    【v38 失败根因】v38 把几何判据套在 AliIFDXCollectionViewCell 类名闸门后，但真机撑白块的外层
+//    容器类名又漂移了——坐标反查抓到 0,143 430x86 是普通 UIView + DXRootView(tpl:slider_icons)、
+//    0,236 430x155 / 0,400 430x135 是普通 UIView（内部 gongge/88_campaign 的 DXRootView 已被压0）。
+//    一个都不是 AliIFDXCollectionViewCell → 类名闸门把所有目标挡在门外，几何判据再对也没机会执行。
+//    【三次真机类名漂移】v36/37 = AliIFDXCollectionViewCell → v38/39 = UIView / DXRootView，
+//    证明「靠类名认领」此路不通。
+//    【修法·去类名闸门】FCZeroRotorCellIfEmpty 对扫描到的所有容器统一跑几何+可见文字判据：
+//    满宽≥75%屏 + 高60~170(覆盖86/135/155三层) + 屏幕y100~450 + 有效可见文字≤1；
+//    内加系统容器/Scroll/tabbar 排除 + 已认领幂等。gongge/88 外壳的「文3」是内部 kFCZeroRec
+//    压0节点的假文字，FCCellLiveTextCount 整枝跳过后数成0 → 正确认领；秒杀卡片(真文4~5)/商品流不误伤。
+//    自愈仍用 FCPruneRotorCells 同源口径（离树或子树冒出>1条正常文字才还原）。例行 __fcadVer 38→39。
 //
 //  v38 相对 v37（老大 v37 真机：商品流防误伤成功，但白块塌陷一次没触发——浮标「内0 挡0 压68」、
 //  白块 cell 仍「压:否 tpl:- 拦:否」）：
@@ -382,8 +395,8 @@ static void FCPruneRotorCells(void);                         // v38：轮播空�
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===38){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=38;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===39){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=39;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1313,10 +1326,11 @@ static void FCApplyNativeRules(void) {
                 if (objc_getAssociatedObject(v, &kFCBlockedRoot) ||
                     objc_getAssociatedObject(v, &kFCZeroRec)) FCZeroBlockedCellShell(v);
             }
-            // v38：轮播空壳 cell——搜索栏下 86pt 轮播位(tpl:- 拦:否、无源头痕迹)，v37 那套够不着。
-            // 直接按几何+内容判据认领：满宽 + 高度60~120 + 屏幕y100~300 + 有效文字≤1。
-            // 秒杀卡片(高155/文4~5)、商品流(有正常文字)全被判据排除，绝不误伤。
-            if ([vcls isEqualToString:@"AliIFDXCollectionViewCell"]) FCZeroRotorCellIfEmpty(v);
+            // v39：去类名闸门——真机三次证实撑白块的外层容器类名在漂移：
+            //   v36/37 AliIFDXCollectionViewCell → v38/39 普通 UIView / DXRootView。
+            // 靠类名认领必漏。改为对所有容器统一跑几何+可见文字判据，函数内部自带
+            // 系统容器排除 + 秒杀/商品流误伤排除。
+            FCZeroRotorCellIfEmpty(v);
             // v32：已被本插件压0的元素——每轮重新压制已由 FCReapplyAllZeroFrames 统一处理，
             // 这里直接跳过命中判定，避免 alpha=0/frame=0 的元素反复计数或误判，但仍下钻子视图。
             if (objc_getAssociatedObject(v, &kFCZeroRec)) {
@@ -1912,29 +1926,45 @@ static NSUInteger FCCellSubtreeLiveText(UIView *root, int depth) {
 }
 
 // v38：轮播空壳 cell 判定 + 压0。
-// 真机铁证（v37 Deep 诊断）：导航下白块是 AliIFDXCollectionViewCell 0,143 430x86，
-// 子1、文≈0、tpl:-、拦:否——根本没有源头痕迹，v37 的 FCZeroBlockedCellShell 永远够不着。
-// 而同页秒杀卡片也是同类 cell，但高155、文4~5，是正常内容，必须排除。
-// 判据（四重，全满足才压）：满宽≥75%屏 / 高度60~120（覆盖86，排除155秒杀）
-//   / 屏幕y在100~300（搜索栏下轮播区，排除y=400+的秒杀与商品流）/ 有效可见文字≤1。
-// 商品流 cell 一般 y>500 或含多文字，四重任一不满足即放行。
+// v39 去类名闸门·纯几何判据。三次真机实证撑白块的外层容器类名一直在漂移：
+//   v36/37 = AliIFDXCollectionViewCell；v38/39 = 普通 UIView / DXRootView。
+// v38 把判据套在 AliIFDXCollectionViewCell 类名闸门后 → 这次一个都认不到（浮标压3全是老逻辑）。
+// 本次诊断三层白块同页并存，全部满宽、有效文字0：
+//   0,143 430x86（轮播位 UIView + DXRootView tpl:slider_icons）
+//   0,236 430x155（gongge 外壳 UIView，内部 DXRootView 已被源头压0带 kFCZeroRec，"文3"是压0节点的假文字）
+//   0,400 430x135（88_campaign 外壳 UIView，同上）
+// 关键：FCCellLiveTextCount 遇 kFCZeroRec/kFCBlockedRoot 整枝跳过 → 上述外壳有效文字数成0，命中；
+//       秒杀卡片(高155但文4~5真实可见) / 商品流(有正常文字) / 有内容卡片都因文字>1被挡。
+// 判据（全满足才压）：满宽≥75%屏 / 高60~170（覆盖86/135/155，排除>170的正常大卡）
+//   / 屏幕y100~450（搜索栏下运营区，排除y<100导航与y>450商品流/tabbar）
+//   / 有效可见文字≤1 / 非系统容器 / 非已知商品流类。
 static void FCZeroRotorCellIfEmpty(UIView *cell) {
     if (!cell || !cell.superview) return;
+    if (cell.tag == 9527 || cell.tag == 9528) return;              // 插件自己的浮标/诊断窗
     // 已被别的压0逻辑认领（用户规则/v37源头外壳）——不重复处理，避免自愈互相打架
     if (objc_getAssociatedObject(cell, &kFCZeroRec)) return;
+    // 系统容器与已知商品流类排除——白块外壳永远是满宽的普通 UIView/DXRootView/业务 cell，
+    // 绝不能碰 UIScrollView 本体、tabbar、系统私有类、列表根容器（防整页空白/黑屏）。
+    NSString *vcls = NSStringFromClass([cell class]);
+    if ([cell isKindOfClass:[UIScrollView class]]) return;          // 含 UITableView/CollectionView 本体
+    if ([cell isKindOfClass:[UITabBar class]] || [cell isKindOfClass:[UINavigationBar class]] ||
+        [cell isKindOfClass:[UIToolbar class]]) return;
+    if ([vcls hasPrefix:@"UI"] || [vcls hasPrefix:@"_UI"]) return; // 系统/私有类
     if (!gFRotorZeroed) gFRotorZeroed = [NSMutableArray array];
     for (FCFlattenRecord *rec in gFRotorZeroed) if (rec.view == cell) return;  // 幂等
     CGRect r = [cell convertRect:cell.bounds toView:nil];
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
     if (r.size.width < sw * 0.75) return;
-    if (r.size.height < 60 || r.size.height > 120) return;
-    if (r.origin.y < 100 || r.origin.y > 300) return;
-    // 空壳判定：内部有效可见文字≤1（轮播位只剩红点/指示条；秒杀卡片4~5条文字在此被挡）
+    if (r.size.height < 60 || r.size.height > 170) return;
+    if (r.origin.y < 100 || r.origin.y > 450) return;
+    // 空壳判定：有效可见文字≤1。被压0/被拦的节点整枝不算——gongge/88 外壳里那 3 条文字
+    // 全在被 kFCZeroRec 压0的内部 DXRootView 里，会被跳过 → 数成0 → 正确认领；
+    // 秒杀卡片/商品卡片是真实可见文字 → >1 → 放行，绝不误伤。
     if (FCCellLiveTextCount(cell, 0) > 1) return;
     FCFlattenRecord *rec = [FCFlattenRecord new];
     rec.view = cell; rec.superview = cell.superview;
     rec.index = [cell.superview.subviews indexOfObject:cell];
-    rec.rule = @"轮播空壳";
+    rec.rule = @"几何空壳";
     rec.zeroCollapsed = YES;
     rec.originalFrame = cell.frame;
     rec.originalAlpha = cell.alpha;
@@ -1943,7 +1973,7 @@ static void FCZeroRotorCellIfEmpty(UIView *cell) {
     objc_setAssociatedObject(cell, &kFCZeroRec, rec, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     FCForceZeroFrame(cell);
     gFCZeroApplied++;
-    FCLog(@"轮播空壳塌陷: %.0fx%.0f @y%.0f", r.size.width, r.size.height, r.origin.y);
+    FCLog(@"几何空壳塌陷: %@ %.0fx%.0f @y%.0f", vcls, r.size.width, r.size.height, r.origin.y);
 }
 
 // v38：轮播空壳自愈——与 v37 口径刻意分开。
@@ -2810,7 +2840,7 @@ static void FCAppendZeroedList(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v38 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v39 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -3275,7 +3305,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv38 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv39 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -3288,7 +3318,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv38 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv39 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3299,7 +3329,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v38"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v39"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3572,7 +3602,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v38 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v39 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
