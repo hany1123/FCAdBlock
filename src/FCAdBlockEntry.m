@@ -1,5 +1,18 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v37（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v38（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v38 相对 v37（老大 v37 真机：商品流防误伤成功，但白块塌陷一次没触发——浮标「内0 挡0 压68」、
+//  白块 cell 仍「压:否 tpl:- 拦:否」）：
+//    【v37 失败根因·三条交叉】①v37 只从「带源头痕迹的 DXRootView」向上找 cell，但真正白块
+//    AliIFDXCollectionViewCell 0,143 430x86 上 tpl:- 拦:否、内部无源头痕迹，触发链根本走不到；
+//    ②压0清单证明里面被压的 132x155 卡片是用户文字规则(kFCZeroRec)压的，v37 口径不认；
+//    ③白块候选判据 height≥120 把 86pt 轮播位天然排除，反而报了带正常商品的 430x155 秒杀卡片。
+//    【精准修法·几何判据认领】新增 FCZeroRotorCellIfEmpty：扫描阶段直接对 AliIFDXCollectionViewCell
+//    按四重判据认领——满宽≥75%屏 + 高60~120(覆盖86、排除155秒杀) + 屏幕y100~300(搜索栏下轮播区、
+//    排除y400+商品流) + 有效可见文字≤1(秒杀卡片文4~5被挡)。留树重压、独立 gFRotorZeroed 表。
+//    【专属自愈口径】v37 的「源头痕迹消失才还原」对无痕迹的轮播位会刚压就还原，故 v38 另立
+//    FCPruneRotorCells：cell 离树或子树冒出>1条正常文字才还原；配 FCCellSubtreeLiveText 专计数子树
+//    （绕开 cell 自身 kFCZeroRec 导致 FCCellLiveTextCount 首行返回0的坑）。例行 __fcadVer 37→38。
 //
 //  v37 相对 v36（老大 v36 诊断三修后带回决定性证据——白块真凶第一次锁死）：
 //    【交叉印证】v36 [白块候选] AliIFDXCollectionViewCell 0,400 430x135（压:否 tpl:-）
@@ -361,14 +374,16 @@ static void FCZeroSourceRootIfBlocked(UIView *v);            // v34：扫描阶�
 static void FCPruneSourceZeros(void);   // v34：源头压0复用自愈
 static void FCZeroBlockedCellShell(UIView *root);            // v37：源头拦截/压0 root → 塌陷外层空壳 cell
 static void FCPruneBlockedCellShells(void);                  // v37：外壳 cell 压0复用自愈
+static void FCZeroRotorCellIfEmpty(UIView *cell);            // v38：满宽矮轮播空壳 cell → 压0（不依赖源头痕迹）
+static void FCPruneRotorCells(void);                         // v38：轮播空壳自愈——内部出现正常文字即还原
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===37){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=37;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===38){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=38;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1151,6 +1166,9 @@ static NSMutableArray<FCFlattenRecord *> *gFCSourceZeroed = nil;
 // v37：源头坑位外层空壳 cell 压0记录（AliIFDXCollectionViewCell）。
 // 内容被源头拦/压0后，外层 cell 仍占满宽高度=白块；独立表、每轮重压、痕迹消失即还原。
 static NSMutableArray<FCFlattenRecord *> *gFCShellZeroed = nil;
+// v38：轮播空壳 cell 压0记录（搜索栏下 86pt 轮播位，内部只剩红点、无有效文字）。
+// v37 只认源头痕迹够不着它（tpl:- 拦:否）；v38 改按几何+内容判据直接认领，独立表+专属自愈口径。
+static NSMutableArray<FCFlattenRecord *> *gFRotorZeroed = nil;
 static char kFCZeroRec;   // v32：view → FCFlattenRecord（压0标记，扫描时快速识别）
 // v33：实例级标记——setTemplateItem 命中后，后续 setData 也不放行。
 // v37：前移到全局区，扫描阶段据此判定「源头拦截过的 root」（原来定义在 hook 区，扫描够不着）。
@@ -1220,6 +1238,16 @@ static void FCReapplyAllZeroFrames(void) {
             }
         }
     }
+    // v38：轮播空壳 cell 每轮重压——同样对抗 UICollectionView 复用重设 frame。
+    for (FCFlattenRecord *rec in gFRotorZeroed) {
+        if (rec.view) {
+            CGRect f = rec.view.frame;
+            if (f.size.width > 0.5 || f.size.height > 0.5 || rec.view.alpha > 0.01) {
+                FCForceZeroFrame(rec.view);
+                gFCZeroApplied++;
+            }
+        }
+    }
 }
 
 // v16：检查已塌陷的 view——规则还在就保持移除，规则删了就插回原位（可逆）
@@ -1256,6 +1284,7 @@ static void FCApplyNativeRules(void) {
     FCRestoreFlattenedIfNeeded(rules);     // v16：规则删了的塌陷元素插回原位
     FCPruneSourceZeros();                  // v34：源头压0复用自愈——模板变了就还原，防误伤正常卡片
     FCPruneBlockedCellShells();            // v37：外壳 cell 复用自愈——坑位内容恢复正常就还原外壳
+    FCPruneRotorCells();                   // v38：轮播空壳自愈——内部冒出正常文字就还原（独立口径）
     FCReapplyAllZeroFrames();              // v32：每轮重新压制——对抗 DX 重设 frame
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     static char kHiddenByFC;
@@ -1284,6 +1313,10 @@ static void FCApplyNativeRules(void) {
                 if (objc_getAssociatedObject(v, &kFCBlockedRoot) ||
                     objc_getAssociatedObject(v, &kFCZeroRec)) FCZeroBlockedCellShell(v);
             }
+            // v38：轮播空壳 cell——搜索栏下 86pt 轮播位(tpl:- 拦:否、无源头痕迹)，v37 那套够不着。
+            // 直接按几何+内容判据认领：满宽 + 高度60~120 + 屏幕y100~300 + 有效文字≤1。
+            // 秒杀卡片(高155/文4~5)、商品流(有正常文字)全被判据排除，绝不误伤。
+            if ([vcls isEqualToString:@"AliIFDXCollectionViewCell"]) FCZeroRotorCellIfEmpty(v);
             // v32：已被本插件压0的元素——每轮重新压制已由 FCReapplyAllZeroFrames 统一处理，
             // 这里直接跳过命中判定，避免 alpha=0/frame=0 的元素反复计数或误判，但仍下钻子视图。
             if (objc_getAssociatedObject(v, &kFCZeroRec)) {
@@ -1861,6 +1894,75 @@ static void FCPruneBlockedCellShells(void) {
         }
     }
     [gFCShellZeroed removeObjectsInArray:gone];
+}
+
+// v38：专供自愈用——数 cell 子树的有效文字，但不因 cell 自身带 kFCZeroRec 而提前返回
+// （FCCellLiveTextCount 首行会跳过带标记节点，轮播 cell 压0后自身带标记，用它自愈会永远数到0）。
+// 子树里被压0/被拦的节点整枝跳过，只数真正可见的正常内容。
+static NSUInteger FCCellSubtreeLiveText(UIView *root, int depth) {
+    if (!root || depth > 10) return 0;
+    NSUInteger n = 0;
+    for (UIView *s in root.subviews) {
+        if (objc_getAssociatedObject(s, &kFCZeroRec) || objc_getAssociatedObject(s, &kFCBlockedRoot)) continue;
+        if (!s.hidden && s.alpha >= 0.05 && s.frame.size.width > 1 && s.frame.size.height > 1 &&
+            FCOwnTextOf(s).length) n++;
+        n += FCCellSubtreeLiveText(s, depth + 1);
+    }
+    return n;
+}
+
+// v38：轮播空壳 cell 判定 + 压0。
+// 真机铁证（v37 Deep 诊断）：导航下白块是 AliIFDXCollectionViewCell 0,143 430x86，
+// 子1、文≈0、tpl:-、拦:否——根本没有源头痕迹，v37 的 FCZeroBlockedCellShell 永远够不着。
+// 而同页秒杀卡片也是同类 cell，但高155、文4~5，是正常内容，必须排除。
+// 判据（四重，全满足才压）：满宽≥75%屏 / 高度60~120（覆盖86，排除155秒杀）
+//   / 屏幕y在100~300（搜索栏下轮播区，排除y=400+的秒杀与商品流）/ 有效可见文字≤1。
+// 商品流 cell 一般 y>500 或含多文字，四重任一不满足即放行。
+static void FCZeroRotorCellIfEmpty(UIView *cell) {
+    if (!cell || !cell.superview) return;
+    // 已被别的压0逻辑认领（用户规则/v37源头外壳）——不重复处理，避免自愈互相打架
+    if (objc_getAssociatedObject(cell, &kFCZeroRec)) return;
+    if (!gFRotorZeroed) gFRotorZeroed = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFRotorZeroed) if (rec.view == cell) return;  // 幂等
+    CGRect r = [cell convertRect:cell.bounds toView:nil];
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    if (r.size.width < sw * 0.75) return;
+    if (r.size.height < 60 || r.size.height > 120) return;
+    if (r.origin.y < 100 || r.origin.y > 300) return;
+    // 空壳判定：内部有效可见文字≤1（轮播位只剩红点/指示条；秒杀卡片4~5条文字在此被挡）
+    if (FCCellLiveTextCount(cell, 0) > 1) return;
+    FCFlattenRecord *rec = [FCFlattenRecord new];
+    rec.view = cell; rec.superview = cell.superview;
+    rec.index = [cell.superview.subviews indexOfObject:cell];
+    rec.rule = @"轮播空壳";
+    rec.zeroCollapsed = YES;
+    rec.originalFrame = cell.frame;
+    rec.originalAlpha = cell.alpha;
+    rec.originalClips = cell.clipsToBounds;
+    [gFRotorZeroed addObject:rec];
+    objc_setAssociatedObject(cell, &kFCZeroRec, rec, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    FCForceZeroFrame(cell);
+    gFCZeroApplied++;
+    FCLog(@"轮播空壳塌陷: %.0fx%.0f @y%.0f", r.size.width, r.size.height, r.origin.y);
+}
+
+// v38：轮播空壳自愈——与 v37 口径刻意分开。
+// v37 判「源头痕迹消失才还原」，但轮播位从无源头痕迹，套用会刚压就还原。
+// v38 判据：cell 离树 → 移除；cell 内部冒出 >1 条有效文字（模板复用成正常卡片/秒杀位）
+//   → 还原尺寸。这样白位压住、正常卡片恢复，两边都不误伤。
+static void FCPruneRotorCells(void) {
+    if (!gFRotorZeroed.count) return;
+    NSMutableArray *gone = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFRotorZeroed) {
+        UIView *cell = rec.view;
+        if (!cell || !cell.superview) { [gone addObject:rec]; continue; }
+        // cell 自身带 kFCZeroRec，必须用专计数子树的 helper（FCCellLiveTextCount 会被自身标记挡成0）
+        if (FCCellSubtreeLiveText(cell, 0) > 1) {
+            FCRestoreZeroRecord(rec);
+            [gone addObject:rec];
+        }
+    }
+    [gFRotorZeroed removeObjectsInArray:gone];
 }
 
 static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
@@ -2708,7 +2810,7 @@ static void FCAppendZeroedList(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v37 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v38 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -3173,7 +3275,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv37 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv38 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -3186,7 +3288,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv37 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv38 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3197,7 +3299,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v37"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v38"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3470,7 +3572,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v37 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v38 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
