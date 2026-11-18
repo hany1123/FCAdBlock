@@ -1,7 +1,13 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v7
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v8
 //
-//  v7 相对 v6（真机六次反馈：点浮标没出菜单、循环点击把整页吃掉）：
+//  v8 相对 v7（真机七次反馈：有些元素选不中 + 要求点击时自动识别标记内容）：
+//    ①点选时浮标盖住页面上方 banner，且「点浮标=取消」，导致那一条区域元素选不中 →
+//      进入点选把浮标挪到顶部安全区(y=52)让开内容区，点选改为连续模式（点顶部浮标才退出）。
+//    ②点击命中后画临时标记：红框覆盖元素 frame + 标签显示识别到的文字/class，2.5s 消失；
+//      网页 JS 回传元素 rect(x,y,w,h)，原生用 convertRect:toView:nil。
+//
+//  v7：止血 class 规则泛化误伤整页 + 隐形菜单连锁循环点击。
 //    根因：v6 点选无文字元素时把触点最深的 UILabel/UIImageView 等**系统通用类**存成 class 规则，
 //         扫描用 substring 匹配 → 命中整页同类控件（浮标显示 原141），连 UIAlertController
 //         弹窗内容也被隐藏 → 用户点浮标后菜单弹出但内容不可见，误以为没弹，继续点屏幕误触
@@ -52,6 +58,9 @@ static void FCCloseRulePanelAndCommit(BOOL commit);
 static NSArray<NSString *> *FCTextsOf(UIView *root);
 static BOOL FCRuleMatchesText(NSString *rule, NSString *text);
 static CGRect FCDefaultBadgeFrame(void);
+static void FCShowPickMark(CGRect screenRect, NSString *text);
+static void FCPickModeEnter(void);
+static void FCPickModeExit(void);
 
 #pragma mark - H5 脚本模板
 
@@ -108,7 +117,8 @@ static NSString * const FCPickJSFmt =
 "if(tr.height>0&&pr.height<=tr.height*1.8&&pr.width<=window.innerWidth*0.97){t=p;}else{break;}}"
 "var r=t.getBoundingClientRect();if(r.height>window.innerHeight*0.85)return 'TOOBIG';"
 "t.style.setProperty('display','none','important');t.__fcadDone=1;"
-"return out.join('|');})();";
+// v8：回传元素位置(x,y,w,h)供原生画标记框，CSSError-free
+"return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+','+Math.round(r.height)+'|'+out.join('|');})();";
 
 #pragma mark - 用户规则持久化
 
@@ -562,6 +572,54 @@ static void FCScanOnce(void) {
     FCApplyNativeRules();
 }
 
+#pragma mark - 点选标记浮层（v8：红框 + 识别文字，2.5s 自动消失）
+
+static void FCShowPickMark(CGRect screenRect, NSString *text) {
+    if (!gFCBadgeWindow) return;
+    // 清理上一次标记
+    for (UIView *old in [gFCBadgeWindow.subviews copy])
+        if (old.tag == 9529) [old removeFromSuperview];
+
+    CGRect s = gFCBadgeWindow.bounds;
+    // 规整坐标，避免 0 尺寸/越界
+    CGRect r = CGRectIntersection(screenRect, s);
+    if (CGRectIsNull(r) || r.size.width < 1 || r.size.height < 1) return;
+
+    UIView *mark = [[UIView alloc] initWithFrame:r];
+    mark.tag = 9529;
+    mark.userInteractionEnabled = NO;
+    mark.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.12];
+    mark.layer.borderColor = [[UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:1] CGColor];
+    mark.layer.borderWidth = 2.0;
+    mark.layer.cornerRadius = 4;
+    [gFCBadgeWindow addSubview:mark];
+
+    // 顶部/底部标签显示识别内容（自动选不遮内容的一侧）
+    NSString *label = text.length ? [text stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"(未识别到文字)";
+    if (label.length > 22) label = [NSString stringWithFormat:@"%@…", [label substringToIndex:22]];
+    UILabel *tip = [[UILabel alloc] init];
+    tip.text = [@"已选中: " stringByAppendingString:label];
+    tip.font = [UIFont boldSystemFontOfSize:11];
+    tip.textColor = [UIColor whiteColor];
+    tip.backgroundColor = [[UIColor colorWithRed:0.85 green:0.1 blue:0.1 alpha:0.95] colorWithAlphaComponent:0.95];
+    tip.textAlignment = NSTextAlignmentCenter;
+    tip.layer.cornerRadius = 4; tip.clipsToBounds = YES;
+    CGFloat tw = MIN(s.size.width - 16, MAX(140, label.length * 13));
+    CGFloat th = 24;
+    CGFloat ty = CGRectGetMinY(r) - th - 2;
+    if (ty < 50) ty = CGRectGetMaxY(r) + 2;              // 顶部放不下就放底部
+    if (ty + th > s.size.height - 10) ty = CGRectGetMinY(r) + 2;
+    tip.frame = CGRectMake(MAX(8, CGRectGetMidX(r) - tw / 2), ty, tw, th);
+    tip.tag = 9529;
+    [gFCBadgeWindow addSubview:tip];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [mark removeFromSuperview];
+        [tip removeFromSuperview];
+    });
+}
+
 #pragma mark - 找触点下最底层 view / 原生容器
 
 static UIView *FCHitViewAtPoint(CGPoint p) {
@@ -625,14 +683,28 @@ static void FCPickAtPoint(CGPoint screenP) {
                 if (!err && [result isKindOfClass:[NSString class]]) {
                     NSString *txt = (NSString *)result;
                     if (txt.length >= 2 && ![txt hasPrefix:@"MISS"] && ![txt hasPrefix:@"TOOBIG"]) {
-                        // v6：一次点选可回传多个特征（文案/alt/id/class/图片名），全部记为规则
-                        NSArray *feats = [txt componentsSeparatedByString:@"|"];
+                        // v8：首段是元素位置 x,y,w,h（CSS 坐标），其后是特征；解析后画标记框
+                        NSArray *parts = [txt componentsSeparatedByString:@"|"];
+                        NSString *rectStr = parts.firstObject;
+                        NSArray *xywh = [rectStr componentsSeparatedByString:@","];
+                        if (xywh.count == 4) {
+                            CGRect wr = CGRectMake([xywh[0] doubleValue], [xywh[1] doubleValue],
+                                                   [xywh[2] doubleValue], [xywh[3] doubleValue]);
+                            CGRect wf = [web convertRect:web.bounds toView:nil];   // web 在屏幕上的位置
+                            CGRect sr = CGRectMake(wf.origin.x + wr.origin.x, wf.origin.y + wr.origin.y,
+                                                   wr.size.width, wr.size.height);
+                            NSString *nm = parts.count > 1 ? parts[1] : @"网页元素";
+                            CGRect finalRect = sr; NSString *finalName = nm;
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                FCShowPickMark(finalRect, finalName);
+                            });
+                        }
+                        // v6：其余段为多个特征（文案/alt/id/class/图片名），全部记为规则
                         NSUInteger added = 0;
-                        for (NSString *f in feats) {
-                            NSString *rule = [f stringByTrimmingCharactersInSet:
+                        for (NSUInteger i = 1; i < parts.count; i++) {
+                            NSString *rule = [parts[i] stringByTrimmingCharactersInSet:
                                               [NSCharacterSet whitespaceAndNewlineCharacterSet]];
                             if (rule.length < 2) continue;
-                            // 前缀特征（#id / .class / img:）要求更长，避免误伤同类控件
                             unichar h = [rule characterAtIndex:0];
                             if ((h == '#' || h == '.') && rule.length < 5) continue;
                             if ([rule hasPrefix:@"img:"] && rule.length < 8) continue;
@@ -650,12 +722,16 @@ static void FCPickAtPoint(CGPoint screenP) {
     } else {
         UIView *card = FCCardContainerFrom(hit);
         NSString *ruleText = FCPickRuleText(card);
+        // v8：先把选中元素框出来并标注识别到的内容（页面可见反馈）
+        CGRect markRect = [card convertRect:card.bounds toView:nil];
+        NSString *cls = NSStringFromClass([hit class]);
+        NSString *show = ruleText.length ? ruleText : cls;
+        FCShowPickMark(markRect, show);
         card.hidden = YES;
         gFCNativeHits++;
         if (ruleText.length >= 2) FCAddUserRule(ruleText);
         // v6：无文字/文字短时，退而记录触点 view 的 class 名（去掉数字后缀）作为同类特征
         if (ruleText.length < 3) {
-            NSString *cls = NSStringFromClass([hit class]);
             NSMutableString *clean = [NSMutableString string];
             for (NSUInteger i = 0; i < cls.length; i++) {
                 unichar c = [cls characterAtIndex:i];
@@ -663,7 +739,7 @@ static void FCPickAtPoint(CGPoint screenP) {
                 else if (c >= '0' && c <= '9') break;   // 去掉末尾编号
                 else break;
             }
-            if (clean.length >= 4) FCAddUserRule(clean);
+            if (clean.length >= 4 && !FCIsUnsafeClassRule(clean)) FCAddUserRule(clean);
         }
         FCShowBadgeMsg(ruleText.length >= 2 ? @"原生·已隐藏并记住" : @"原生·已隐藏");
     }
@@ -907,13 +983,13 @@ static CGRect FCDefaultBadgeFrame(void) {
     CGPoint p = [t locationInView:self];
 
     if (self.picking) {                                   // 点选模式：拾取
-        self.picking = NO;
-        // v7：点浮标自身=取消点选，不拾取（否则「再点浮标取消」会误拾取浮标下的元素）
+        // v8：点顶部浮标自身=退出点选；否则拾取触点下的元素（浮标已让位到顶部，不挡内容区）
         if (CGRectContainsPoint(gFCBadgeFrame, p)) {
-            FCShowBadgeMsg(@"已取消点选");
+            FCPickModeExit();
+            FCShowBadgeMsg(@"已结束选取");
             return;
         }
-        FCUpdateBadge();
+        // v8：保持点选模式（浮标在顶部让位），可连续选取多个元素；点顶部浮标才退出
         FCPickAtPoint(p);
         return;
     }
@@ -970,6 +1046,37 @@ static CGRect FCDefaultBadgeFrame(void) {
 
 @end
 
+// v8：进入点选——把浮标挪到屏幕顶部让开内容区（浮标原本会盖住上方 banner，导致那一条选不中）
+static CGRect gFCBadgeFrameBeforePick = {0};
+static void FCPickModeEnter(void) {
+    if (!gFCBadgeWindow) return;
+    gFCBadgeFrameBeforePick = gFCBadgeFrame;
+    gFCBadgeCollapsed = NO;
+    CGRect s = gFCBadgeWindow.bounds;
+    CGFloat w = MIN(s.size.width - 40, 200), h = 30;
+    gFCBadgeFrame = CGRectMake((s.size.width - w) / 2, 52, w, h);   // 顶部安全区，避开运营 banner
+    gFCBadgeBar.frame = gFCBadgeFrame;
+    gFCBadgeLabel.frame = CGRectInset(gFCBadgeBar.bounds, 6, 2);
+    gFCBadgeWindow.picking = YES;
+    gFCBadgeLabel.text = @"点广告元素 · 点此结束选取";
+    gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.85 green:0.1 blue:0.1 alpha:0.9] colorWithAlphaComponent:0.9];
+}
+
+static void FCPickModeExit(void) {
+    if (!gFCBadgeWindow) return;
+    gFCBadgeWindow.picking = NO;
+    // 清掉可能残留的标记
+    for (UIView *v in [gFCBadgeWindow.subviews copy]) if (v.tag == 9529) [v removeFromSuperview];
+    // 恢复进入点选前的浮标位置
+    if (!CGRectIsEmpty(gFCBadgeFrameBeforePick)) {
+        gFCBadgeFrame = gFCBadgeFrameBeforePick;
+        gFCBadgeNormalFrame = gFCBadgeFrameBeforePick;
+        gFCBadgeBar.frame = gFCBadgeFrame;
+        gFCBadgeLabel.frame = CGRectInset(gFCBadgeBar.bounds, 6, 2);
+    }
+    FCUpdateBadge();
+}
+
 static void FCEnsureBadgeWindow(void) {
     if (gFCBadgeWindow) return;
     CGRect s = [UIScreen mainScreen].bounds;
@@ -1007,7 +1114,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv7 规则%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv8 规则%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -1019,7 +1126,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv7 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv8 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1029,12 +1136,10 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v7"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v8"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
-                 handler:^(UIAlertAction *a){ gFCBadgeWindow.picking = YES;
-                     gFCBadgeLabel.text = @"点页面上的广告元素（再点浮标取消）";
-                     gFCBadgeBar.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.8]; }]];
+                 handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"管理规则（查看/编辑/新增）" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCShowRulePanel(); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"浮标复位" style:UIAlertActionStyleDefault
@@ -1092,7 +1197,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v7 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v8 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
