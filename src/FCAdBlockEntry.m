@@ -1379,9 +1379,11 @@ static NSString *FCTplNameFromData(id raw) {
     if (![t isKindOfClass:[NSDictionary class]]) return nil;
     NSString *name = t[@"name"];
     if (![name isKindOfClass:[NSString class]] || !name.length || name.length > 120) return nil;
-    NSString *ver = t[@"version"];
-    if ([ver isKindOfClass:[NSNumber class]]) ver = [ver stringValue];
-    if (![ver isKindOfClass:[NSString class]] || ver.length > 12) ver = nil;
+    id verRaw = t[@"version"];
+    NSString *ver = nil;
+    if ([verRaw isKindOfClass:[NSNumber class]]) ver = [(NSNumber *)verRaw stringValue];
+    else if ([verRaw isKindOfClass:[NSString class]]) ver = (NSString *)verRaw;
+    if (ver.length > 12) ver = nil;
     // 完整名 = name_version（与 setTemplateItem 对象名一致，如 secondfloor_10）
     return ver.length ? [NSString stringWithFormat:@"%@_%@", name, ver] : name;
 }
