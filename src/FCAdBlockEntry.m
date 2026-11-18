@@ -572,54 +572,6 @@ static void FCScanOnce(void) {
     FCApplyNativeRules();
 }
 
-#pragma mark - 点选标记浮层（v8：红框 + 识别文字，2.5s 自动消失）
-
-static void FCShowPickMark(CGRect screenRect, NSString *text) {
-    if (!gFCBadgeWindow) return;
-    // 清理上一次标记
-    for (UIView *old in [gFCBadgeWindow.subviews copy])
-        if (old.tag == 9529) [old removeFromSuperview];
-
-    CGRect s = gFCBadgeWindow.bounds;
-    // 规整坐标，避免 0 尺寸/越界
-    CGRect r = CGRectIntersection(screenRect, s);
-    if (CGRectIsNull(r) || r.size.width < 1 || r.size.height < 1) return;
-
-    UIView *mark = [[UIView alloc] initWithFrame:r];
-    mark.tag = 9529;
-    mark.userInteractionEnabled = NO;
-    mark.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.12];
-    mark.layer.borderColor = [[UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:1] CGColor];
-    mark.layer.borderWidth = 2.0;
-    mark.layer.cornerRadius = 4;
-    [gFCBadgeWindow addSubview:mark];
-
-    // 顶部/底部标签显示识别内容（自动选不遮内容的一侧）
-    NSString *label = text.length ? [text stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"(未识别到文字)";
-    if (label.length > 22) label = [NSString stringWithFormat:@"%@…", [label substringToIndex:22]];
-    UILabel *tip = [[UILabel alloc] init];
-    tip.text = [@"已选中: " stringByAppendingString:label];
-    tip.font = [UIFont boldSystemFontOfSize:11];
-    tip.textColor = [UIColor whiteColor];
-    tip.backgroundColor = [[UIColor colorWithRed:0.85 green:0.1 blue:0.1 alpha:0.95] colorWithAlphaComponent:0.95];
-    tip.textAlignment = NSTextAlignmentCenter;
-    tip.layer.cornerRadius = 4; tip.clipsToBounds = YES;
-    CGFloat tw = MIN(s.size.width - 16, MAX(140, label.length * 13));
-    CGFloat th = 24;
-    CGFloat ty = CGRectGetMinY(r) - th - 2;
-    if (ty < 50) ty = CGRectGetMaxY(r) + 2;              // 顶部放不下就放底部
-    if (ty + th > s.size.height - 10) ty = CGRectGetMinY(r) + 2;
-    tip.frame = CGRectMake(MAX(8, CGRectGetMidX(r) - tw / 2), ty, tw, th);
-    tip.tag = 9529;
-    [gFCBadgeWindow addSubview:tip];
-
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
-                   dispatch_get_main_queue(), ^{
-        [mark removeFromSuperview];
-        [tip removeFromSuperview];
-    });
-}
-
 #pragma mark - 找触点下最底层 view / 原生容器
 
 static UIView *FCHitViewAtPoint(CGPoint p) {
@@ -1075,6 +1027,50 @@ static void FCPickModeExit(void) {
         gFCBadgeLabel.frame = CGRectInset(gFCBadgeBar.bounds, 6, 2);
     }
     FCUpdateBadge();
+}
+
+// v8：点选标记浮层——红框 + 识别文字，2.5s 自动消失（放在 gFCBadgeWindow 定义之后）
+static void FCShowPickMark(CGRect screenRect, NSString *text) {
+    if (!gFCBadgeWindow) return;
+    for (UIView *old in [gFCBadgeWindow.subviews copy])
+        if (old.tag == 9529) [old removeFromSuperview];
+
+    CGRect s = gFCBadgeWindow.bounds;
+    CGRect r = CGRectIntersection(screenRect, s);
+    if (CGRectIsNull(r) || r.size.width < 1 || r.size.height < 1) return;
+
+    UIView *mark = [[UIView alloc] initWithFrame:r];
+    mark.tag = 9529;
+    mark.userInteractionEnabled = NO;
+    mark.backgroundColor = [[UIColor redColor] colorWithAlphaComponent:0.12];
+    mark.layer.borderColor = [[UIColor colorWithRed:1 green:0.15 blue:0.15 alpha:1] CGColor];
+    mark.layer.borderWidth = 2.0;
+    mark.layer.cornerRadius = 4;
+    [gFCBadgeWindow addSubview:mark];
+
+    NSString *label = text.length ? [text stringByReplacingOccurrencesOfString:@"\n" withString:@" "] : @"(未识别到文字)";
+    if (label.length > 22) label = [NSString stringWithFormat:@"%@…", [label substringToIndex:22]];
+    UILabel *tip = [[UILabel alloc] init];
+    tip.text = [@"已选中: " stringByAppendingString:label];
+    tip.font = [UIFont boldSystemFontOfSize:11];
+    tip.textColor = [UIColor whiteColor];
+    tip.backgroundColor = [[UIColor colorWithRed:0.85 green:0.1 blue:0.1 alpha:0.95] colorWithAlphaComponent:0.95];
+    tip.textAlignment = NSTextAlignmentCenter;
+    tip.layer.cornerRadius = 4; tip.clipsToBounds = YES;
+    CGFloat tw = MIN(s.size.width - 16, MAX(140, label.length * 13));
+    CGFloat th = 24;
+    CGFloat ty = CGRectGetMinY(r) - th - 2;
+    if (ty < 50) ty = CGRectGetMaxY(r) + 2;
+    if (ty + th > s.size.height - 10) ty = CGRectGetMinY(r) + 2;
+    tip.frame = CGRectMake(MAX(8, CGRectGetMidX(r) - tw / 2), ty, tw, th);
+    tip.tag = 9529;
+    [gFCBadgeWindow addSubview:tip];
+
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [mark removeFromSuperview];
+        [tip removeFromSuperview];
+    });
 }
 
 static void FCEnsureBadgeWindow(void) {
