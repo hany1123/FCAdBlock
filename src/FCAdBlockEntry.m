@@ -1,7 +1,14 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v8
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v9
 //
-//  v8 相对 v7（真机七次反馈：有些元素选不中 + 要求点击时自动识别标记内容）：
+//  v9 相对 v8（真机八次反馈：规则要标元素类型+左滑编辑删除、隐藏重启后失效）：
+//    ①修复隐藏「失效」真因：v7 的可逆判定对 hidden view 调 FCTextsOf 读文字，但
+//      FCCollectText 见 hidden 直接 return → 读到空 → 每 0.3s 误判「规则已删」自动恢复显示。
+//      v9 改为隐藏时把「命中的规则串」存 associatedObject，恢复判定改为查该规则是否还在规则表。
+//    ②规则面板：每条规则左侧显示类型标签（文/ID/类/图，按 #/. /img: 前缀判定，配色区分），
+//      左滑露出「编辑/删除」按钮，编辑聚焦输入框、删除移除该行；点空白/完成统一保存。
+//
+//  v8：点选浮标让位到顶部 + 点击自动识别并用红框文字标记选中元素。
 //    ①点选时浮标盖住页面上方 banner，且「点浮标=取消」，导致那一条区域元素选不中 →
 //      进入点选把浮标挪到顶部安全区(y=52)让开内容区，点选改为连续模式（点顶部浮标才退出）。
 //    ②点击命中后画临时标记：红框覆盖元素 frame + 标签显示识别到的文字/class，2.5s 消失；
@@ -484,20 +491,26 @@ static void FCApplyNativeRules(void) {
             if ([v isKindOfClass:[UIAlertController class]] ||
                 [vcls hasPrefix:@"UIAlert"] || [vcls hasPrefix:@"_UIAlert"]) continue;
 
-            // v7：被本插件隐藏过的 view，先尝试恢复（规则已删/已自愈时立即救回页面）
-            BOOL ours = [objc_getAssociatedObject(v, &kHiddenByFC) boolValue];
-            if (ours && v.hidden) {
-                NSArray *rt = FCTextsOf(v);
-                BOOL still = NO;
-                for (NSString *s in rt) for (NSString *rule in rules)
-                    if (FCRuleMatchesText(rule, s)) { still = YES; break; }
-                if (!still) for (NSString *rule in rules)
-                    if (rule.length >= 5 && [rule isEqualToString:vcls]) { still = YES; break; }
-                if (!still) {
+            // v9：被本插件隐藏过的 view——只有「当初命中的规则已被删除」才恢复显示。
+            // v7 旧做法(FCTextsOf重判)有致命 bug：hidden view 的文字根本读不到 → 每轮都误判失效→立刻恢复。
+            id stored = objc_getAssociatedObject(v, &kHiddenByFC);
+            if (stored && v.hidden) {
+                NSString *ruleUsed = [stored isKindOfClass:[NSString class]] ? stored : nil;
+                BOOL stillValid = NO;
+                if (ruleUsed.length) {
+                    for (NSString *r in rules) {
+                        if ([r isEqualToString:ruleUsed] ||
+                            [r rangeOfString:ruleUsed].location != NSNotFound ||
+                            [ruleUsed rangeOfString:r].location != NSNotFound) { stillValid = YES; break; }
+                    }
+                }
+                if (!stillValid) {
                     v.hidden = NO;
                     objc_setAssociatedObject(v, &kHiddenByFC, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    continue;
                 }
+                // 命中规则仍在 → 保持隐藏，但继续下钻子视图
+                for (UIView *sub in v.subviews) [q addObject:sub];
+                continue;
             }
 
             CGRect r = [v convertRect:v.bounds toView:nil];
@@ -512,19 +525,21 @@ static void FCApplyNativeRules(void) {
             }
             NSArray *texts = FCTextsOf(v);
             BOOL hit = NO;
+            NSString *hitRule = nil;
             // v7：class 名改为「精确相等」匹配（子串匹配会让 Cell/Label 命中整页同类）
             for (NSString *rule in rules) {
-                if (rule.length >= 5 && [rule isEqualToString:vcls]) { hit = YES; break; }
+                if (rule.length >= 5 && [rule isEqualToString:vcls]) { hit = YES; hitRule = rule; break; }
             }
             if (!hit) for (NSString *s in texts) {
                 for (NSString *rule in rules) {
-                    if (FCRuleMatchesText(rule, s)) { hit = YES; break; }
+                    if (FCRuleMatchesText(rule, s)) { hit = YES; hitRule = rule; break; }
                 }
                 if (hit) break;
             }
             if (hit) {
                 v.hidden = YES; gFCNativeHits++;
-                objc_setAssociatedObject(v, &kHiddenByFC, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                // v9：存「命中的规则」而非 @YES，供恢复判定用（FCTextsOf 读不到 hidden view 的文字）
+                objc_setAssociatedObject(v, &kHiddenByFC, hitRule ?: @"", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
             for (UIView *sub in v.subviews) [q addObject:sub];
         }
@@ -733,6 +748,111 @@ static void FCInjectWebViews(BOOL force) {
 
 #pragma mark - 规则管理面板（独立可成 key 的 window，支持键盘编辑）
 
+// v9：规则类型判定（按前缀），用于在面板里给每条规则打标签
+static NSString *FCRuleTypeText(NSString *r) {
+    if ([r hasPrefix:@"#"]) return @"ID";
+    if ([r hasPrefix:@"."]) return @"类";
+    if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return @"图";
+    return @"文";
+}
+static UIColor *FCRuleTypeColor(NSString *r) {
+    if ([r hasPrefix:@"#"]) return [UIColor colorWithRed:0.55 green:0.35 blue:0.85 alpha:1];
+    if ([r hasPrefix:@"."]) return [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return [UIColor colorWithRed:0.2 green:0.65 blue:0.35 alpha:1];
+    return [UIColor colorWithRed:0.42 green:0.48 blue:0.58 alpha:1];
+}
+
+// v9：规则行——左侧类型标签 + 可编辑文字，左滑露出「编辑/删除」
+@interface FCRuleRow : UIView <UIGestureRecognizerDelegate>
+@property (nonatomic, strong) UITextField *field;
+@property (nonatomic, strong) UILabel *typeTag;
+@property (nonatomic, strong) UIView *front;
+- (instancetype)initWithRule:(NSString *)rule placeholder:(BOOL)ph frame:(CGRect)frame;
+@end
+
+@implementation FCRuleRow
+- (instancetype)initWithRule:(NSString *)rule placeholder:(BOOL)ph frame:(CGRect)frame {
+    self = [super initWithFrame:frame];
+    if (!self) return nil;
+    CGFloat w = frame.size.width, h = frame.size.height;
+    self.clipsToBounds = YES;
+    self.backgroundColor = [UIColor clearColor];
+
+    UIButton *editB = [UIButton buttonWithType:UIButtonTypeCustom];
+    editB.frame = CGRectMake(w - 132, 3, 62, h - 6);
+    [editB setTitle:@"编辑" forState:UIControlStateNormal];
+    editB.titleLabel.font = [UIFont systemFontOfSize:12];
+    editB.backgroundColor = [UIColor colorWithRed:0.2 green:0.55 blue:0.95 alpha:1];
+    editB.layer.cornerRadius = 6;
+    [editB addTarget:self action:@selector(fcEdit) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:editB];
+
+    UIButton *delB = [UIButton buttonWithType:UIButtonTypeCustom];
+    delB.frame = CGRectMake(w - 66, 3, 62, h - 6);
+    [delB setTitle:@"删除" forState:UIControlStateNormal];
+    delB.titleLabel.font = [UIFont systemFontOfSize:12];
+    delB.backgroundColor = [UIColor colorWithRed:0.9 green:0.2 blue:0.2 alpha:1];
+    delB.layer.cornerRadius = 6;
+    [delB addTarget:self action:@selector(fcDelete) forControlEvents:UIControlEventTouchUpInside];
+    [self addSubview:delB];
+
+    UIView *front = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
+    front.backgroundColor = [UIColor whiteColor];
+    front.layer.cornerRadius = 6;
+    front.layer.borderColor = [UIColor colorWithRed:0.85 green:0.85 blue:0.87 alpha:1].CGColor;
+    front.layer.borderWidth = 0.5;
+
+    UILabel *tag = [[UILabel alloc] initWithFrame:CGRectMake(6, (h - 18) / 2, 28, 18)];
+    tag.font = [UIFont boldSystemFontOfSize:10];
+    tag.textAlignment = NSTextAlignmentCenter;
+    tag.textColor = [UIColor whiteColor];
+    tag.layer.cornerRadius = 4; tag.clipsToBounds = YES;
+    tag.text = ph ? @"＋" : FCRuleTypeText(rule);
+    tag.backgroundColor = ph ? [UIColor lightGrayColor] : FCRuleTypeColor(rule);
+    [front addSubview:tag];
+    self.typeTag = tag;
+
+    UITextField *f = [[UITextField alloc] initWithFrame:CGRectMake(40, 3, w - 46, h - 6)];
+    f.text = ph ? nil : rule;
+    f.placeholder = ph ? @"新增规则（广告文字）" : nil;
+    f.font = [UIFont systemFontOfSize:12];
+    f.clearButtonMode = UITextFieldViewModeWhileEditing;
+    [f addTarget:self action:@selector(fcTextChanged) forControlEvents:UIControlEventEditingChanged];
+    [front addSubview:f];
+    self.field = f;
+
+    UISwipeGestureRecognizer *sl = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(fcSwipe:)];
+    sl.direction = UISwipeGestureRecognizerDirectionLeft; sl.delegate = self;
+    [front addGestureRecognizer:sl];
+    UISwipeGestureRecognizer *sr = [[UISwipeGestureRecognizer alloc] initWithTarget:self action:@selector(fcSwipe:)];
+    sr.direction = UISwipeGestureRecognizerDirectionRight; sr.delegate = self;
+    [front addGestureRecognizer:sr];
+
+    self.front = front;
+    [self addSubview:front];
+    return self;
+}
+- (BOOL)gestureRecognizer:(UIGestureRecognizer *)g shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)o { return YES; }
+- (void)fcSwipe:(UISwipeGestureRecognizer *)g {
+    [self endEditing:YES];
+    CGFloat tx = (g.direction == UISwipeGestureRecognizerDirectionLeft) ? -136 : 0;
+    [UIView animateWithDuration:0.2 animations:^{
+        self.front.frame = CGRectMake(tx, 0, self.front.frame.size.width, self.front.frame.size.height);
+    }];
+}
+- (void)fcEdit {
+    [UIView animateWithDuration:0.2 animations:^{
+        self.front.frame = CGRectMake(0, 0, self.front.frame.size.width, self.front.frame.size.height);
+    }];
+    [self.field becomeFirstResponder];
+}
+- (void)fcDelete { [self removeFromSuperview]; }
+- (void)fcTextChanged {
+    self.typeTag.text = FCRuleTypeText(self.field.text);
+    self.typeTag.backgroundColor = FCRuleTypeColor(self.field.text);
+}
+@end
+
 @interface FCPanelWindow : UIWindow <UIGestureRecognizerDelegate>
 @end
 
@@ -828,7 +948,7 @@ static void FCShowRulePanel(void) {
     gFCRuleCard = card;
 
     UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, w - 32, 30)];
-    title.text = @"已生效规则（可直接修改，点空白保存）";
+    title.text = @"已生效规则（左滑编辑/删除 · 点空白保存）";
     title.font = [UIFont boldSystemFontOfSize:14];
     title.textColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.12 alpha:1];
     [card addSubview:title];
@@ -836,22 +956,19 @@ static void FCShowRulePanel(void) {
     CGFloat rowY = 50;
     NSArray *rules = FCUserRules();
     for (NSUInteger i = 0; i < rules.count && rowY < cardH - 110; i++) {
-        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(16, rowY, w - 70, 34)];
-        tf.text = rules[i];
-        tf.font = [UIFont systemFontOfSize:12];
-        tf.borderStyle = UITextBorderStyleRoundedRect;
-        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
-        [card addSubview:tf];
-        rowY += 40;
+        FCRuleRow *row = [[FCRuleRow alloc] initWithRule:rules[i] placeholder:NO
+                                        frame:CGRectMake(12, rowY, w - 24, 36)];
+        row.tag = 9528;   // 扫描排除
+        [card addSubview:row];
+        rowY += 42;
     }
     // 至少留一个空行方便新增
     if (rowY < cardH - 110) {
-        UITextField *tf = [[UITextField alloc] initWithFrame:CGRectMake(16, rowY, w - 70, 34)];
-        tf.placeholder = @"新增规则（广告文字）";
-        tf.font = [UIFont systemFontOfSize:12];
-        tf.borderStyle = UITextBorderStyleRoundedRect;
-        [card addSubview:tf];
-        rowY += 40;
+        FCRuleRow *row = [[FCRuleRow alloc] initWithRule:nil placeholder:YES
+                                        frame:CGRectMake(12, rowY, w - 24, 36)];
+        row.tag = 9528;
+        [card addSubview:row];
+        rowY += 42;
     }
 
     // 「完成」按钮（保存并关闭）
@@ -1110,7 +1227,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv8 规则%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv9 规则%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -1122,7 +1239,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv8 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv9 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1132,7 +1249,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v8"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v9"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1193,7 +1310,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v8 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v9 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
