@@ -114,8 +114,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===14){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=14;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===15){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=15;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -440,6 +440,16 @@ static NSArray<NSString *> *FCBuiltinAdKeys(void) {
     return keys;
 }
 
+// v15：诊断实证的宿主运营组件类——原生卡片文字是「¥20/洗衣」等价格，文字词表永远匹配不上，
+// 只能按类名隐藏。这些类来自真机诊断输出（HiveConsumer.PersonaMoreCouponItemView 等）。
+static NSArray<NSString *> *FCBuiltinAdClasses(void) {
+    static NSArray *keys = nil; static dispatch_once_t once;
+    dispatch_once(&once, ^{ keys = @[
+        @"PersonaMoreCouponItemView",    // 我的页-更多省钱卡列表项（¥20/洗衣）
+    ]; });
+    return keys;
+}
+
 static BOOL FCIsBuiltinAdKey(NSString *s) {
     if (!s.length) return NO;
     for (NSString *k in FCBuiltinAdKeys()) if ([k isEqualToString:s]) return YES;
@@ -661,12 +671,21 @@ static void FCApplyNativeRules(void) {
             BOOL hit = NO;
             NSString *hitRule = nil;
             BOOL builtinHit = NO;
+            BOOL classHardHit = NO;   // v15：类名硬证据命中，跳过文案闸门
             // v7：class 名改为「精确相等」匹配（子串匹配会让 Cell/Label 命中整页同类）
             for (NSString *rule in rules) {
                 if (rule.length >= 5 && [rule isEqualToString:vcls]) { hit = YES; hitRule = rule; break; }
                 // v13：元素指纹 cls:/pos:——图片型运营位（无文字）靠类名+屏幕位置命中
                 if (FCRuleMatchesFingerprint(rule, vcls, r, [UIScreen mainScreen].bounds.size.width, sh)) {
                     hit = YES; hitRule = rule; break;
+                }
+            }
+            // v15：内置运营组件类（诊断实证）——按类名精确命中，不受文案/闸门影响
+            if (!hit && FCBuiltinEnabled()) {
+                for (NSString *bc in FCBuiltinAdClasses()) {
+                    if ([vcls rangeOfString:bc].location != NSNotFound) {
+                        hit = YES; hitRule = bc; builtinHit = YES; classHardHit = YES; break;
+                    }
                 }
             }
             if (!hit) for (NSString *s in texts) {
@@ -681,7 +700,7 @@ static void FCApplyNativeRules(void) {
             }
             if (hit) {
                 // v11：内置关键词命中时加严格尺寸闸门——绝不让「包含 banner 的大卡片」整块消失
-                if (builtinHit && (r.size.height > sh * 0.30 || r.size.width < 90 || texts.count > 16)) {
+                if (builtinHit && !classHardHit && (r.size.height > sh * 0.30 || r.size.width < 90 || texts.count > 16)) {
                     gFCBuiltinBlocked++;   // v12：浮标可见，区分「没匹配」和「匹配但被闸门挡」
                     for (UIView *sub in v.subviews) [q addObject:sub];
                     continue;
@@ -847,17 +866,30 @@ static void FCPickAtPoint(CGPoint screenP) {
         card.hidden = YES;
         gFCNativeHits++;
         if (ruleText.length >= 2) FCAddUserRule(ruleText);
-        // v13：元素指纹——无论有无文字都存 cls:类名 + pos:屏幕相对位置，图片型广告也能复现
+        // v15 修复真 bug：v13 存的是 hit(UIImageView 等系统类，被 FCIsUnsafeClassRule 拒绝)，
+        // 导致点选从来没存下有用的类名。改为从 card 沿祖先链收集所有「宿主自定义类」。
+        // 诊断实证：运营位是 HiveConsumer.PersonaMoreCouponItemView 这种宿主类，文字是 ¥20/洗衣
+        NSUInteger clsAdded = 0;
+        UIView *curC = card;
+        for (int depth = 0; curC && depth < 6; depth++) {
+            NSString *c = NSStringFromClass([curC class]);
+            // 只收宿主自定义类（含点号如 HiveConsumer.XxxView，或带业务前缀），排除系统 UI/NS
+            BOOL hostClass = ([c rangeOfString:@"."].location != NSNotFound) ||
+                (![c hasPrefix:@"UI"] && ![c hasPrefix:@"NS"] && ![c isEqualToString:@"UIView"]);
+            if (hostClass && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
+                FCAddUserRule([@"cls:" stringByAppendingString:c]);
+                clsAdded++;
+            }
+            curC = curC.superview;
+        }
         CGSize scr = [UIScreen mainScreen].bounds.size;
         CGRect nr = [card convertRect:card.bounds toView:nil];
-        if (cls.length >= 4 && !FCIsUnsafeClassRule(cls))
-            FCAddUserRule([@"cls:" stringByAppendingString:cls]);
         if (nr.size.width >= 40 && nr.size.height >= 18) {
             FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
                 nr.origin.x/scr.width, nr.origin.y/scr.height,
                 nr.size.width/scr.width, nr.size.height/scr.height]);
         }
-        FCShowBadgeMsg(ruleText.length >= 2 ? @"原生·已记文字+指纹" : @"原生·已记位置指纹");
+        FCShowBadgeMsg([NSString stringWithFormat:@"原生·已记%lu类+位置", (unsigned long)clsAdded]);
     }
 }
 
@@ -1522,7 +1554,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv14 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv15 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1535,7 +1567,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv14 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv15 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1545,7 +1577,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v14"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v15"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1618,7 +1650,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v14 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v15 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
