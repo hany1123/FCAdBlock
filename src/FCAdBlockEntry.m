@@ -1,5 +1,12 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v11
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v12
+//
+//  v12 相对 v11（真机十一次反馈：「FCv11 规则8 内0」，部分运营位仍没隐藏）：
+//    截图「我的」页明确显示 寄件省钱卡/查价领返现/100元寄件券包，但内置命中 0。
+//    两个原因：①v11 的内置闸门要求宽≥120pt，而这些卡片实测约 109pt，全被挡；
+//    ②「100元寄件券包 / 69.9元 / 马上抢 / 洗护券」不在内置关键词里（旧词是
+//      「百元券包 / 69.9元抢」），文案对不上。v12 放宽闸门到 90pt、按截图补词、
+//      H5 的 K 同步，并在浮标加「挡N」显示被闸门拦下的命中数供诊断。
 //
 //  v11 相对 v10（真机十次反馈：重启后隐藏仍没生效，规则 5 条都在）：
 //    真因不是持久化——截图浮标「FCv10 规则5」证明规则完好。是**内置运营广告关键词
@@ -91,7 +98,7 @@ static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 "if(W.__fcadLoaded){if(W.__fcadSweep){W.__fcadSweep();}return;}"
 "W.__fcadLoaded=1;W.__fcadHits=0;"
-"var K=['百元券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','5元立减券','69.9元抢','立即抢购','9.9洗衣','领福利'];"
+"var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
 "if(e.getAttribute){add(e.getAttribute('alt'));add(e.getAttribute('aria-label'));"
@@ -254,6 +261,7 @@ static NSUInteger gFCWindows = 0, gFCEvidences = 0, gFCSplashHits = 0;
 static NSUInteger gFCOpEvidence = 0, gFCWebViewFound = 0, gFCH5Hits = 0;
 static NSUInteger gFCNativeHits = 0;
 static NSUInteger gFCBuiltinHits = 0;   // v11：内置运营广告规则命中数（区别于用户点选规则）
+static NSUInteger gFCBuiltinBlocked = 0; // v12：内置命中但被尺寸闸门拦下的次数（诊断用）
 
 #pragma mark - 双向规则匹配（v5 修复返回失效核心）
 
@@ -358,9 +366,11 @@ static BOOL FCTextsAreSplash(NSArray<NSString *> *texts) {
 static NSArray<NSString *> *FCBuiltinAdKeys(void) {
     static NSArray *keys = nil; static dispatch_once_t once;
     dispatch_once(&once, ^{ keys = @[
-        @"百元券包", @"限量1折", @"限量2折", @"限量7折", @"寄件省钱卡",
-        @"查价领返现", @"换季洗羽绒", @"换季洗", @"5元立减券",
-        @"69.9元抢", @"立即抢购", @"9.9洗衣", @"领福利",
+        @"百元券包", @"100元寄件券包", @"寄件券包", @"限量1折",
+        @"限量2折", @"限量7折", @"寄件省钱卡", @"查价领返现",
+        @"换季洗羽绒", @"换季洗", @"洗护券", @"5元立减券",
+        @"69.9元", @"马上抢", @"立即抢购", @"9.9洗衣",
+        @"领福利", @"立省30", @"顺丰专享券包",
     ]; });
     return keys;
 }
@@ -602,7 +612,8 @@ static void FCApplyNativeRules(void) {
             }
             if (hit) {
                 // v11：内置关键词命中时加严格尺寸闸门——绝不让「包含 banner 的大卡片」整块消失
-                if (builtinHit && (r.size.height > sh * 0.25 || r.size.width < 120 || texts.count > 14)) {
+                if (builtinHit && (r.size.height > sh * 0.30 || r.size.width < 90 || texts.count > 16)) {
+                    gFCBuiltinBlocked++;   // v12：浮标可见，区分「没匹配」和「匹配但被闸门挡」
                     for (UIView *sub in v.subviews) [q addObject:sub];
                     continue;
                 }
@@ -1297,9 +1308,10 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv11 规则%lu 内%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv12 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
-        (unsigned long)gFCNativeHits, (unsigned long)gFCH5Hits, top];
+        (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
+        (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 }
 
@@ -1309,7 +1321,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv11 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv12 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1319,7 +1331,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v11"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v12"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1389,7 +1401,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v11 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v12 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
