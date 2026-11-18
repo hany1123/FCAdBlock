@@ -1,5 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v34（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v35（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v35 相对 v34（老大 v34 真机：second_pit 源头拦截命中+源头压0容器4个，但首页
+//    搜索栏下白块仍在，天猫入口+轮播点还在——被压的4个容器都不含白块主体）：
+//    【白块真凶修正】v34 误判「secondfloor 是首页信息流容器、拦了会整页空白」，
+//    实际 golden 取证：商品信息流是 recommend_* 系列（recommend_m_home_*/
+//    recommend_newface_*），secondfloor（secondfloor_10/secondfloor.zip,columnType=one）
+//    是独立的搜索栏下运营楼层。老大授权「拦+压，天猫入口一起去掉」。
+//    改：①内置身份表加 secondfloor 子串（拦内容+FCZeroSourceRoot 压容器，商品流不碰）；
+//    ②诊断加「白块候选容器」只读段（宽≥90%屏/高150~600/无文字大容器，列类名+frame+
+//    bridge模板名+是否命中拦截），若 v35 仍未消白块，一段定位真凶不再猜容器层级。
+//    例行 __fcadVer 34→35。
 //
 //  v34 相对 v33（老大 v33 真机：88横幅已消失=源头拦截生效；只剩搜索栏下方大白块，
 //    压0从42暴涨到101仍压不掉）：
@@ -328,8 +339,8 @@ static void FCPruneSourceZeros(void);   // v34：源头压0复用自愈
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===34){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=34;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===35){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=35;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1628,8 +1639,12 @@ static BOOL FCTplBuiltinBlocked(NSString *tpl) {
         @"88_campaign",           // 超级88 领券中心（老大反复要去掉的）
         @"campaign_bottom_bar",   // 首页底部活动条
         // v34：搜索栏下方运营坑位（轮播+天猫入口），真机取证 second_pit_searchbar_slim。
-        // 只按「second_pit」身份子串拦，绝不写 secondfloor——后者是首页信息流容器，拦了会整页空白。
-        @"second_pit",            // 搜索栏下方大坑位（约半屏白块的真凶）
+        @"second_pit",            // 搜索栏下方小坑位（v34 拦了但白块没塌）
+        // v35：白块真凶修正——撑高度的是 secondfloor（secondfloor_10 / secondfloor.zip），
+        // 不是 second_pit。v34 误把 secondfloor 当「首页信息流容器」故没拦，白块纹丝不动。
+        // 真机取证：商品信息流是 recommend_* 系列（recommend_m_home_*/recommend_newface_*），
+        // 与 secondfloor 是两个独立模板；拦 secondfloor 不会动商品流。老大已授权「拦+压」。
+        @"secondfloor",           // 搜索栏下方运营楼层（白块主体，约470pt）
     ]; });
     for (NSString *key in ids)
         if ([tpl rangeOfString:key].location != NSNotFound) return YES;
@@ -2409,9 +2424,62 @@ static NSMutableArray<NSString *> *gFCProbeDeep = nil;   // v31：secondfloor �
 static NSUInteger gFCProbeDropped = 0;
 #endif
 
+// v35：统计子树有效文字条数（上限3即止，供白块候选判定；浅层即可，深容器不必全扫）
+static NSUInteger FCCountSubTexts(UIView *v, int depth) {
+    if (!v || depth > 8) return 0;
+    NSUInteger n = FCOwnTextOf(v).length ? 1 : 0;
+    if (n >= 3) return n;
+    for (UIView *s in v.subviews) {
+        n += FCCountSubTexts(s, depth + 1);
+        if (n >= 3) break;
+    }
+    return n;
+}
+
+// v35：兜底只读诊断——列出「看起来在撑高度的大空白容器」，用于 v35 仍未消白块时精准定位。
+// 判据：宽≥90%屏、高150~600、屏幕Y在80~700、子树有效文字≤2、非明确系统/业务容器、未被压0。
+// 输出类名+frame+bridge模板名+是否命中拦截，一次截图即可锁定白块真凶，不再靠猜容器层级。
+static void FCAppendBlankContainerDiag(void) {
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+    (void)sh;
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    NSArray *hardExclude = @[@"UIWindow", @"UICollectionView", @"UITableView", @"UITabBar",
+                             @"UINavigationBar", @"UIToolbar", @"UILabel", @"UIImageView",
+                             @"UIButton", @"WKWebView", @"UISwitch", @"UISlider", @"UIScrollView"];
+    for (UIWindow *w in FCAllWindows()) {
+        NSString *wc = NSStringFromClass([w class]);
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
+            [wc isEqualToString:@"FCDiagWindow"]) continue;
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
+        NSUInteger idx = 0;
+        while (idx < q.count && idx < 1200 && out.count < 12) {
+            UIView *v = q[idx++];
+            for (UIView *sub in v.subviews) [q addObject:sub];
+            if (objc_getAssociatedObject(v, &kFCZeroRec)) continue;   // 已压0的不列为候选
+            NSString *cls = NSStringFromClass([v class]);
+            BOOL excluded = NO;
+            for (NSString *e in hardExclude) if ([cls isEqualToString:e]) { excluded = YES; break; }
+            if (excluded) continue;
+            CGRect r = [v convertRect:v.bounds toView:nil];
+            if (r.size.width < sw * 0.9 || r.size.height < 150 || r.size.height > 600) continue;
+            if (r.origin.y < 80 || r.origin.y > 700) continue;
+            if (FCCountSubTexts(v, 0) > 2) continue;
+            NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:v] : nil;
+            BOOL blocked = tpl.length ? FCTplIsBlocked(tpl) : NO;
+            [out addObject:[NSString stringWithFormat:
+                @"[白块候选] %@ | %.0f,%.0f %.0fx%.0f | 子view%lu | tpl:%@ | 拦:%@",
+                cls, r.origin.x, r.origin.y, r.size.width, r.size.height,
+                (unsigned long)v.subviews.count, tpl.length ? tpl : @"-", blocked ? @"是" : @"否"]];
+        }
+    }
+    if (!out.count) FCAppendDiagText(@"[白块候选] 无（未发现可疑大空白容器）");
+    for (NSString *line in out) FCAppendDiagText(line);
+}
+
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v34 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v35 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2422,6 +2490,7 @@ static void FCFillDiagnose(void) {
     NSUInteger srcZero = gFCSourceZeroed ? gFCSourceZeroed.count : 0;
     FCAppendDiagText([NSString stringWithFormat:@"[压0] 当前压平 %lu 个窗口 / 源头压0容器 %lu / 累计重压 %lu 次（原生视图层，非删节点）",
         (unsigned long)zeroNow, (unsigned long)srcZero, (unsigned long)gFCZeroApplied]);
+    FCAppendBlankContainerDiag();     // v35：白块候选容器只读诊断——下次若白块还在，一段就能定位撑高度的是谁
     // v22：逐条打印规则真实内容 + 类型——老大一眼看清点选到底存了文字还是 cls:/pos: 指纹
     for (NSUInteger i = 0; i < diagUserRules.count; i++) {
         NSString *rule = diagUserRules[i];
@@ -2873,7 +2942,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv34 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv35 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -2886,7 +2955,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv34 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv35 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2897,7 +2966,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v34"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v35"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3170,7 +3239,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v34 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v35 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
