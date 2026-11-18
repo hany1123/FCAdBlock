@@ -1,5 +1,12 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v13
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v14
+//
+//  v14 相对 v13（真机浮标「FCv13 规则9 内0 挡0 原19 H50」，运营位仍不动）：
+//    连续多版盲改无效——停止猜测，改为「诊断优先」。真因待定：内0挡0 说明原生扫描
+//    完全没匹配到这些运营位文字，它们极可能在 WKWebView 里（H5）或文字画在切图上。
+//    v14：①浮标菜单加「诊断当前页面」——把原生视图树(class+文字+frame)和
+//    WKWebView 的 DOM 文本/图片名全部导出到浮标可滚动文本框，截图即可一次定位；
+//    ②网页 sweep 加固：glob 匹配 alt/aria-label、放宽文字长度、body 直接文本兜底。
 //
 //  v13 相对 v12（老大问「规则里为什么都是文字」+ 浮标内0挡0）：
 //    根因：点选拾取只取「最长中文串」当规则（FCPickRuleText），图片型运营位
@@ -99,14 +106,16 @@ static CGRect FCDefaultBadgeFrame(void);
 static void FCShowPickMark(CGRect screenRect, NSString *text);
 static void FCPickModeEnter(void);
 static void FCPickModeExit(void);
+static void FCShowDiagnose(void);   // v14：页面结构诊断面板
+static void FCAppendDiagText(NSString *s);
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===13){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=13;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===14){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=14;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -115,7 +124,11 @@ static NSString * const FCJSAdCardsTemplate =
 "var c=e.className&&(''+e.className).trim().split(/\\s+/)[0];if(c)add('.'+c);"
 "var src=e.getAttribute('src')||e.getAttribute('data-src');"
 "if(src){var m=src.split('/').pop().split('?')[0];"
-"if(m&&m.length>=4&&/\\.(png|jpg|jpeg|gif|webp)/i.test(m))add('img:'+m);}}"
+"if(m&&m.length>=4&&/\\.(png|jpg|jpeg|gif|webp)/i.test(m))add('img:'+m);}"
+// v14：CSS 背景图（很多运营位用 background-image，img 标签抓不到）
+"var bg=e.style&&e.style.backgroundImage?e.style.backgroundImage:'';"
+"var bm=bg.match(/url\\(['\"]?([^'\")]+)/i);"
+"if(bm){var bn=bm[1].split('/').pop().split('?')[0];if(bn&&bn.length>=4)add('img:'+bn);}}"
 "return a;}"
 "function hit(e){"
 "if(!e||e.nodeType!==1)return false;"
@@ -129,6 +142,8 @@ static NSString * const FCJSAdCardsTemplate =
 // v13：sel: 精确 CSS 选择器路径——图片型运营位无文字，靠结构指纹命中
 "if(a.indexOf('sel:')===0){var q=a.slice(4);try{if(e.matches&&e.matches(q))return true;"
 "if(e.querySelector&&e.querySelector(q))return true;}catch(ex){}continue;}"
+"if(a.charAt(0)==='*'){var g=a.slice(1);if(g&&(t.indexOf(g)>=0))return true;"
+"for(var z=0;z<ks.length;z++){if(ks[z].indexOf(g)>=0)return true;}continue;}"
 "if(t&&t.indexOf(a)>=0)return true;"
 "for(var j=0;j<ks.length;j++){if(ks[j].indexOf(a)>=0)return true;}}"
 "return false;}"
@@ -593,7 +608,7 @@ static void FCApplyNativeRules(void) {
     static char kHiddenByFC;
     for (UIWindow *w in FCAllWindows()) {
         NSString *wc = NSStringFromClass([w class]);
-        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"]) continue;
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] || [wc isEqualToString:@"FCDiagWindow"]) continue;
         if (w.hidden || w.alpha < 0.01) continue;
         // v7：绝不扫描系统弹窗/键盘/文字特效 window，否则把 UIAlertController 内容也隐藏
         if ([wc hasPrefix:@"UITextEffects"] || [wc hasPrefix:@"UIRemoteKeyboard"] ||
@@ -686,7 +701,7 @@ static void FCScanOnce(void) {
     for (UIWindow *w in windows) {
         if (!w || w.hidden || w.alpha < 0.01) continue;
         NSString *wc = NSStringFromClass([w class]);
-        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"]) continue;
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] || [wc isEqualToString:@"FCDiagWindow"]) continue;
         if ([wc hasPrefix:@"UITextEffects"] || [wc hasPrefix:@"UIRemoteKeyboard"] ||
             [wc hasPrefix:@"_UI"] || [wc isEqualToString:@"_UITouchEffectWindow"]) continue;
         NSArray *wtexts = FCTextsOf(w);
@@ -728,7 +743,7 @@ static UIView *FCHitViewAtPoint(CGPoint p) {
     UIView *found = nil;
     for (UIWindow *w in FCAllWindows()) {
         NSString *wc = NSStringFromClass([w class]);
-        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"]) continue;
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] || [wc isEqualToString:@"FCDiagWindow"]) continue;
         if (w.hidden || w.alpha < 0.01) continue;
         if (!CGRectContainsPoint(w.bounds, p)) continue;
         NSMutableArray<UIView *> *stack = [NSMutableArray arrayWithObject:w];
@@ -854,7 +869,7 @@ static void FCInjectWebViews(BOOL force) {
     NSString *js = FCBuildInjectionJS();
     for (UIWindow *w in FCAllWindows()) {
         NSString *wc = NSStringFromClass([w class]);
-        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"]) continue;
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] || [wc isEqualToString:@"FCDiagWindow"]) continue;
         NSMutableArray *q = [NSMutableArray arrayWithObject:w]; NSUInteger idx = 0;
         while (idx < q.count && idx < 500) {
             UIView *v = q[idx++];
@@ -1123,6 +1138,148 @@ static void FCHidePanel(void) {
     FCCloseRulePanelAndCommit(YES);
 }
 
+#pragma mark - v14：页面结构诊断面板（原生视图树 + WKWebView DOM）
+
+@interface FCDiagWindow : UIWindow
+- (void)fcCloseDiag;
+@end
+static FCDiagWindow *gFCDiagWindow = nil;
+static UITextView *gFCDiagText = nil;
+
+@implementation FCDiagWindow
+- (BOOL)canBecomeKeyWindow { return YES; }
+- (void)fcCloseDiag {
+    [self.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
+    self.hidden = YES;
+    gFCDiagText = nil;
+}
+@end
+
+static void FCAppendDiagText(NSString *s) {
+    if (!gFCDiagText) return;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        gFCDiagText.text = [gFCDiagText.text stringByAppendingFormat:@"%@\n", s];
+        [gFCDiagText scrollRangeToVisible:NSMakeRange(gFCDiagText.text.length, 0)];
+    });
+}
+
+// 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
+static void FCFillDiagnose(void) {
+    FCAppendDiagText(@"===== FC 页面诊断 v14 =====");
+    FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCTopViewController() class]) ?: @"-"]);
+    FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
+        (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
+    // 1) 原生视图树：列出所有有文字的 view（class + 文字 + frame），并标记它命中了哪条规则
+    NSArray *rules = FCEffectiveRules();
+    for (UIWindow *w in FCAllWindows()) {
+        NSString *wc = NSStringFromClass([w class]);
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
+            [wc isEqualToString:@"FCDiagWindow"]) continue;
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
+        NSUInteger idx = 0;
+        while (idx < q.count && idx < 400) {
+            UIView *v = q[idx++];
+            NSArray *texts = FCTextsOf(v);
+            if (texts.count) {
+                NSString *joined = [[texts subarrayWithRange:NSMakeRange(0, MIN(texts.count, 3))]
+                                    componentsJoinedByString:@" / "];
+                CGRect r = [v convertRect:v.bounds toView:nil];
+                // 标出哪些规则命中了这个 view 的文字
+                NSMutableArray *matched = [NSMutableArray array];
+                for (NSString *rule in rules) {
+                    for (NSString *t in texts) {
+                        if (FCRuleMatchesText(rule, t)) { [matched addObject:rule]; break; }
+                    }
+                }
+                FCAppendDiagText([NSString stringWithFormat:@"[原生] %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
+                    NSStringFromClass([v class]), joined,
+                    r.origin.x, r.origin.y, r.size.width, r.size.height,
+                    matched.count ? [matched componentsJoinedByString:@","] : @"无"]);
+            }
+            for (UIView *sub in v.subviews) [q addObject:sub];
+        }
+    }
+    // 2) WKWebView：注入诊断 JS，回传 body 直系运营文案 + 图片名 + 数量
+    Class wk = NSClassFromString(@"WKWebView"); if (!wk) { FCAppendDiagText(@"无 WKWebView 类"); return; }
+    SEL sel = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
+    NSString *js = @"(function(){var a=document.querySelectorAll('div,li,a,section,article,img,span,p');"
+        "var out=[],n=0;for(var i=0;i<a.length&&n<25;i++){var e=a[i];"
+        "var t=(e.innerText||e.textContent||'').trim();"
+        "var src=e.getAttribute('src')||e.getAttribute('data-src')||'';"
+        "var bg=(e.style&&e.style.backgroundImage||'');"
+        "if((t&&t.length>=2&&t.length<=60)||src||bg){out.push(e.tagName+'.'+(''+e.className).split(/\\s+/)[0]+' | '+t.slice(0,40)+' | '+src.split('/').pop().slice(0,30)+' | '+bg.slice(0,40));n++;}}"
+        "return out.join('\\n')||'(DOM空)';})()";
+    __block NSUInteger found = 0;
+    for (UIWindow *w in FCAllWindows()) {
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w]; NSUInteger idx = 0;
+        while (idx < q.count && idx < 400) {
+            UIView *v = q[idx++];
+            if ([v isKindOfClass:wk] && [v respondsToSelector:sel]) {
+                found++;
+                CGRect r = [v convertRect:v.bounds toView:nil];
+                FCAppendDiagText([NSString stringWithFormat:@"----- WKWebView #%lu frame %.0f,%.0f %.0fx%.0f -----",
+                    (unsigned long)found, r.origin.x, r.origin.y, r.size.width, r.size.height]);
+                IMP imp = [v methodForSelector:sel];
+                ((void (*)(id, SEL, NSString *, void (^)(id, NSError *)))imp)
+                    (v, sel, js, ^(id result, NSError *err){
+                        NSString *txt = err ? [NSString stringWithFormat:@"JS错误:%@", err.localizedDescription]
+                                            : ([result isKindOfClass:[NSString class]] ? result : @"(无返回)");
+                        for (NSString *line in [txt componentsSeparatedByString:@"\n"])
+                            FCAppendDiagText([@"[网页] " stringByAppendingString:line]);
+                    });
+            }
+            for (UIView *sub in v.subviews) [q addObject:sub];
+        }
+    }
+    if (!found) FCAppendDiagText(@"未找到 WKWebView——运营位大概率是原生绘制");
+    FCAppendDiagText(@"===== 诊断结束（可截图发我）=====");
+}
+
+static void FCShowDiagnose(void) {
+    FCHidePanel();
+    CGRect s = [UIScreen mainScreen].bounds;
+    if (!gFCDiagWindow) {
+        gFCDiagWindow = [[FCDiagWindow alloc] initWithFrame:s];
+        gFCDiagWindow.windowLevel = UIWindowLevelAlert + 110;
+        if (@available(iOS 13.0, *)) {
+            for (UIScene *sc in [UIApplication sharedApplication].connectedScenes) {
+                if ([sc isKindOfClass:[UIWindowScene class]]) {
+                    gFCDiagWindow.windowScene = (UIWindowScene *)sc; break;
+                }
+            }
+        }
+    }
+    [gFCDiagWindow.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
+    gFCDiagWindow.frame = s;
+    UIView *bg = [[UIView alloc] initWithFrame:s];
+    bg.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
+    [gFCDiagWindow addSubview:bg];
+
+    CGFloat top = 54;
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 18, s.size.width - 110, 30)];
+    title.text = @"页面诊断（上滑查看）";
+    title.textColor = [UIColor whiteColor];
+    title.font = [UIFont boldSystemFontOfSize:16];
+    [bg addSubview:title];
+    UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+    close.frame = CGRectMake(s.size.width - 90, 16, 76, 34);
+    [close setTitle:@"关闭" forState:UIControlStateNormal];
+    close.titleLabel.font = [UIFont systemFontOfSize:15];
+    [close addTarget:gFCDiagWindow action:@selector(fcCloseDiag) forControlEvents:UIControlEventTouchUpInside];
+    [bg addSubview:close];
+
+    gFCDiagText = [[UITextView alloc] initWithFrame:CGRectMake(12, top, s.size.width - 24, s.size.height - top - 20)];
+    gFCDiagText.backgroundColor = [UIColor clearColor];
+    gFCDiagText.textColor = [UIColor colorWithRed:0.6 green:1.0 blue:0.7 alpha:1];
+    gFCDiagText.font = [UIFont fontWithName:@"Menlo" size:10];
+    gFCDiagText.editable = NO;
+    gFCDiagText.text = @"收集页面中…";
+    [bg addSubview:gFCDiagText];
+    gFCDiagWindow.hidden = NO;
+    [gFCDiagWindow makeKeyWindow];
+    dispatch_async(dispatch_get_main_queue(), ^{ FCFillDiagnose(); });
+}
+
 #pragma mark - 常驻浮标窗口（v5：可拖动 / 边缘吸附小白条 / tap 菜单）
 
 @interface FCBadgeWindow : UIWindow
@@ -1365,7 +1522,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv13 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv14 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1378,7 +1535,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv13 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv14 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1388,12 +1545,15 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v13"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v14"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"管理规则（查看/编辑/新增）" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCShowRulePanel(); }]];
+    // v14：诊断当前页面——一次看清运营位在原生还是网页、命中了什么规则
+    [ac addAction:[UIAlertAction actionWithTitle:@"诊断当前页面（发给开发者）" style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){ FCShowDiagnose(); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"浮标复位" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ gFCBadgeCollapsed = NO; gFCBadgeSide = 0;
                      gFCBadgeNormalFrame = FCDefaultBadgeFrame();
@@ -1458,7 +1618,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v13 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v14 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
