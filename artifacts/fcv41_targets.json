@@ -59,10 +59,12 @@
       "u16:面积小",
       "u16:源头坑位外壳塌陷",
       "u16:精简已达70行上限",
-      "originalHeightSpec",
       "u16:高度归零",
       "u16:高度归属",
-      "u16:只写不读"
+      "u16:只写不读",
+      "setOriginalHeightSpec:",
+      "u16:高度签名",
+      "u16:非对象·已跳过"
     ],
     "no": [
       "CydiaSubstrate",
@@ -85,7 +87,6 @@
       "setTemplateItem:",
       "setViewModel:",
       "setOriginalHeightSpec:",
-      "originalHeightSpec",
       "DXScrollerLayoutCell",
       "DXTemplateItem:",
       "88_campaign",
@@ -109,7 +110,8 @@
       "u16:高度归零",
       "u16:高度归属",
       "u16:只写不读",
-      "u16:非对象·已跳过"
+      "u16:非对象·已跳过",
+      "u16:高度签名"
     ],
     "no": [
       "CydiaSubstrate",

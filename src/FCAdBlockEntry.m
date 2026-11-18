@@ -1227,6 +1227,10 @@ static NSUInteger gFCZeroApplied = 0;  // v32：累计压制次数（诊断可�
 // v40：高度归零结果计数（诊断可见：成功/非NSNumber跳过/无spec）
 static NSUInteger gFCHeightZeroOK = 0;
 static NSUInteger gFCHeightZeroSkip = 0;
+// v41：setOriginalHeightSpec: 的 type encoding。闪退复盘的关键取证——
+// 崩溃是 ARC 去 retain 传给 setter 的「第三个参数」时炸的（0x3fffffff 是寄存器残值，
+// 不是对象），所以必须把真实签名打出来看它到底是不是对象参数。
+static NSString *gFCHeightSetEnc = nil;
 // v40：v39 几何空壳压0 的开关（停用：压子视图不减高度，且会误伤正常运营位；留代码便于回退）
 static const BOOL gFCRotorEnabled = NO;
 
@@ -2999,6 +3003,10 @@ static void FCAppendHeightOwnerDiag(void) {
     FCAppendDiagText([NSString stringWithFormat:
         @"[高度归零] 成功 %lu / 跳过 %lu（v41 只写不读，不再读 spec 旧值）",
         (unsigned long)gFCHeightZeroOK, (unsigned long)gFCHeightZeroSkip]);
+    // v41：把 setter 的 type encoding 打出来——上版闪退就是「参数根本不是对象」，
+    // v=void、@=对象、{CGSize=dd}=结构体传值。看到结构体就说明得按值再调一次。
+    FCAppendDiagText([NSString stringWithFormat:@"[高度签名] setOriginalHeightSpec: %@",
+                      gFCHeightSetEnc.length ? gFCHeightSetEnc : @"(未取到/未装载Deep档)"]);
     if (!out.count) { FCAppendDiagText(@"[高度归属] 当前无被拦 DXRootView（可能还没滚到运营位）"); return; }
     FCAppendDiagText([NSString stringWithFormat:@"[高度归属] 被拦 root %lu 个:", (unsigned long)out.count]);
     NSUInteger n = MIN(out.count, (NSUInteger)8);
@@ -3767,13 +3775,17 @@ static void FCInstallProbeHooks(void) {
         Method hs = FCOwnMethod(root, @"setOriginalHeightSpec:");
         // v41：先验签名，参数必须是对象(@)。万一宿主把它写成 C 结构体（CGSize/WXLength 传值），
         // 用 id 签名去调会把栈搅烂——宁可不 hook，也不能崩。
-        NSMethodSignature *hsSig = [root instanceMethodSignatureForSelector:@selector(setOriginalHeightSpec:)];
+        const char *hsEnc = hs ? method_getTypeEncoding(hs) : NULL;
+        gFCHeightSetEnc = hsEnc ? [NSString stringWithUTF8String:hsEnc] : nil;
+        NSMethodSignature *hsSig = nil;
+        if (hsEnc) { @try { hsSig = [NSMethodSignature signatureWithObjCTypes:hsEnc]; } @catch (NSException *e) { } }
         BOOL hsOK = (hsSig && hsSig.numberOfArguments >= 3 && [hsSig getArgumentTypeAtIndex:2][0] == '@');
         if (hs && hsOK) {
             gFCOrigSetHeightSpec = method_getImplementation(hs);
             method_setImplementation(hs, (IMP)FCHookSetHeightSpec);
         }
-        FCLog(@"v41 高度 setter hook=%d(签名%@)", hs ? 1 : 0, hsOK ? @"对象" : @"非对象·已跳过");
+        FCLog(@"v41 高度 setter hook=%d(签名%@) enc=%@", hs ? 1 : 0,
+              hsOK ? @"对象·已挂" : @"非对象·已跳过", gFCHeightSetEnc ? gFCHeightSetEnc : @"?");
     }
     Class cell = NSClassFromString(@"DXScrollerLayoutCell");
     if (cell) {
