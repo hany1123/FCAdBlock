@@ -1,16 +1,17 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v6
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v7
 //
-//  v6 相对 v5（真机五次反馈：吸附失效 + 点选覆盖范围窄）：
-//    1) 修浮标边缘吸附：v5 用「中心点 cx<60 或 >屏宽-60」判定，但浮标宽达 360pt
-//       几乎占满屏，中心恒在中段 → 吸附条件永假。v6 收窄胶囊到 250pt，改用
-//       「浮标左右边缘到屏幕边的距离 ≤44pt」判定吸附；记住自由位置供展开恢复；
-//       小白条加宽到 20pt 便于点按。
-//    2) 点选覆盖无文字广告：v5 只取最长中文串当规则，纯图片/图标广告记不住。
-//       v6 多特征记忆：文案/alt/aria-label/#id/.class/img:文件名（网页 JS 回传多值），
-//       原生回退 ASCII 串与触点 view 的 class 名；扫描时按 class 名也可命中。
+//  v7 相对 v6（真机六次反馈：点浮标没出菜单、循环点击把整页吃掉）：
+//    根因：v6 点选无文字元素时把触点最深的 UILabel/UIImageView 等**系统通用类**存成 class 规则，
+//         扫描用 substring 匹配 → 命中整页同类控件（浮标显示 原141），连 UIAlertController
+//         弹窗内容也被隐藏 → 用户点浮标后菜单弹出但内容不可见，误以为没弹，继续点屏幕误触
+//         「点选广告元素」这个隐形按钮进入 picking → 表现为「循环点击吃掉整页」。
+//    修复：①系统通用类禁止入库 + 启动时自愈剔除历史危险 class 规则；②class 名改精确相等匹配；
+//         ③扫描排除 UIAlertController/键盘/文字特效 window 与 view；④被隐藏 view 记标记，
+//         规则删除后恢复 hidden=NO（隐藏可逆）；⑤菜单加「清空全部规则(恢复页面)」紧急入口；
+//         ⑥picking 模式点浮标自身=取消，不再误拾取。
 //
-//  v5：可拖动浮标 + 边缘吸附小白条 + 规则可视化面板 + 返回页面失效修复。
+//  v6：修浮标边缘吸附几何 bug + 点选多特征（文案/alt/id/class/img）。
 //    1) 浮标可拖动：touchesMoved 更新位置；松手靠近左右边缘自动收成「小白条」吸附贴边；
 //       点小白条展开回完整浮标。tap 完整浮标弹出操作菜单（点选广告/规则管理/复位）。
 //       区分 tap 与 drag（位移阈值），拖动不误触发菜单。
@@ -113,9 +114,50 @@ static NSString * const FCPickJSFmt =
 
 static NSString * const FCUserRulesKey = @"FCAdBlockUserRules_v3";  // 保留 key，延续已存规则
 
+// v7：系统通用类黑名单——这些类作规则会命中整页控件，造成「页面被吃掉」
+static BOOL FCIsUnsafeClassRule(NSString *rule) {
+    if (rule.length < 2) return YES;
+    if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."] || [rule hasPrefix:@"img:"]) return NO;
+    // 只把「首字母大写、纯字母」的串当作 class 规则来检查
+    unichar h = [rule characterAtIndex:0];
+    if (!(h >= 'A' && h <= 'Z')) return NO;
+    BOOL allLetter = YES;
+    for (NSUInteger i = 0; i < rule.length; i++) {
+        unichar c = [rule characterAtIndex:i];
+        if (!((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'))) { allLetter = NO; break; }
+    }
+    if (!allLetter) return NO;
+    static NSArray *unsafe = nil; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        unsafe = @[@"UIView",@"UILabel",@"UIImageView",@"UIButton",@"UIControl",@"UICollectionViewCell",
+                   @"UITableViewCell",@"UICollectionView",@"UITableView",@"UIStackView",@"UIScrollView",
+                   @"UITextField",@"UITextView",@"UIViewController",@"UIAlertController",@"UIWindow",
+                   @"Cell",@"View",@"Label",@"Image",@"Button",@"Stack",@"Content",@"Container",@"Wrapper"];
+    });
+    for (NSString *u in unsafe)
+        if ([rule rangeOfString:u options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    // 系统 UI/NS 前缀一律不放行
+    if ([rule hasPrefix:@"UI"] || [rule hasPrefix:@"NS"]) return YES;
+    return NO;
+}
+
 static NSArray<NSString *> *FCUserRules(void) {
     NSArray *a = [[NSUserDefaults standardUserDefaults] arrayForKey:FCUserRulesKey];
     return a ?: @[];
+}
+
+// v7：启动自愈——把历史存下来的危险 class 规则剔除，避免老规则继续误伤
+static void FCSanitizeRulesOnce(void) {
+    NSArray *a = FCUserRules();
+    if (!a.count) return;
+    NSMutableArray *clean = [NSMutableArray array];
+    for (NSString *s in a)
+        if (!FCIsUnsafeClassRule(s)) [clean addObject:s];
+    if (clean.count != a.count) {
+        FCSetUserRules(clean);
+        FCLog(@"自愈：剔除 %lu 条危险 class 规则，剩 %lu 条",
+              (unsigned long)(a.count - clean.count), (unsigned long)clean.count);
+    }
 }
 
 static void FCSetUserRules(NSArray *rules) {
@@ -141,6 +183,7 @@ static NSString *FCJSSafe(NSString *s) {
 static void FCAddUserRule(NSString *raw) {
     NSString *rule = FCJSSafe(raw);
     if (rule.length < 2) return;
+    if (FCIsUnsafeClassRule(rule)) { FCLog(@"拒绝危险 class 规则：%@", rule); return; }   // v7
     NSMutableArray *a = [NSMutableArray arrayWithArray:FCUserRules()];
     for (NSString *exist in a)
         if ([exist rangeOfString:rule].location != NSNotFound ||
@@ -410,45 +453,69 @@ static UIViewController *FCTopViewController(void) {
 
 static void FCApplyNativeRules(void) {
     NSArray *rules = FCUserRules();
-    if (!rules.count) return;
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+    static char kHiddenByFC;
     for (UIWindow *w in FCAllWindows()) {
         NSString *wc = NSStringFromClass([w class]);
         if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"]) continue;
         if (w.hidden || w.alpha < 0.01) continue;
+        // v7：绝不扫描系统弹窗/键盘/文字特效 window，否则把 UIAlertController 内容也隐藏
+        if ([wc hasPrefix:@"UITextEffects"] || [wc hasPrefix:@"UIRemoteKeyboard"] ||
+            [wc hasPrefix:@"UIAlert"] || [wc hasPrefix:@"_UI"]) continue;
+        UIViewController *wr = w.rootViewController;
+        if ([wr isKindOfClass:[UIAlertController class]]) continue;
         NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
         NSUInteger idx = 0;
         while (idx < q.count && idx < 1400) {
             UIView *v = q[idx++];
             if (v.tag == 9527 || v.tag == 9528) continue;
+            NSString *vcls = NSStringFromClass([v class]);
+            // v7：遇到系统弹窗视图整枝跳过（不隐藏、不下钻）
+            if ([v isKindOfClass:[UIAlertController class]] ||
+                [vcls hasPrefix:@"UIAlert"] || [vcls hasPrefix:@"_UIAlert"]) continue;
+
+            // v7：被本插件隐藏过的 view，先尝试恢复（规则已删/已自愈时立即救回页面）
+            BOOL ours = [objc_getAssociatedObject(v, &kHiddenByFC) boolValue];
+            if (ours && v.hidden) {
+                NSArray *rt = FCTextsOf(v);
+                BOOL still = NO;
+                for (NSString *s in rt) for (NSString *rule in rules)
+                    if (FCRuleMatchesText(rule, s)) { still = YES; break; }
+                if (!still) for (NSString *rule in rules)
+                    if (rule.length >= 5 && [rule isEqualToString:vcls]) { still = YES; break; }
+                if (!still) {
+                    v.hidden = NO;
+                    objc_setAssociatedObject(v, &kHiddenByFC, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    continue;
+                }
+            }
+
             CGRect r = [v convertRect:v.bounds toView:nil];
-            // 卡片级尺寸：宽>=40、高 18~50% 屏，排除整页与已隐藏（已隐藏的无需再处理）
             if (v.hidden || r.size.width < 40 || r.size.height < 18 || r.size.height > sh * 0.5) {
                 for (UIView *sub in v.subviews) [q addObject:sub];
                 continue;
             }
-            NSString *cls = NSStringFromClass([v class]);
-            if ([cls rangeOfString:@"TabBar"].location != NSNotFound ||
-                [cls rangeOfString:@"NavigationBar"].location != NSNotFound) {
+            if ([vcls rangeOfString:@"TabBar"].location != NSNotFound ||
+                [vcls rangeOfString:@"NavigationBar"].location != NSNotFound) {
                 for (UIView *sub in v.subviews) [q addObject:sub];
                 continue;
             }
             NSArray *texts = FCTextsOf(v);
             BOOL hit = NO;
-            // v6：先按 class 名匹配（覆盖无文字图片广告）
+            // v7：class 名改为「精确相等」匹配（子串匹配会让 Cell/Label 命中整页同类）
             for (NSString *rule in rules) {
-                if (rule.length >= 4 && [cls rangeOfString:rule options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                    hit = YES; break;
-                }
+                if (rule.length >= 5 && [rule isEqualToString:vcls]) { hit = YES; break; }
             }
-            // 再按文案匹配
             if (!hit) for (NSString *s in texts) {
                 for (NSString *rule in rules) {
                     if (FCRuleMatchesText(rule, s)) { hit = YES; break; }
                 }
                 if (hit) break;
             }
-            if (hit) { v.hidden = YES; gFCNativeHits++; }
+            if (hit) {
+                v.hidden = YES; gFCNativeHits++;
+                objc_setAssociatedObject(v, &kHiddenByFC, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            }
             for (UIView *sub in v.subviews) [q addObject:sub];
         }
     }
@@ -841,6 +908,11 @@ static CGRect FCDefaultBadgeFrame(void) {
 
     if (self.picking) {                                   // 点选模式：拾取
         self.picking = NO;
+        // v7：点浮标自身=取消点选，不拾取（否则「再点浮标取消」会误拾取浮标下的元素）
+        if (CGRectContainsPoint(gFCBadgeFrame, p)) {
+            FCShowBadgeMsg(@"已取消点选");
+            return;
+        }
         FCUpdateBadge();
         FCPickAtPoint(p);
         return;
@@ -935,7 +1007,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv6 规则%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv7 规则%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -947,7 +1019,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv6 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv7 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -957,7 +1029,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v6"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v7"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ gFCBadgeWindow.picking = YES;
@@ -969,6 +1041,13 @@ static void FCShowActionMenu(void) {
                  handler:^(UIAlertAction *a){ gFCBadgeCollapsed = NO; gFCBadgeSide = 0;
                      gFCBadgeNormalFrame = FCDefaultBadgeFrame();
                      [gFCBadgeWindow expandBadgeFrame]; FCUpdateBadge(); }]];
+    // v7：一键清空全部规则——页面被误伤时的紧急恢复入口
+    [ac addAction:[UIAlertAction actionWithTitle:@"清空全部规则（恢复页面）" style:UIAlertActionStyleDestructive
+                 handler:^(UIAlertAction *a){
+                     FCSetUserRules(@[]);
+                     FCInjectWebViews(YES);
+                     FCShowBadgeMsg(@"已清空规则");
+                 }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     if (ac.popoverPresentationController) ac.popoverPresentationController.sourceView = gFCBadgeBar;
     [top presentViewController:ac animated:YES completion:nil];
@@ -1013,8 +1092,9 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v6 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v7 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
+        FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
             FCEnsureBadgeWindow();
             __block NSInteger fastTicks = 0;
