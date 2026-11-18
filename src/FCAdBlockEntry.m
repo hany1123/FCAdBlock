@@ -1,5 +1,20 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v28（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v29（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v29 相对 v28（老大 Deep 档源头参数取证决定性证据）：
+//    【证据】12 条 setData: 参数全是 NSDictionary，data.template.name/version 直接可读
+//    （如 name=secondfloor/version=10 → DXTemplateItem:secondfloor_10）；
+//    setTemplateItem: 对象 description 带完整模板名（recommend_m_home_2025_88_campaign_card_67
+//    即老大一直要去的「超级88领券中心」）。用户文字规则 0 命中——文案不在这两层摘要深度内，
+//    但模板名确定可见且比文案稳定（服务端改文案不改模板身份）。
+//    【根治思路】不再视图层删了被 DX 重绘：源头 setData: 若模板名命中 tpl: 规则，
+//    直接不调原 IMP——数据不进引擎，卡片无从渲染，自然不会重绘。
+//    ①点选命中元素向上找 DXRootView，读 data.template 或 templateItem description，
+//      自动存 tpl:模板名 规则（通用能力，不硬编码淘宝模板）；
+//    ②Deep 档 FCHookSetData 精确匹配 tpl: 规则命中即返回，未命中才调原实现；
+//    ③tpl: 纳入指纹类规则（精确去重/160字上限/面板「模」标签/诊断类型标注）；
+//    ④浮标提示显示模板名，老大一次截图即可确认点中了哪个模板。
+//    【安全】仅精确匹配，不用子串；只拦用户明确点选的模板；清空规则菜单可即时自救。
 //
 //  v28 相对 v27（老大回传 v27 真机 DX 类表/方法名——取证成功）：
 //    【拿到的证据】DXRootView 确有 setData:/setTemplateItem: 数据入口；Swift 类
@@ -251,8 +266,8 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===28){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=28;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===29){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=29;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -425,7 +440,8 @@ static NSString *FCJSSafe(NSString *s) {
     s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     // v13：指纹规则（sel: CSS 路径 / pos: 坐标）必须完整保留，截断就失效；改用更长上限
     NSUInteger cap = ([s hasPrefix:@"sel:"] || [s hasPrefix:@"pos:"] ||
-                      [s hasPrefix:@"cls:"] || [s hasPrefix:@"img:"]) ? 160 : 40;
+                      [s hasPrefix:@"cls:"] || [s hasPrefix:@"img:"] ||
+                      [s hasPrefix:@"tpl:"]) ? 160 : 40;   // v29：tpl: 模板名必须完整保留
     if (s.length > cap) s = [s substringToIndex:cap];
     return s;
 }
@@ -437,6 +453,7 @@ static void FCAddUserRule(NSString *raw) {
     NSMutableArray *a = [NSMutableArray arrayWithArray:FCUserRules()];
     BOOL isFingerprint = [rule hasPrefix:@"sel:"] || [rule hasPrefix:@"cls:"] ||
                          [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"img:"] ||
+                         [rule hasPrefix:@"tpl:"] ||                 // v29：模板指纹精确去重
                          [rule hasPrefix:@"#"] || [rule hasPrefix:@"."];
     for (NSString *exist in a) {
         // v13：指纹类规则（不同位置/选择器只是数字或路径不同）必须精确去重，包含判断会误杀
@@ -1349,6 +1366,83 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule) {
 
 // v18：原生拾取——从触点 hit 往上找运营卡片，存「文案 + cls:宿主类 + pos:位置」指纹。
 // 抽成函数供两条路径复用：①无 webview 直接走；②网页 JS 失败(MISS/TOOBIG/err)降级走。
+// v29：从 DXRootView.setData: 的参数字典取模板名——真机证据 data.template.name/version
+// 兼容两种结构：①参数本身含 template 键；②参数外层 data.template（实际取证是后者）
+static NSString *FCTplNameFromData(id raw) {
+    if (![raw isKindOfClass:[NSDictionary class]]) return nil;
+    NSDictionary *d = (NSDictionary *)raw;
+    NSDictionary *t = d[@"template"];
+    if (![t isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *inner = d[@"data"];
+        if ([inner isKindOfClass:[NSDictionary class]]) t = inner[@"template"];
+    }
+    if (![t isKindOfClass:[NSDictionary class]]) return nil;
+    NSString *name = t[@"name"];
+    if (![name isKindOfClass:[NSString class]] || !name.length || name.length > 120) return nil;
+    NSString *ver = t[@"version"];
+    if ([ver isKindOfClass:[NSNumber class]]) ver = [ver stringValue];
+    if (![ver isKindOfClass:[NSString class]] || ver.length > 12) ver = nil;
+    // 完整名 = name_version（与 setTemplateItem 对象名一致，如 secondfloor_10）
+    return ver.length ? [NSString stringWithFormat:@"%@_%@", name, ver] : name;
+}
+
+// v29：从 DXTemplateItem 的 description 抠完整模板名（<0x.. DXTemplateItem:xxx>）
+static NSString *FCTplNameFromItem(id item) {
+    if (!item) return nil;
+    NSString *d = [item description];
+    NSRange r = [d rangeOfString:@"DXTemplateItem:"];
+    if (r.location == NSNotFound) return nil;
+    NSString *rest = [d substringFromIndex:NSMaxRange(r)];
+    NSRange e = [rest rangeOfString:@">"];
+    if (e.location != NSNotFound) rest = [rest substringToIndex:e.location];
+    rest = [rest stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+    return (rest.length && rest.length <= 160) ? rest : nil;
+}
+
+// v29：点选命中元素向上找承载它的 DXRootView，取该卡片正在渲染的模板名
+static NSString *FCTemplateNameOfView(UIView *v) {
+    Class dxRoot = NSClassFromString(@"DXRootView");
+    if (!dxRoot) return nil;
+    UIView *cur = v;
+    for (int depth = 0; cur && depth < 30; depth++) {
+        if ([cur isKindOfClass:dxRoot]) {
+            NSString *n = nil;
+            @try { n = FCTplNameFromData([cur valueForKey:@"data"]); } @catch (NSException *e) { }
+            if (n.length) return n;
+            @try { n = FCTplNameFromItem([cur valueForKey:@"templateItem"]); } @catch (NSException *e) { }
+            if (n.length) return n;
+        }
+        cur = cur.superview;
+    }
+    return nil;
+}
+
+// v29：tpl: 规则判定——支持「完整名」与「name_version」两种存法互相兼容
+static BOOL FCTplIsBlocked(NSString *tpl) {
+    if (!tpl.length) return NO;
+    for (NSString *r in FCUserRules()) {
+        if (![r hasPrefix:@"tpl:"]) continue;
+        NSString *want = [r substringFromIndex:4];
+        if (!want.length) continue;
+        if ([want isEqualToString:tpl]) return YES;
+        // 点选存的若是 name、数据是 name_version（或反之），只在尾段为纯数字版本时兼容
+        NSString *longer = want.length > tpl.length ? want : tpl;
+        NSString *shorter = want.length > tpl.length ? tpl : want;
+        if (longer.length > shorter.length && [longer hasPrefix:shorter]) {
+            NSString *tail = [longer substringFromIndex:shorter.length];
+            if (tail.length >= 2 && tail.length <= 5 && [tail hasPrefix:@"_"]) {
+                NSString *num = [tail substringFromIndex:1];
+                BOOL digit = num.length > 0;
+                NSCharacterSet *digits = [NSCharacterSet decimalDigitCharacterSet];
+                for (NSUInteger i = 0; i < num.length; i++)
+                    if (![digits characterIsMember:[num characterAtIndex:i]]) { digit = NO; break; }
+                if (digit) return YES;
+            }
+        }
+    }
+    return NO;
+}
+
 static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     if (!hit) { FCShowBadgeMsg(@"未命中元素"); return; }
     // v21：跳过系统输入控件——真机点搜索框会命中 UIInputSetContainerView 等键盘私有类，
@@ -1373,8 +1467,11 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // v25：红框标签带上命中类名——老大反馈「部分元素无法选取」，截图带类名才能一次
     // 定位到底命中了什么（是 DXTextView 还是空壳 WK 还是别的），不再靠猜。
     NSString *engTag2 = FCEngineName(FCEngineOfClass(cls));
-    NSString *show = [NSString stringWithFormat:@"%@·%@", engTag2,
-                      ruleText.length ? ruleText : cls];
+    // v29：取该元素所属 DX 模板名——红框显示，截图一次即可确认点中了哪个卡片模板
+    NSString *tplName = FCTemplateNameOfView(hit);
+    NSString *show = tplName.length
+        ? [NSString stringWithFormat:@"%@·模板:%@", engTag2, tplName]
+        : [NSString stringWithFormat:@"%@·%@", engTag2, ruleText.length ? ruleText : cls];
     FCShowPickMark(markRect, show);
     // v19：若降级来自网页通道（触点本在 H5 内），card/hit 多半在 webview 内部——
     // 隐藏它=隐藏整个网页、存 pos=全屏误伤规则。此时只记诊断，不隐藏、不存位置。
@@ -1391,6 +1488,8 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     card.hidden = YES;
     gFCNativeHits++;
     if (ruleText.length >= 2) FCAddUserRule(ruleText);
+    // v29：DX 动态化卡片存模板规则——Deep 档源头 setData: 按此拦截，根治「删了被重绘」
+    if (tplName.length) FCAddUserRule([@"tpl:" stringByAppendingString:tplName]);
     // v18：跳过 webview 私有类(WKContentView 等)，从卡片往上找真正的宿主自定义类
     NSUInteger clsAdded = 0;
     UIView *curC = card;
@@ -1429,6 +1528,8 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     NSString *msg = enginePrefix
         ? [NSString stringWithFormat:@"%@已记%lu类+位置", prefix, (unsigned long)clsAdded]
         : [NSString stringWithFormat:@"%@原生·已记%lu类+位置", prefix, (unsigned long)clsAdded];
+    // v29：把模板名带进浮标提示——老大截图即可确认源头拦截规则已存
+    if (tplName.length) msg = [NSString stringWithFormat:@"%@|模板已记", msg];
     FCShowBadgeMsg(msg);
 }
 
@@ -1577,6 +1678,7 @@ static NSString *FCRuleTypeText(NSString *r) {
     if ([r hasPrefix:@"."]) return @"类";
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return @"图";
     if ([r hasPrefix:@"sel:"]) return @"选";   // v13：CSS 结构指纹
+    if ([r hasPrefix:@"tpl:"]) return @"模";   // v29：DX 模板指纹
     if ([r hasPrefix:@"cls:"]) {
         FCAdType at = FCAdTypeOfClass([r substringFromIndex:4]);
         return at != FCAdTypeUnknown ? FCAdTypeName(at) : @"位";
@@ -1589,6 +1691,7 @@ static UIColor *FCRuleTypeColor(NSString *r) {
     if ([r hasPrefix:@"."]) return [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return [UIColor colorWithRed:0.2 green:0.65 blue:0.35 alpha:1];
     if ([r hasPrefix:@"sel:"]) return [UIColor colorWithRed:0.85 green:0.25 blue:0.55 alpha:1];
+    if ([r hasPrefix:@"tpl:"]) return [UIColor colorWithRed:0.95 green:0.30 blue:0.20 alpha:1];  // v29：模板=红橙
     if ([r hasPrefix:@"cls:"] || [r hasPrefix:@"pos:"]) return [UIColor colorWithRed:0.15 green:0.55 blue:0.75 alpha:1];
     return [UIColor colorWithRed:0.42 green:0.48 blue:0.58 alpha:1];
 }
@@ -1927,6 +2030,7 @@ static NSString *FCDiagRuleKind(NSString *rule) {
     if ([rule hasPrefix:@"pos:"]) return @"位置";
     if ([rule hasPrefix:@"sel:"]) return @"选择器";
     if ([rule hasPrefix:@"img:"]) return @"图片";
+    if ([rule hasPrefix:@"tpl:"]) return @"模板";   // v29
     if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."]) return @"CSS";
     return @"文字";
 }
@@ -2036,7 +2140,7 @@ static NSUInteger gFCProbeDropped = 0;
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v28 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v29 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2483,7 +2587,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv28 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv29 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2496,7 +2600,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv28 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv29 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2507,7 +2611,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v28"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v29"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2655,6 +2759,14 @@ static IMP gFCOrigSetTemplate = nil;
 static IMP gFCOrigSetViewModel = nil;
 
 static void FCHookSetData(id self, SEL _cmd, id data) {
+    // v29：源头拦截——模板名命中 tpl: 规则就不把数据喂给 DX 引擎，卡片无从渲染/重绘。
+    // 只精确匹配用户点选的模板；命中即 return，未命中照常调原 IMP（行为不变）。
+    NSString *tpl = FCTplNameFromData(data);
+    if (tpl.length && FCTplIsBlocked(tpl)) {
+        FCProbeRecord(@"源头拦截", tpl);
+        FCLog(@"源头拦截模板: %@", tpl);
+        return;
+    }
     @try { FCProbeRecord(@"DXRootView.setData", data); } @catch (NSException *e) { }
     if (gFCOrigSetData) ((void (*)(id, SEL, id))gFCOrigSetData)(self, _cmd, data);
 }
@@ -2712,7 +2824,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v28 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v29 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
