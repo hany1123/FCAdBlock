@@ -1,5 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v10
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v11
+//
+//  v11 相对 v10（真机十次反馈：重启后隐藏仍没生效，规则 5 条都在）：
+//    真因不是持久化——截图浮标「FCv10 规则5」证明规则完好。是**内置运营广告关键词
+//    只喂给 FCTextsAreOperationAd 做诊断计数 gFCOpEvidence，从不参与任何 view 隐藏**；
+//    FCApplyNativeRules 只匹配「用户点选规则」，而用户那 5 条全是业务文案（生活服务/
+//    我的卡包…），订单页「百元券包限量1折」banner 从来就没进过隐藏流程。
+//    v11：①内置关键词并入有效规则表，真正隐藏；②关键词按真机文案更新（限量1折、
+//    5元立减券、69.9元抢、立即抢购、9.9洗衣、领福利…），H5 的 K 数组同步；
+//    ③内置命中加严格尺寸闸门（高≤25%屏/宽≥120/子树文本≤14）防整页误伤；
+//    ④恢复判定改用合并规则表，避免内置规则被当成「已删」而立刻恢复；
+//    ⑤菜单加「关闭内置规则」逃生口；⑥浮标加「内N」计数供诊断。
 //
 //  v10 相对 v9（真机九次反馈：App 退出重开后隐藏失效）：
 //    两个方向同时堵死——①数据丢失：规则 NSUserDefaults + Library/plist 双保险，互为兜底；
@@ -80,7 +91,7 @@ static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 "if(W.__fcadLoaded){if(W.__fcadSweep){W.__fcadSweep();}return;}"
 "W.__fcadLoaded=1;W.__fcadHits=0;"
-"var K=['百元券包','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','任选3件'];"
+"var K=['百元券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','5元立减券','69.9元抢','立即抢购','9.9洗衣','领福利'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
 "if(e.getAttribute){add(e.getAttribute('alt'));add(e.getAttribute('aria-label'));"
@@ -242,6 +253,7 @@ static NSString *FCBuildInjectionJS(void) {
 static NSUInteger gFCWindows = 0, gFCEvidences = 0, gFCSplashHits = 0;
 static NSUInteger gFCOpEvidence = 0, gFCWebViewFound = 0, gFCH5Hits = 0;
 static NSUInteger gFCNativeHits = 0;
+static NSUInteger gFCBuiltinHits = 0;   // v11：内置运营广告规则命中数（区别于用户点选规则）
 
 #pragma mark - 双向规则匹配（v5 修复返回失效核心）
 
@@ -342,10 +354,38 @@ static BOOL FCTextsAreSplash(NSArray<NSString *> *texts) {
     return NO;
 }
 
-static BOOL FCTextsAreOperationAd(NSArray<NSString *> *texts) {
+// v11：内置运营广告文案——真机反馈的 banner 实拍文案，必须真正参与隐藏，不能只做诊断计数
+static NSArray<NSString *> *FCBuiltinAdKeys(void) {
     static NSArray *keys = nil; static dispatch_once_t once;
-    dispatch_once(&once, ^{ keys = @[@"百元券包",@"限量7折",@"寄件省钱卡",@"查价领返现",@"换季洗羽绒",@"任选3件"]; });
-    for (NSString *s in texts) for (NSString *k in keys)
+    dispatch_once(&once, ^{ keys = @[
+        @"百元券包", @"限量1折", @"限量2折", @"限量7折", @"寄件省钱卡",
+        @"查价领返现", @"换季洗羽绒", @"换季洗", @"5元立减券",
+        @"69.9元抢", @"立即抢购", @"9.9洗衣", @"领福利",
+    ]; });
+    return keys;
+}
+
+static BOOL FCIsBuiltinAdKey(NSString *s) {
+    if (!s.length) return NO;
+    for (NSString *k in FCBuiltinAdKeys()) if ([k isEqualToString:s]) return YES;
+    return NO;
+}
+
+// v11：内置规则总开关，误伤时可在菜单关闭（默认开）
+static NSString * const FCBuiltinOffKey = @"FCAdBlockBuiltinOff_v1";
+static BOOL FCBuiltinEnabled(void) {
+    return ![[NSUserDefaults standardUserDefaults] boolForKey:FCBuiltinOffKey];
+}
+
+// v11：用户规则 + 内置运营广告规则 = 真正用于隐藏的有效规则表
+static NSArray<NSString *> *FCEffectiveRules(void) {
+    NSMutableArray *a = [NSMutableArray arrayWithArray:FCUserRules()];
+    if (FCBuiltinEnabled()) [a addObjectsFromArray:FCBuiltinAdKeys()];
+    return a;
+}
+
+static BOOL FCTextsAreOperationAd(NSArray<NSString *> *texts) {
+    for (NSString *s in texts) for (NSString *k in FCBuiltinAdKeys())
         if ([s rangeOfString:k].location != NSNotFound) return YES;
     return NO;
 }
@@ -488,7 +528,7 @@ static UIViewController *FCTopViewController(void) {
 #pragma mark - 原生规则定时扫描（v5：双向匹配 + 强制重扫）
 
 static void FCApplyNativeRules(void) {
-    NSArray *rules = FCUserRules();
+    NSArray *rules = FCEffectiveRules();   // v11：用户规则 + 内置运营广告关键词
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     static char kHiddenByFC;
     for (UIWindow *w in FCAllWindows()) {
@@ -545,18 +585,29 @@ static void FCApplyNativeRules(void) {
             NSArray *texts = FCTextsOf(v);
             BOOL hit = NO;
             NSString *hitRule = nil;
+            BOOL builtinHit = NO;
             // v7：class 名改为「精确相等」匹配（子串匹配会让 Cell/Label 命中整页同类）
             for (NSString *rule in rules) {
                 if (rule.length >= 5 && [rule isEqualToString:vcls]) { hit = YES; hitRule = rule; break; }
             }
             if (!hit) for (NSString *s in texts) {
                 for (NSString *rule in rules) {
-                    if (FCRuleMatchesText(rule, s)) { hit = YES; hitRule = rule; break; }
+                    if (FCRuleMatchesText(rule, s)) {
+                        hit = YES; hitRule = rule;
+                        builtinHit = FCIsBuiltinAdKey(rule);
+                        break;
+                    }
                 }
                 if (hit) break;
             }
             if (hit) {
+                // v11：内置关键词命中时加严格尺寸闸门——绝不让「包含 banner 的大卡片」整块消失
+                if (builtinHit && (r.size.height > sh * 0.25 || r.size.width < 120 || texts.count > 14)) {
+                    for (UIView *sub in v.subviews) [q addObject:sub];
+                    continue;
+                }
                 v.hidden = YES; gFCNativeHits++;
+                if (builtinHit) gFCBuiltinHits++;
                 // v9：存「命中的规则」而非 @YES，供恢复判定用（FCTextsOf 读不到 hidden view 的文字）
                 objc_setAssociatedObject(v, &kHiddenByFC, hitRule ?: @"", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             }
@@ -1246,9 +1297,9 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv10 规则%lu 原%lu H5%lu | 点我操作 | %@",
-        (unsigned long)FCUserRules().count, (unsigned long)gFCNativeHits,
-        (unsigned long)gFCH5Hits, top];
+        @"FCv11 规则%lu 内%lu 原%lu H5%lu | 点我操作 | %@",
+        (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
+        (unsigned long)gFCNativeHits, (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 }
 
@@ -1258,7 +1309,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv10 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv11 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1268,7 +1319,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v10"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v11"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1278,6 +1329,15 @@ static void FCShowActionMenu(void) {
                  handler:^(UIAlertAction *a){ gFCBadgeCollapsed = NO; gFCBadgeSide = 0;
                      gFCBadgeNormalFrame = FCDefaultBadgeFrame();
                      [gFCBadgeWindow expandBadgeFrame]; FCUpdateBadge(); }]];
+    // v11：内置运营位规则总开关——原生视图被误伤时的逃生口
+    [ac addAction:[UIAlertAction actionWithTitle:FCBuiltinEnabled() ? @"关闭内置运营位规则" : @"开启内置运营位规则"
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     BOOL wasOn = FCBuiltinEnabled();
+                     [[NSUserDefaults standardUserDefaults] setBool:wasOn forKey:FCBuiltinOffKey];
+                     [[NSUserDefaults standardUserDefaults] synchronize];
+                     FCShowBadgeMsg(wasOn ? @"内置规则已关闭" : @"内置规则已开启");
+                 }]];
     // v7：一键清空全部规则——页面被误伤时的紧急恢复入口
     [ac addAction:[UIAlertAction actionWithTitle:@"清空全部规则（恢复页面）" style:UIAlertActionStyleDestructive
                  handler:^(UIAlertAction *a){
@@ -1329,7 +1389,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v10 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v11 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
