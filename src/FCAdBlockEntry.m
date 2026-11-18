@@ -1,5 +1,17 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v29（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v30（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v30 相对 v29（老大 v29 诊断：Deep 档对了，但规则仍 10 条旧文字——没重新点选，
+//  且发现两个真 bug 让点选即使做了也可能白费）：
+//    ①模板提取漏分支：真机取证多数卡片模板名在 data.style.template（22键那批），
+//      v29 只取顶层 template / data.template，补 style.template 两级；
+//    ②点选取名不可靠：v29 靠 KVC 读 DXRootView.data 属性（Swift/ObjC 混合很可能读不到），
+//      改为 hook 在 setTemplateItem:/setData: 时建立「实例→模板名」bridge 映射，
+//      点选直接查表；
+//    ③内置两个身份型广告模板 88_campaign(超级88) / campaign_bottom_bar(底部活动条)，
+//      用核心身份子串匹配避开版本号，尊重内置开关——不点选也能先见效；
+//    ④每版例行 __fcadVer 29→30。
+//    说明：tpl: 规则仍需用户点选生成，内置只覆盖两个铁证模板。
 //
 //  v29 相对 v28（老大 Deep 档源头参数取证决定性证据）：
 //    【证据】12 条 setData: 参数全是 NSDictionary，data.template.name/version 直接可读
@@ -266,8 +278,8 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===29){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=29;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===30){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=30;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1372,9 +1384,20 @@ static NSString *FCTplNameFromData(id raw) {
     if (![raw isKindOfClass:[NSDictionary class]]) return nil;
     NSDictionary *d = (NSDictionary *)raw;
     NSDictionary *t = d[@"template"];
+    // v30：真机取证——多数卡片模板名在 data.style.template（22键那批），不是顶层 template
+    if (![t isKindOfClass:[NSDictionary class]]) {
+        NSDictionary *style = d[@"style"];
+        if ([style isKindOfClass:[NSDictionary class]]) t = style[@"template"];
+    }
     if (![t isKindOfClass:[NSDictionary class]]) {
         NSDictionary *inner = d[@"data"];
-        if ([inner isKindOfClass:[NSDictionary class]]) t = inner[@"template"];
+        if ([inner isKindOfClass:[NSDictionary class]]) {
+            t = inner[@"template"];
+            if (![t isKindOfClass:[NSDictionary class]]) {
+                NSDictionary *is = inner[@"style"];
+                if ([is isKindOfClass:[NSDictionary class]]) t = is[@"template"];
+            }
+        }
     }
     if (![t isKindOfClass:[NSDictionary class]]) return nil;
     NSString *name = t[@"name"];
@@ -1401,14 +1424,26 @@ static NSString *FCTplNameFromItem(id item) {
     return (rest.length && rest.length <= 160) ? rest : nil;
 }
 
-// v29：点选命中元素向上找承载它的 DXRootView，取该卡片正在渲染的模板名
+// v30：bridge 映射——Deep 档 hook 在 setTemplateItem:/setData: 时把「DXRootView 实例 → 模板名」
+// 记下来。点选时直接查表，不再依赖 KVC 读 Swift/ObjC 混合的 data 属性（很可能读不到）。
+static NSMapTable<UIView *, NSString *> *gFCTplBridge = nil;
+
+static void FCTplBridgePut(UIView *view, NSString *name) {
+    if (!view || !name.length) return;
+    if (!gFCTplBridge) gFCTplBridge = [NSMapTable weakToStrongObjectsMapTable];
+    [gFCTplBridge setObject:name forKey:view];
+}
+
+// v29/v30：点选命中元素向上找承载它的 DXRootView，取该卡片正在渲染的模板名
 static NSString *FCTemplateNameOfView(UIView *v) {
     Class dxRoot = NSClassFromString(@"DXRootView");
     if (!dxRoot) return nil;
     UIView *cur = v;
     for (int depth = 0; cur && depth < 30; depth++) {
         if ([cur isKindOfClass:dxRoot]) {
-            NSString *n = nil;
+            // v30 首选：hook 建立的实例映射，最可靠
+            NSString *n = gFCTplBridge ? [gFCTplBridge objectForKey:cur] : nil;
+            if (n.length) return n;
             @try { n = FCTplNameFromData([cur valueForKey:@"data"]); } @catch (NSException *e) { }
             if (n.length) return n;
             @try { n = FCTplNameFromItem([cur valueForKey:@"templateItem"]); } @catch (NSException *e) { }
@@ -1419,9 +1454,25 @@ static NSString *FCTemplateNameOfView(UIView *v) {
     return nil;
 }
 
+// v30：内置身份型广告模板——真机取证铁证，服务端改文案不改模板身份。
+// 用「核心身份子串」而非完整名，避开版本号（67/72 会随服务端升级变化）。
+static BOOL FCTplBuiltinBlocked(NSString *tpl) {
+    if (!FCBuiltinEnabled() || !tpl.length) return NO;   // 尊重「内置规则开关」
+    static NSArray *ids = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ ids = @[
+        @"88_campaign",           // 超级88 领券中心（老大反复要去掉的）
+        @"campaign_bottom_bar",   // 首页底部活动条
+    ]; });
+    for (NSString *key in ids)
+        if ([tpl rangeOfString:key].location != NSNotFound) return YES;
+    return NO;
+}
+
 // v29：tpl: 规则判定——支持「完整名」与「name_version」两种存法互相兼容
 static BOOL FCTplIsBlocked(NSString *tpl) {
     if (!tpl.length) return NO;
+    if (FCTplBuiltinBlocked(tpl)) return YES;            // v30：内置身份模板
     for (NSString *r in FCUserRules()) {
         if (![r hasPrefix:@"tpl:"]) continue;
         NSString *want = [r substringFromIndex:4];
@@ -2142,7 +2193,7 @@ static NSUInteger gFCProbeDropped = 0;
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v29 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v30 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2589,7 +2640,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv29 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv30 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2602,7 +2653,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv29 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv30 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2613,7 +2664,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v29"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v30"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2764,6 +2815,8 @@ static void FCHookSetData(id self, SEL _cmd, id data) {
     // v29：源头拦截——模板名命中 tpl: 规则就不把数据喂给 DX 引擎，卡片无从渲染/重绘。
     // 只精确匹配用户点选的模板；命中即 return，未命中照常调原 IMP（行为不变）。
     NSString *tpl = FCTplNameFromData(data);
+    // v30：建立「实例→模板名」映射，供点选直接查表（不依赖 KVC 读属性）
+    if (tpl.length) FCTplBridgePut((UIView *)self, tpl);
     if (tpl.length && FCTplIsBlocked(tpl)) {
         FCProbeRecord(@"源头拦截", tpl);
         FCLog(@"源头拦截模板: %@", tpl);
@@ -2773,6 +2826,9 @@ static void FCHookSetData(id self, SEL _cmd, id data) {
     if (gFCOrigSetData) ((void (*)(id, SEL, id))gFCOrigSetData)(self, _cmd, data);
 }
 static void FCHookSetTemplate(id self, SEL _cmd, id tpl) {
+    // v30：setTemplateItem 的对象名最完整（含版本），优先刷进 bridge
+    NSString *n = FCTplNameFromItem(tpl);
+    if (n.length) FCTplBridgePut((UIView *)self, n);
     @try { FCProbeRecord(@"DXRootView.setTemplateItem", tpl); } @catch (NSException *e) { }
     if (gFCOrigSetTemplate) ((void (*)(id, SEL, id))gFCOrigSetTemplate)(self, _cmd, tpl);
 }
@@ -2826,7 +2882,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v29 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v30 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
