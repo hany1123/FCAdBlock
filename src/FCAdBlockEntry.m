@@ -1,5 +1,17 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v20（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v21（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v21 相对 v20（老大反馈「日志文件字数太多我无法发送」+ 点搜索框误选键盘容器截图）：
+//    ①诊断日志瘦身：新增 FCOwnTextOf 只取 view 自身文字，不再对每个 view 递归整棵子树
+//      收集文字（旧版父容器与子 label 反复重复输出同样内容，日志暴涨到无法发送）；
+//      诊断循环按 class+文字+坐标 去重，正文最多 80 行，超限提示改走复制精简。
+//    ②复制双模式：诊断顶栏改为「关闭 / 复制精简 / 复制全文」三按钮；新增
+//      FCDiagBriefString 从全文提炼要点（标题/顶层VC/用户规则/引擎图例/命中行），
+//      最多 45 行，用户直接粘贴精简版发我，无需截图也无需发超长日志。
+//    ③点选系统输入控件拦截：FCPickNative 开头跳过 UITextField/UITextView/UIInput*/
+//      _UIInput*/Keyboard/InputSet 等键盘与输入容器，浮标提示「点广告内容区」，
+//      杜绝点搜索框选中 UIInputSetContainerView 记 0 类。
+//    ④注入脚本 __fcadVer 20→21，确保热更新后的新词表/幂等锁生效。
 //
 //  v20 相对 v19（老大三张真机截图 + 诊断输出定案）：
 //    诊断证据：所有板块都是 [原生] DXRootView/DXScrollerLayoutCell/DOOTabItem/AUIconFontView，
@@ -160,8 +172,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===20){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=20;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===21){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=21;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -743,6 +755,27 @@ static NSArray<NSString *> *FCTextsOf(UIView *root) {
     return out;
 }
 
+// v21：只取 view「自身」的文字（不递归子树）——诊断专用。
+// FCTextsOf 对每个 view 都收集整棵子树，导致父容器/子label 反复输出同一段文字
+// （老大反馈日志几千字发不出去）。诊断改用本函数，每个元素只报自己的文字。
+static NSString *FCOwnTextOf(UIView *v) {
+    if (!v || v.hidden || v.alpha < 0.05 || v.tag == 9527 || v.tag == 9528) return nil;
+    NSString *s = nil;
+    if ([v isKindOfClass:[UILabel class]]) {
+        s = ((UILabel *)v).text;
+        if (!s.length) s = ((UILabel *)v).attributedText.string;
+    } else if ([v isKindOfClass:[UIButton class]]) {
+        s = ((UIButton *)v).currentTitle;
+        if (!s.length) s = ((UIButton *)v).titleLabel.attributedText.string;
+    } else if ([v isKindOfClass:[UITextField class]]) {
+        s = ((UITextField *)v).text;
+    } else if ([v isKindOfClass:[UITextView class]]) {
+        s = ((UITextView *)v).text;
+    }
+    if (!s.length) s = v.accessibilityLabel;
+    return (s.length && s.length < 80) ? s : nil;
+}
+
 static NSString *FCPickRuleText(UIView *root) {
     NSArray *texts = FCTextsOf(root);
     NSString *bestCN = nil, *bestASCII = nil;
@@ -1101,6 +1134,16 @@ static UIView *FCCardContainerFrom(UIView *hit) {
 // 抽成函数供两条路径复用：①无 webview 直接走；②网页 JS 失败(MISS/TOOBIG/err)降级走。
 static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     if (!hit) { FCShowBadgeMsg(@"未命中元素"); return; }
+    // v21：跳过系统输入控件——真机点搜索框会命中 UIInputSetContainerView 等键盘私有类，
+    // 隐藏/记规则都无意义（老大截图「已选中:UIInputSetContainerView / 原生·已记0类」）。
+    NSString *hitCls = NSStringFromClass([hit class]);
+    if ([hit isKindOfClass:[UITextField class]] || [hit isKindOfClass:[UITextView class]] ||
+        [hitCls hasPrefix:@"UIInput"] || [hitCls hasPrefix:@"_UIInput"] ||
+        [hitCls rangeOfString:@"Keyboard"].location != NSNotFound ||
+        [hitCls rangeOfString:@"InputSet"].location != NSNotFound) {
+        FCShowBadgeMsg(@"这是输入控件,请点广告内容区");
+        return;
+    }
     UIView *card = FCCardContainerFrom(hit);
     NSString *ruleText = FCPickRuleText(card);
     CGRect markRect = [card convertRect:card.bounds toView:nil];
@@ -1549,11 +1592,48 @@ static void FCHidePanel(void) {
 
 @interface FCDiagWindow : UIWindow
 - (void)fcCloseDiag;
-- (void)fcCopyDiag;   // v20：一键复制诊断全文
+- (void)fcCopyDiag;    // v20：复制全文
+- (void)fcCopyBrief;   // v21：复制精简要点（可直接发）
+- (void)fcShowCopied:(NSString *)t;
 @end
 static FCDiagWindow *gFCDiagWindow = nil;
 static UITextView *gFCDiagText = nil;
 static UILabel *gFCDiagToast = nil;
+
+// v21：从诊断全文提炼精简要点——老大反馈日志几千字发不出去。
+// 保留：标题/顶层VC/引擎图例/有广告类型或命中的行/WKWebView摘要；其余细节丢弃。
+static NSString *FCDiagBriefString(void) {
+    NSString *full = gFCDiagText.text ?: @"";
+    NSMutableString *brief = [NSMutableString string];
+    NSUInteger kept = 0;
+    // 每种引擎保留少量代表行，让用户从精简版也能看清页面由哪些板块技术构成
+    NSMutableDictionary<NSString *, NSNumber *> *engineQuota = [NSMutableDictionary dictionary];
+    const NSUInteger kPerEngine = 3;
+    for (NSString *line in [full componentsSeparatedByString:@"\n"]) {
+        BOOL keep = NO;
+        if ([line hasPrefix:@"====="] || [line hasPrefix:@"顶层VC"] ||
+            [line hasPrefix:@"用户规则"] || [line hasPrefix:@"[引擎图例]"] ||
+            [line hasPrefix:@"----- WKWebView"] || [line hasPrefix:@"[网页]"] ||
+            [line hasPrefix:@"[已截断]"]) keep = YES;
+        if ([line rangeOfString:@"[类型:"].location != NSNotFound) keep = YES;  // 命中广告类的行
+        if ([line rangeOfString:@"命中:无"].location == NSNotFound &&
+            [line rangeOfString:@"命中:"].location != NSNotFound) keep = YES;     // 命中用户规则的行
+        // v21：未命中的板块行也按引擎各留几条，回答「点不中的到底是什么板块」
+        if (!keep && [line hasPrefix:@"["]) {
+            NSRange rb = [line rangeOfString:@"]"];
+            if (rb.location != NSNotFound) {
+                NSString *eng = [line substringWithRange:NSMakeRange(1, rb.location - 1)];
+                NSUInteger used = [engineQuota[eng] unsignedIntegerValue];
+                if (used < kPerEngine) { engineQuota[eng] = @(used + 1); keep = YES; }
+            }
+        }
+        if (keep) {
+            [brief appendFormat:@"%@\n", line];
+            if (++kept >= 45) { [brief appendString:@"[精简已达45行上限]\n"]; break; }
+        }
+    }
+    return brief.length ? brief : full;
+}
 
 @implementation FCDiagWindow
 - (BOOL)canBecomeKeyWindow { return YES; }
@@ -1563,9 +1643,15 @@ static UILabel *gFCDiagToast = nil;
     gFCDiagText = nil;
     gFCDiagToast = nil;
 }
-- (void)fcCopyDiag {   // v20：复制到剪贴板 + 顶部 toast 反馈，无需截图
+- (void)fcCopyDiag {   // v20：复制全文
     NSString *t = gFCDiagText.text ?: @"";
-    if (!t.length) return;
+    if (t.length) [self fcShowCopied:t];
+}
+- (void)fcCopyBrief {  // v21：复制精简要点
+    NSString *t = FCDiagBriefString();
+    if (t.length) [self fcShowCopied:t];
+}
+- (void)fcShowCopied:(NSString *)t {
     [UIPasteboard generalPasteboard].string = t;
     if (gFCDiagToast) {
         gFCDiagToast.text = [NSString stringWithFormat:@"已复制 %lu 字，可直接粘贴发我",
@@ -1587,49 +1673,56 @@ static void FCAppendDiagText(NSString *s) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v20 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v21 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCTopViewController() class]) ?: @"-"]);
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
     // v20：引擎图例——让用户看懂每个板块底层是哪类技术，回答「为什么有的选不中」
     FCAppendDiagText(@"[引擎图例] 原生=UIKit控件 / DX动态=阿里DX-Weex原生动态化 / RN=ReactNative / H5=WKWebView内DOM / Flutter / 小程序");
     FCAppendDiagText(@"[提示] 满屏但 DOM空 的 WKWebView 是空壳容器，内容实际是原生/DX，点选按元素真实引擎走。");
-    // 1) 原生视图树：列出所有有文字的 view（class + 文字 + frame），并标记它命中了哪条规则
+    // 1) 原生视图树（v21：自身文字 + 去重 + 限量，解决日志过长发不出去）
     NSArray *rules = FCEffectiveRules();
+    NSMutableSet *seen = [NSMutableSet set];       // v21：去重集合
+    __block NSUInteger lines = 0;                 // v21：行数上限
+    const NSUInteger kMaxDiagLines = 80;          // v21：正文最多 80 行
     for (UIWindow *w in FCAllWindows()) {
         NSString *wc = NSStringFromClass([w class]);
         if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
             [wc isEqualToString:@"FCDiagWindow"]) continue;
         NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
         NSUInteger idx = 0;
-        while (idx < q.count && idx < 400) {
+        while (idx < q.count && idx < 800 && lines < kMaxDiagLines) {
             UIView *v = q[idx++];
-            NSArray *texts = FCTextsOf(v);
-            if (texts.count) {
-                NSString *joined = [[texts subarrayWithRange:NSMakeRange(0, MIN(texts.count, 3))]
-                                    componentsJoinedByString:@" / "];
+            NSString *joined = FCOwnTextOf(v);     // v21：只取自身文字，不再递归整棵子树
+            if (joined.length) {
                 CGRect r = [v convertRect:v.bounds toView:nil];
-                // 标出哪些规则命中了这个 view 的文字
                 NSMutableArray *matched = [NSMutableArray array];
                 for (NSString *rule in rules) {
-                    for (NSString *t in texts) {
-                        if (FCRuleMatchesText(rule, t)) { [matched addObject:rule]; break; }
-                    }
+                    if (FCRuleMatchesText(rule, joined)) { [matched addObject:rule]; break; }
                 }
-                // v17：类名命中权威表时标注广告类型（开屏/激励/横幅/运营位/联盟…）
                 NSString *vcls = NSStringFromClass([v class]);
                 FCAdType at = FCAdTypeOfClass(vcls);
                 NSString *typeTag = (at != FCAdTypeUnknown)
                     ? [NSString stringWithFormat:@"[类型:%@]", FCAdTypeName(at)] : @"";
-                // v20：标注该元素所属板块渲染引擎（DX动态/RN/H5/原生…）
                 FCEngine eng = FCEngineOfView(v);
                 NSString *engTag = [NSString stringWithFormat:@"[%@]", FCEngineName(eng)];
-                FCAppendDiagText([NSString stringWithFormat:@"[原生]%@%@ %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
-                    engTag, typeTag, vcls, joined,
-                    r.origin.x, r.origin.y, r.size.width, r.size.height,
-                    matched.count ? [matched componentsJoinedByString:@","] : @"无"]);
+                // v21：去重 key = 类名+文字+量化位置（同元素跨容器不再重复输出）
+                NSString *key = [NSString stringWithFormat:@"%@|%@|%.0f,%.0f",
+                                 vcls, joined, r.origin.x, r.origin.y];
+                if (![seen containsObject:key]) {
+                    [seen addObject:key];
+                    FCAppendDiagText([NSString stringWithFormat:@"%@%@ %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
+                        engTag, typeTag, vcls, joined,
+                        r.origin.x, r.origin.y, r.size.width, r.size.height,
+                        matched.count ? [matched componentsJoinedByString:@","] : @"无"]);
+                    lines++;
+                }
             }
             for (UIView *sub in v.subviews) [q addObject:sub];
+        }
+        if (lines >= kMaxDiagLines) {
+            FCAppendDiagText(@"[已截断] 正文达 80 行上限；可用「复制精简」发送要点。");
+            break;
         }
     }
     // 2) WKWebView：注入诊断 JS，回传 body 直系运营文案 + 图片名 + 数量
@@ -1688,35 +1781,45 @@ static void FCShowDiagnose(void) {
     bg.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
     [gFCDiagWindow addSubview:bg];
 
-    // v20：顶部常驻「标题 + 关闭 + 一键复制」，TextView 从 y=100 起，不再覆盖按钮
+    // v21：顶部固定「关闭 / 复制精简 / 复制全文」三按钮，TextView 从 y=92 起不覆盖按钮
     CGFloat barH = 92;
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, s.size.width - 32, 28)];
-    title.text = @"页面诊断 · 复制后粘贴发我";
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 10, s.size.width - 32, 28)];
+    title.text = @"页面诊断 · 优先点「复制精简」发我";
     title.textColor = [UIColor whiteColor];
-    title.font = [UIFont boldSystemFontOfSize:15];
+    title.font = [UIFont boldSystemFontOfSize:14];
     [bg addSubview:title];
 
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    close.frame = CGRectMake(16, 46, 80, 36);
+    close.frame = CGRectMake(12, 46, 62, 36);
     [close setTitle:@"关闭" forState:UIControlStateNormal];
-    close.titleLabel.font = [UIFont systemFontOfSize:15];
+    close.titleLabel.font = [UIFont systemFontOfSize:14];
     close.backgroundColor = [UIColor colorWithWhite:0.92 alpha:0.18];
     close.layer.cornerRadius = 8;
     [close addTarget:gFCDiagWindow action:@selector(fcCloseDiag) forControlEvents:UIControlEventTouchUpInside];
     [bg addSubview:close];
 
+    UIButton *brief = [UIButton buttonWithType:UIButtonTypeSystem];
+    brief.frame = CGRectMake(82, 46, 122, 36);
+    [brief setTitle:@"复制精简" forState:UIControlStateNormal];
+    brief.titleLabel.font = [UIFont systemFontOfSize:14];
+    brief.backgroundColor = [UIColor colorWithRed:0.15 green:0.65 blue:0.35 alpha:0.5];
+    brief.layer.cornerRadius = 8;
+    [brief addTarget:gFCDiagWindow action:@selector(fcCopyBrief) forControlEvents:UIControlEventTouchUpInside];
+    [bg addSubview:brief];
+
     UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
-    copy.frame = CGRectMake(104, 46, 130, 36);
-    [copy setTitle:@"一键复制全部" forState:UIControlStateNormal];
-    copy.titleLabel.font = [UIFont systemFontOfSize:15];
+    copy.frame = CGRectMake(212, 46, 112, 36);
+    [copy setTitle:@"复制全文" forState:UIControlStateNormal];
+    copy.titleLabel.font = [UIFont systemFontOfSize:14];
     copy.backgroundColor = [UIColor colorWithRed:0.15 green:0.55 blue:0.95 alpha:0.35];
     copy.layer.cornerRadius = 8;
     [copy addTarget:gFCDiagWindow action:@selector(fcCopyDiag) forControlEvents:UIControlEventTouchUpInside];
     [bg addSubview:copy];
 
-    gFCDiagToast = [[UILabel alloc] initWithFrame:CGRectMake(242, 46, s.size.width - 258, 36)];
+    gFCDiagToast = [[UILabel alloc] initWithFrame:CGRectMake(332, 46, s.size.width - 342, 36)];
     gFCDiagToast.textColor = [UIColor colorWithRed:0.5 green:1.0 blue:0.6 alpha:1];
-    gFCDiagToast.font = [UIFont systemFontOfSize:12];
+    gFCDiagToast.font = [UIFont systemFontOfSize:11];
+    gFCDiagToast.numberOfLines = 2;
     gFCDiagToast.hidden = YES;
     [bg addSubview:gFCDiagToast];
 
@@ -1974,7 +2077,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv20 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv21 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1987,7 +2090,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv20 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv21 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1997,7 +2100,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v20"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v21"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2078,7 +2181,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v20 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v21 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
