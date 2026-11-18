@@ -1,5 +1,14 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v25（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v26（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v26 相对 v25（老大真机诊断决定性证据：命中:✓的元素仍可见、留白框还在）：
+//    【纠正方向】v25「猜外层卡片整块删」是错的——诊断显示命中✓元素仍在树里可见，
+//    真相是删了 DX 管理的容器后，阿里 DX 动态化引擎下一帧重绘恢复，进入「删→重绘」打架，
+//    表现为留白/时有时无。改为：①FCCardShellForHide 回退为「只删命中元素自身」，不碰
+//    DX 大容器，粒度精确不与引擎打架；②新增 FCRemoveEmptyShellIfNeeded——删掉命中元素后
+//    若直接父容器被删空（无文字+子view≤1+尺寸像块）则连空壳一起移除，消除留白框。
+//    【技术天花板】DX 是服务端驱动的原生动态化，视图层删除存在「删了又重绘」的拉锯，
+//    Pure 档视图扫描有天然上限；彻底根治需 Deep 档从宿主广告数据/源头拦截（待评估）。
 //
 //  v25 相对 v24（老大真机：点选生效、内置命中2，但①隐藏后留空白方块②部分元素选不中）：
 //    ①留白根因：命中文字 label（如「淘宝直播抢10亿」/「芭芭农场」）只删了 label，外层带
@@ -212,14 +221,15 @@ static void FCPickModeExit(void);
 static void FCShowDiagnose(void);   // v14：页面结构诊断面板
 static void FCAppendDiagText(NSString *s);
 static UIView *FCCardShellForHide(UIView *hit);   // v25：隐藏时找整块卡片外壳
+static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  // v26：空壳父容器清理
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===25){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=25;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===26){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=26;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1134,6 +1144,7 @@ static void FCApplyNativeRules(void) {
                 // 的卡片容器还在 → 留白方块。改为移除 FCCardShellForHide 找到的整块卡片。
                 // 用记录表保住 view（否则释放），规则删除时 FCRestoreFlattenedIfNeeded 插回。
                 UIView *target = FCCardShellForHide(v);
+                UIView *targetParent = target.superview;   // v26：移除后用于空壳父容器判定
                 BOOL alreadyFlattened = NO;
                 for (FCFlattenRecord *rec in gFCFlattened) if (rec.view == target) { alreadyFlattened = YES; break; }
                 if (target.superview && !alreadyFlattened) {
@@ -1144,9 +1155,11 @@ static void FCApplyNativeRules(void) {
                     rec.rule = hitRule ?: @"";
                     [gFCFlattened addObject:rec];
                     [target removeFromSuperview];
+                    // v26：若父容器被删空（只剩背景无文字），连同空壳一起移除，消除留白框
+                    FCRemoveEmptyShellIfNeeded(targetParent, hitRule);
                     // 父视图是 stack/collection 时触发布局重算，下方元素自动补齐
-                    if ([target.superview isKindOfClass:NSClassFromString(@"UIStackView")] ||
-                        [target.superview isKindOfClass:[UIScrollView class]]) [target.superview setNeedsLayout];
+                    if ([targetParent isKindOfClass:NSClassFromString(@"UIStackView")] ||
+                        [targetParent isKindOfClass:[UIScrollView class]]) [targetParent setNeedsLayout];
                 } else {
                     target.hidden = YES;   // 兜底：无父视图时用隐藏
                     objc_setAssociatedObject(target, &kHiddenByFC, hitRule ?: @"", OBJC_ASSOCIATION_RETAIN_NONATOMIC);
@@ -1271,35 +1284,42 @@ static UIView *FCCardContainerFrom(UIView *hit) {
     return best ?: hit;
 }
 
-// v25：隐藏时找「整块卡片外壳」——真机命中文字 label（如「淘宝直播抢10亿」）后只删 label，
-// 外层带背景/固定高度的卡片容器还在 → 留白方块。本函数从命中 view 往上找最内层的独立卡片：
-// 高度≤35%屏（远小于黑名单闸门的 50%，绝不碰根容器）、宽不超屏、且有实际卡片尺寸。
-// 只取满足条件的「最内层」一层，逐层塌陷交给下一轮扫描，避免一次移太大误伤。
+// v26：删除目标——只删「命中内容自身」，不再猜外层大容器。
+// 真机教训（v25/v26 猜容器整块删）：诊断显示命中✓的元素仍在树里可见 → 我们删的是猜出来的
+// DX 外层容器，而阿里 DX 动态化引擎下一帧就重绘恢复，进入「删→重绘→再删」打架状态，
+// 表现为留白框/时有时无。正解：删命中元素自身（粒度精确、不碰 DX 管理的容器）。
+// 仅当命中元素很小（高<40，通常是个文字 label）时，连同它的直接父容器一起删——
+// 直接父容器粒度适中，既吃掉小 label 的外壳，又不会猜到会被重绘的大卡片。
 static UIView *FCCardShellForHide(UIView *hit) {
-    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    return hit;   // 默认：删命中自身。空壳父容器清理交给下方的 FCRemoveEmptyShellIfNeeded。
+}
+
+// v26：删掉命中小元素后，若它的直接父容器被删空（只剩背景、无可见文字、子 view≤1），
+// 一并塌陷这个空壳——专治「删了文字留白框」。只处理直接父容器一层，且尺寸像卡片
+// （宽≥100、高≤30%屏），绝不向上猜，避免碰 DX 大容器触发重绘打架。
+static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule) {
+    UIView *p = removedFrom;
+    if (!p || [p isKindOfClass:[UIWindow class]]) return;
+    CGRect pr = [p convertRect:p.bounds toView:nil];
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
-    UIView *cur = hit;
-    for (int d = 0; cur && d < 6; d++) {
-        UIView *sup = cur.superview;
-        if (!sup || [sup isKindOfClass:[UIWindow class]]) break;
-        NSString *cls = NSStringFromClass([sup class]);
-        if ([cls rangeOfString:@"TabBar"].location != NSNotFound ||
-            [cls rangeOfString:@"NavigationBar"].location != NSNotFound) break;
-        CGRect r = [sup convertRect:sup.bounds toView:nil];
-        // 卡片外壳特征：宽≥60、高≥36、高≤30%屏、不超屏宽、子 view 数≤8（典型卡片，
-        // 排除滚动列表大容器）。远小于 50%屏 的黑屏闸门，绝不碰根容器。
-        NSUInteger subCount = sup.subviews.count;
-        if (r.size.width >= 60 && r.size.width <= sw + 1 &&
-            r.size.height >= 36 && r.size.height <= sh * 0.30 && subCount <= 8) {
-            // 父容器必须比它大——确认它是「一块」而不是整页
-            CGRect pr = sup.superview ? [sup.superview convertRect:sup.superview.bounds toView:nil] : CGRectZero;
-            BOOL parentBigger = !sup.superview || [sup.superview isKindOfClass:[UIWindow class]] ||
-                                pr.size.height > r.size.height + 20 || pr.size.width > r.size.width + 20;
-            if (parentBigger) return sup;   // 取最内层符合条件的卡片
+    // 空壳判定：自身无文字 + 可见子 view≤1 + 尺寸像块卡片
+    NSString *ownText = FCOwnTextOf(p);
+    NSUInteger visibleSubs = 0;
+    for (UIView *s in p.subviews) if (!s.hidden && s.alpha >= 0.05) visibleSubs++;
+    if (ownText.length == 0 && visibleSubs <= 1 &&
+        pr.size.width >= 100 && pr.size.height >= 30 && pr.size.height <= sh * 0.30) {
+        BOOL already = NO;
+        for (FCFlattenRecord *rec in gFCFlattened) if (rec.view == p) { already = YES; break; }
+        if (p.superview && !already) {
+            FCFlattenRecord *rec = [FCFlattenRecord new];
+            rec.view = p; rec.superview = p.superview;
+            rec.index = [p.superview.subviews indexOfObject:p];
+            rec.rule = rule ?: @"";
+            [gFCFlattened addObject:rec];
+            [p removeFromSuperview];
+            FCLog(@"空壳清理：移除 %@ %.0fx%.0f", NSStringFromClass([p class]), pr.size.width, pr.size.height);
         }
-        cur = sup;
     }
-    return hit;   // 找不到合适外壳就退回命中 view 本身（保持 v16 行为）
 }
 
 #pragma mark - 点选拾取
@@ -1905,7 +1925,7 @@ static UIViewController *FCHostTopVC(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v25 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v26 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2328,7 +2348,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv25 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv26 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2341,7 +2361,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv25 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv26 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2352,7 +2372,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v25"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v26"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2440,7 +2460,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v25 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v26 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
