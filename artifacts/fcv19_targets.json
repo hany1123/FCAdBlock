@@ -1,0 +1,10 @@
+{
+  "FCAdBlock_Pure_v19.dylib": {
+    "yes": ["FCv19", "FCAdBlock v19", "@rpath/FCAdBlock.dylib", "SPSplashController", "TBBootImageSplashDO", "TBRewardKit", "TBTDBannerView", "MunionAdRequestMiddleware", "AKTsAlimamaAdAbility", "UINavigationControllerDidShowViewControllerNotification", "FCFlattenRecord", "u16:开屏", "u16:激励", "u16:横幅", "u16:联盟", "u16:100元寄件券包", "u16:网页过大→", "u16:网页空点→", "u16:H5内元素"],
+    "no": ["CydiaSubstrate", "MobileSubstrate", "DynamicLibraries", "MSHook", "_logos_", "libsubstrate"]
+  },
+  "FCAdBlock_Deep_v19.dylib": {
+    "yes": ["FCv19", "@rpath/FCAdBlock.dylib", "method_setImplementation", "TBCashRewardService", "MunionAdRequestMiddleware"],
+    "no": ["CydiaSubstrate", "MobileSubstrate", "DynamicLibraries", "MSHook", "_logos_", "libsubstrate"]
+  }
+}
