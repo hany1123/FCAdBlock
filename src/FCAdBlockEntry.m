@@ -612,7 +612,7 @@ static void FCCloseRulePanelAndCommit(BOOL commit) {
 }
 
 static void FCShowRulePanel(void) {
-    [FCHidePanel];
+    FCHidePanel();
     if (!gFCPanelWindow) {
         CGRect s = [UIScreen mainScreen].bounds;
         gFCPanelWindow = [[FCPanelWindow alloc] initWithFrame:s];
