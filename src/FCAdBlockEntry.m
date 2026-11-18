@@ -3688,8 +3688,8 @@ static void FCHookSetHeightSpec(id self, SEL _cmd, id spec) {
     // 已判定拦截的实例：无论谁在什么时候设高度，一律压成 0 —— 从布局源头掐掉那个空槽。
     BOOL blocked = NO;
     @try {
-        blocked = (objc_getAssociatedObject(self, &kFCBlockedRoot) ||
-                   objc_getAssociatedObject(self, &kFCZeroRec)) != nil;
+        blocked = (objc_getAssociatedObject(self, &kFCBlockedRoot) != nil);
+        if (!blocked) blocked = (objc_getAssociatedObject(self, &kFCZeroRec) != nil);
     } @catch (NSException *e) { }
     if (blocked && [spec isKindOfClass:[NSNumber class]] && [spec doubleValue] > 0.5) {
         inHeightHook = YES;
