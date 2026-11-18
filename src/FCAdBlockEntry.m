@@ -1211,6 +1211,61 @@ static NSUInteger gFCHeightZeroSkip = 0;
 // v40：v39 几何空壳压0 的开关（停用：压子视图不减高度，且会误伤正常运营位；留代码便于回退）
 static const BOOL gFCRotorEnabled = NO;
 
+#pragma mark - v40：DX 高度规格归零（唯一能真正减高度的入口）
+// 注意：这两个函数必须放在 #ifdef FC_DEEP_HOOKS 之外——扫描阶段在 A/Pure 档也会调用，
+// 定义若留在 Deep 段内，A 档会报 "function has internal linkage but is not defined"(DL4 坑)。
+
+// v40：通知最近的宿主列表重算 item 尺寸。
+// 真机铁证：v35 与 v39 两版商品流起点都在 y≈590，中间 480pt 高度纹丝不动——
+// 说明高度不是内容撑的，而是 DX 高度规格 / 宿主 collection item 给的。
+// 只压子视图永远是「删内容留空壳」，必须让宿主重新布局才塌得下去。
+static void FCTriggerHostRelayout(UIView *v) {
+    UIView *p = v.superview;
+    int guard = 0;
+    while (p && guard++ < 10) {
+        if ([p isKindOfClass:[UICollectionView class]]) {
+            @try {
+                UICollectionView *cv = (UICollectionView *)p;
+                if (cv.collectionViewLayout) [cv.collectionViewLayout invalidateLayout];
+                [cv setNeedsLayout];
+            } @catch (NSException *e) { }
+            return;
+        }
+        if ([p isKindOfClass:[UITableView class]]) {
+            @try {
+                UITableView *tv = (UITableView *)p;
+                [tv beginUpdates];
+                [tv endUpdates];
+            } @catch (NSException *e) { }
+            return;
+        }
+        p = p.superview;
+    }
+}
+
+// v40：把被拦 DXRootView 的高度规格（originalHeightSpec）置 0。
+// 安全边界：只在 spec 是 NSNumber 时改写；自定义 spec 对象（Weex WXLength 之类）不硬塞，
+// 只记日志等下一版按类型处理——宁可这版无效，也不能把引擎布局搞崩。
+static void FCZeroDXHeightSpec(UIView *root) {
+    if (!root) return;
+    if (objc_getAssociatedObject(root, &kFCHeightZeroed)) return;   // 每个 root 只做一次
+    id spec = nil;
+    @try { spec = [root valueForKey:@"originalHeightSpec"]; } @catch (NSException *e) { }
+    if (!spec) return;                       // 还没设置，等下一轮再试（幂等，不计数）
+    objc_setAssociatedObject(root, &kFCHeightZeroed, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![spec isKindOfClass:[NSNumber class]]) {
+        gFCHeightZeroSkip++;
+        FCLog(@"v40 高度规格非 NSNumber，跳过: %@ (%@)", NSStringFromClass([spec class]), spec);
+        return;
+    }
+    if ([spec doubleValue] <= 0.5) return;   // 已经是 0，不必重写
+    @try { [root setValue:@0 forKey:@"originalHeightSpec"]; }
+    @catch (NSException *e) { gFCHeightZeroSkip++; FCLog(@"v40 高度规格写入失败: %@", e.reason); return; }
+    gFCHeightZeroOK++;
+    FCLog(@"v40 高度规格置0: 原 %@ (%@)", spec, NSStringFromClass([root class]));
+    FCTriggerHostRelayout(root);
+}
+
 // v32：规则是否仍匹配这条记录（与 FCRestoreFlattenedIfNeeded 同口径）
 static BOOL FCRecordRuleStillValid(FCFlattenRecord *rec, NSArray<NSString *> *rules) {
     for (NSString *r in rules) {
@@ -3575,58 +3630,7 @@ static BOOL gFCDeepScanned = NO;   // v31：secondfloor 深扫只做一次，避
 
 // v37：kFCBlockedRoot 已前移到全局压0记录区，扫描阶段据此判定源头拦截过的 root。
 
-#pragma mark - v40：DX 高度规格归零（唯一能真正减高度的入口）
-
-// v40：通知最近的宿主列表重算 item 尺寸。
-// 真机铁证：v35 与 v39 两版商品流起点都在 y≈590，中间 480pt 高度纹丝不动——
-// 说明高度不是内容撑的，而是 DX 高度规格 / 宿主 collection item 给的。
-// 只压子视图永远是「删内容留空壳」，必须让宿主重新布局才塌得下去。
-static void FCTriggerHostRelayout(UIView *v) {
-    UIView *p = v.superview;
-    int guard = 0;
-    while (p && guard++ < 10) {
-        if ([p isKindOfClass:[UICollectionView class]]) {
-            @try {
-                UICollectionView *cv = (UICollectionView *)p;
-                if (cv.collectionViewLayout) [cv.collectionViewLayout invalidateLayout];
-                [cv setNeedsLayout];
-            } @catch (NSException *e) { }
-            return;
-        }
-        if ([p isKindOfClass:[UITableView class]]) {
-            @try {
-                UITableView *tv = (UITableView *)p;
-                [tv beginUpdates];
-                [tv endUpdates];
-            } @catch (NSException *e) { }
-            return;
-        }
-        p = p.superview;
-    }
-}
-
-// v40：把被拦 DXRootView 的高度规格（originalHeightSpec）置 0。
-// 安全边界：只在 spec 是 NSNumber 时改写；自定义 spec 对象（Weex WXLength 之类）不硬塞，
-// 只记日志等下一版按类型处理——宁可这版无效，也不能把引擎布局搞崩。
-static void FCZeroDXHeightSpec(UIView *root) {
-    if (!root) return;
-    if (objc_getAssociatedObject(root, &kFCHeightZeroed)) return;   // 每个 root 只做一次
-    id spec = nil;
-    @try { spec = [root valueForKey:@"originalHeightSpec"]; } @catch (NSException *e) { }
-    if (!spec) return;                       // 还没设置，等下一轮再试（幂等，不计数）
-    objc_setAssociatedObject(root, &kFCHeightZeroed, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (![spec isKindOfClass:[NSNumber class]]) {
-        gFCHeightZeroSkip++;
-        FCLog(@"v40 高度规格非 NSNumber，跳过: %@ (%@)", NSStringFromClass([spec class]), spec);
-        return;
-    }
-    if ([spec doubleValue] <= 0.5) return;   // 已经是 0，不必重写
-    @try { [root setValue:@0 forKey:@"originalHeightSpec"]; }
-    @catch (NSException *e) { gFCHeightZeroSkip++; FCLog(@"v40 高度规格写入失败: %@", e.reason); return; }
-    gFCHeightZeroOK++;
-    FCLog(@"v40 高度规格置0: 原 %@ (%@)", spec, NSStringFromClass([root class]));
-    FCTriggerHostRelayout(root);
-}
+#pragma mark - v40：高度规格 hook（Deep 档）
 
 static void FCHookSetHeightSpec(id self, SEL _cmd, id spec) {
     // 已判定拦截的实例：无论谁在什么时候设高度，一律压成 0 —— 从布局源头掐掉那个空槽。
