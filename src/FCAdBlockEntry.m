@@ -1,7 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v5
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v6
 //
-//  v5 相对 v4（真机四次反馈：浮标要能拖/边缘吸附小白条 + 规则可视化编辑 + 返回页面后失效）：
+//  v6 相对 v5（真机五次反馈：吸附失效 + 点选覆盖范围窄）：
+//    1) 修浮标边缘吸附：v5 用「中心点 cx<60 或 >屏宽-60」判定，但浮标宽达 360pt
+//       几乎占满屏，中心恒在中段 → 吸附条件永假。v6 收窄胶囊到 250pt，改用
+//       「浮标左右边缘到屏幕边的距离 ≤44pt」判定吸附；记住自由位置供展开恢复；
+//       小白条加宽到 20pt 便于点按。
+//    2) 点选覆盖无文字广告：v5 只取最长中文串当规则，纯图片/图标广告记不住。
+//       v6 多特征记忆：文案/alt/aria-label/#id/.class/img:文件名（网页 JS 回传多值），
+//       原生回退 ASCII 串与触点 view 的 class 名；扫描时按 class 名也可命中。
+//
+//  v5：可拖动浮标 + 边缘吸附小白条 + 规则可视化面板 + 返回页面失效修复。
 //    1) 浮标可拖动：touchesMoved 更新位置；松手靠近左右边缘自动收成「小白条」吸附贴边；
 //       点小白条展开回完整浮标。tap 完整浮标弹出操作菜单（点选广告/规则管理/复位）。
 //       区分 tap 与 drag（位移阈值），拖动不误触发菜单。
@@ -41,6 +50,7 @@ static void FCHidePanel(void);
 static void FCCloseRulePanelAndCommit(BOOL commit);
 static NSArray<NSString *> *FCTextsOf(UIView *root);
 static BOOL FCRuleMatchesText(NSString *rule, NSString *text);
+static CGRect FCDefaultBadgeFrame(void);
 
 #pragma mark - H5 脚本模板
 
@@ -49,14 +59,31 @@ static NSString * const FCJSAdCardsTemplate =
 "if(W.__fcadLoaded){if(W.__fcadSweep){W.__fcadSweep();}return;}"
 "W.__fcadLoaded=1;W.__fcadHits=0;"
 "var K=['百元券包','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','任选3件'];"
-"function hit(t){if(!t||t.length>160){return false;}"
-"var A=K.concat(W.__fcadUserRules||[]);"
-"for(var i=0;i<A.length;i++){if(t.indexOf(A[i])>=0){return true;}}return false;}"
-"function sweep(){var all=document.querySelectorAll('div,li,a,section,article');"
-"for(var i=0;i<all.length;i++){var e=all[i];if(!e||e.__fcadDone){continue;}"
-"var txt=(e.innerText||e.textContent||'');if(txt.length<2||txt.length>160){continue;}"
-"if(!hit(txt)){continue;}"
-"var t=e;for(var k=0;k<2;k++){var p=t.parentElement;if(!p||p===document.body){break;}"
+"function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
+"add((e.innerText||e.textContent||'').trim());"
+"if(e.getAttribute){add(e.getAttribute('alt'));add(e.getAttribute('aria-label'));"
+"if(e.id)add('#'+e.id);"
+"var c=e.className&&(''+e.className).trim().split(/\\s+/)[0];if(c)add('.'+c);"
+"var src=e.getAttribute('src')||e.getAttribute('data-src');"
+"if(src){var m=src.split('/').pop().split('?')[0];"
+"if(m&&m.length>=4&&/\\.(png|jpg|jpeg|gif|webp)/i.test(m))add('img:'+m);}}"
+"return a;}"
+"function hit(e){"
+"if(!e||e.nodeType!==1)return false;"
+"var t=(e.innerText||e.textContent||'').trim();if(t.length>160)return false;"
+"var A=K.concat(W.__fcadUserRules||[]);var ks=keys(e);"
+"for(var i=0;i<A.length;i++){var a=A[i];if(!a)continue;"
+"if(a.charAt(0)==='#'){if(e.id&&e.id===a.slice(1))return true;continue;}"
+"if(a.charAt(0)==='.'){if(e.className&&(''+e.className).split(/\\s+/).indexOf(a.slice(1))>=0)return true;continue;}"
+"if(a.indexOf('img:')===0){var s=(e.getAttribute('src')||'')+' '+(e.getAttribute('data-src')||'');"
+"if(s.indexOf(a.slice(4))>=0)return true;continue;}"
+"if(t&&t.indexOf(a)>=0)return true;"
+"for(var j=0;j<ks.length;j++){if(ks[j].indexOf(a)>=0)return true;}}"
+"return false;}"
+"function sweep(){var all=document.querySelectorAll('div,li,a,section,article,img,span');"
+"for(var i=0;i<all.length;i++){var e=all[i];if(!e||e.__fcadDone)continue;"
+"if(!hit(e))continue;"
+"var t=e;for(var k=0;k<2;k++){var p=t.parentElement;if(!p||p===document.body)break;"
 "var pr=p.getBoundingClientRect();var tr=t.getBoundingClientRect();"
 "if(tr.height>0&&pr.height<=tr.height*1.6&&pr.width<=window.innerWidth*0.96){t=p;}else{break;}}"
 "var r=t.getBoundingClientRect();if(r.height>window.innerHeight*0.6){continue;}"
@@ -66,13 +93,21 @@ static NSString * const FCJSAdCardsTemplate =
 "W.__fcadOb.observe(document.documentElement,{childList:true,subtree:true});}})();";
 
 static NSString * const FCPickJSFmt =
-@"(function(){var e=document.elementFromPoint(%f,%f);if(!e){return 'MISS';}"
-"var t=e;for(var k=0;k<3;k++){var p=t.parentElement;if(!p||p===document.body){break;}"
+@"(function(){var e=document.elementFromPoint(%f,%f);if(!e)return 'MISS';"
+"var out=[];function add(s){if(s&&(''+s).length>=2&&out.indexOf(''+s)<0)out.push(''+s);}"
+"add((e.innerText||e.textContent||'').trim());"
+"if(e.getAttribute){add(e.getAttribute('alt'));add(e.getAttribute('aria-label'));"
+"if(e.id)add('#'+e.id);"
+"var c=e.className&&(''+e.className).trim().split(/\\s+/)[0];if(c)add('.'+c);"
+"var src=e.getAttribute('src')||e.getAttribute('data-src');"
+"if(src){var m=src.split('/').pop().split('?')[0];"
+"if(m&&m.length>=4&&/\\.(png|jpg|jpeg|gif|webp)/i.test(m))add('img:'+m);}}"
+"var t=e;for(var k=0;k<3;k++){var p=t.parentElement;if(!p||p===document.body)break;"
 "var pr=p.getBoundingClientRect();var tr=t.getBoundingClientRect();"
 "if(tr.height>0&&pr.height<=tr.height*1.8&&pr.width<=window.innerWidth*0.97){t=p;}else{break;}}"
-"var r=t.getBoundingClientRect();if(r.height>window.innerHeight*0.7){return 'TOOBIG';}"
+"var r=t.getBoundingClientRect();if(r.height>window.innerHeight*0.85)return 'TOOBIG';"
 "t.style.setProperty('display','none','important');t.__fcadDone=1;"
-"var txt=(t.innerText||t.textContent||'');return txt.substring(0,40);})();";
+"return out.join('|');})();";
 
 #pragma mark - 用户规则持久化
 
@@ -264,7 +299,7 @@ static NSArray<NSString *> *FCTextsOf(UIView *root) {
 
 static NSString *FCPickRuleText(UIView *root) {
     NSArray *texts = FCTextsOf(root);
-    NSString *best = nil;
+    NSString *bestCN = nil, *bestASCII = nil;
     for (NSString *s in texts) {
         if (s.length < 2) continue;
         BOOL hasCN = NO;
@@ -272,9 +307,23 @@ static NSString *FCPickRuleText(UIView *root) {
             unichar c = [s characterAtIndex:i];
             if (c >= 0x4e00 && c <= 0x9fff) { hasCN = YES; break; }
         }
-        if (hasCN && (!best || s.length > best.length)) best = s;
+        if (hasCN) {
+            if (!bestCN || s.length > bestCN.length) bestCN = s;
+        } else {
+            // v6：无中文时收 ASCII 长串（≥4，且非纯数字/纯符号），覆盖英文/图标型广告
+            if (s.length < 4) continue;
+            BOOL hasLetter = NO, hasDigit = NO;
+            for (NSUInteger i = 0; i < s.length; i++) {
+                unichar c = [s characterAtIndex:i];
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) hasLetter = YES;
+                else if (c >= '0' && c <= '9') hasDigit = YES;
+            }
+            if (hasLetter || hasDigit) {
+                if (!bestASCII || s.length > bestASCII.length) bestASCII = s;
+            }
+        }
     }
-    return best;
+    return bestCN ?: bestASCII;
 }
 
 static NSMapTable<UIViewController *, NSNumber *> *gFCAttempts = nil;
@@ -386,7 +435,14 @@ static void FCApplyNativeRules(void) {
             }
             NSArray *texts = FCTextsOf(v);
             BOOL hit = NO;
-            for (NSString *s in texts) {
+            // v6：先按 class 名匹配（覆盖无文字图片广告）
+            for (NSString *rule in rules) {
+                if (rule.length >= 4 && [cls rangeOfString:rule options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    hit = YES; break;
+                }
+            }
+            // 再按文案匹配
+            if (!hit) for (NSString *s in texts) {
                 for (NSString *rule in rules) {
                     if (FCRuleMatchesText(rule, s)) { hit = YES; break; }
                 }
@@ -502,9 +558,22 @@ static void FCPickAtPoint(CGPoint screenP) {
                 if (!err && [result isKindOfClass:[NSString class]]) {
                     NSString *txt = (NSString *)result;
                     if (txt.length >= 2 && ![txt hasPrefix:@"MISS"] && ![txt hasPrefix:@"TOOBIG"]) {
-                        FCAddUserRule(txt);
+                        // v6：一次点选可回传多个特征（文案/alt/id/class/图片名），全部记为规则
+                        NSArray *feats = [txt componentsSeparatedByString:@"|"];
+                        NSUInteger added = 0;
+                        for (NSString *f in feats) {
+                            NSString *rule = [f stringByTrimmingCharactersInSet:
+                                              [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+                            if (rule.length < 2) continue;
+                            // 前缀特征（#id / .class / img:）要求更长，避免误伤同类控件
+                            unichar h = [rule characterAtIndex:0];
+                            if ((h == '#' || h == '.') && rule.length < 5) continue;
+                            if ([rule hasPrefix:@"img:"] && rule.length < 8) continue;
+                            FCAddUserRule(rule); added++;
+                        }
                         dispatch_async(dispatch_get_main_queue(), ^{
-                            FCInjectWebViews(NO); FCShowBadgeMsg(@"网页·已隐藏并记住");
+                            FCInjectWebViews(NO);
+                            FCShowBadgeMsg(added ? @"网页·已隐藏并记住" : @"网页·已隐藏");
                         });
                         return;
                     }
@@ -517,6 +586,18 @@ static void FCPickAtPoint(CGPoint screenP) {
         card.hidden = YES;
         gFCNativeHits++;
         if (ruleText.length >= 2) FCAddUserRule(ruleText);
+        // v6：无文字/文字短时，退而记录触点 view 的 class 名（去掉数字后缀）作为同类特征
+        if (ruleText.length < 3) {
+            NSString *cls = NSStringFromClass([hit class]);
+            NSMutableString *clean = [NSMutableString string];
+            for (NSUInteger i = 0; i < cls.length; i++) {
+                unichar c = [cls characterAtIndex:i];
+                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) [clean appendFormat:@"%C", c];
+                else if (c >= '0' && c <= '9') break;   // 去掉末尾编号
+                else break;
+            }
+            if (clean.length >= 4) FCAddUserRule(clean);
+        }
         FCShowBadgeMsg(ruleText.length >= 2 ? @"原生·已隐藏并记住" : @"原生·已隐藏");
     }
 }
@@ -703,11 +784,18 @@ static void FCHidePanel(void) {
 static UIView *gFCBadgeBar = nil;
 static UILabel *gFCBadgeLabel = nil;
 static CGRect gFCBadgeFrame = {0};
+static CGRect gFCBadgeNormalFrame = {0};   // v6：记住展开态的自由位置，供展开恢复
 static FCBadgeWindow *gFCBadgeWindow = nil;
 static BOOL gFCBadgeCollapsed = NO;      // 是否为吸附小白条
 static NSInteger gFCBadgeSide = 0;       // 吸附边：0 左 / 1 右
 static CGPoint gFCTouchStart = {0};
 static BOOL gFCDidDrag = NO;
+
+static CGRect FCDefaultBadgeFrame(void) {
+    CGRect s = [UIScreen mainScreen].bounds;
+    CGFloat w = MIN(s.size.width - 40, 250);   // v6：收窄胶囊，留出拖动空间
+    return CGRectMake((s.size.width - w) / 2, 108, w, 40);
+}
 
 @implementation FCBadgeWindow
 
@@ -741,6 +829,7 @@ static BOOL gFCDidDrag = NO;
     f.origin.x = MAX(0, MIN(f.origin.x, s.size.width - f.size.width));
     f.origin.y = MAX(60, MIN(f.origin.y, s.size.height - f.size.height - 40));
     gFCBadgeFrame = f;
+    if (!gFCBadgeCollapsed) gFCBadgeNormalFrame = f;   // v6：记住展开态自由位置
     gFCBadgeBar.frame = f;
     gFCTouchStart = p;
     if (gFCBadgeCollapsed) { gFCBadgeCollapsed = NO; [self expandBadgeFrame]; }
@@ -756,12 +845,15 @@ static BOOL gFCDidDrag = NO;
         FCPickAtPoint(p);
         return;
     }
-    if (gFCDidDrag) {                                     // 拖动结束：边缘吸附
+    if (gFCDidDrag) {                                     // 拖动结束：按「浮标边缘到屏幕边的距离」判定吸附
         CGRect s = self.bounds;
-        CGFloat cx = CGRectGetMidX(gFCBadgeFrame);
-        if (cx < 60) { gFCBadgeSide = 0; [self collapseToEdge]; }
-        else if (cx > s.size.width - 60) { gFCBadgeSide = 1; [self collapseToEdge]; }
-        else { gFCBadgeCollapsed = NO; [self expandBadgeFrame]; }
+        CGRect f = gFCBadgeFrame;
+        CGFloat leftGap = CGRectGetMinX(f);               // v6：不再用中心点（浮标宽时中心恒在中屏，永不贴边）
+        CGFloat rightGap = s.size.width - CGRectGetMaxX(f);
+        CGFloat snap = 44;                                // 距屏幕边 44pt 内即吸附
+        if (leftGap <= snap) { gFCBadgeSide = 0; [self collapseToEdge]; }
+        else if (rightGap <= snap) { gFCBadgeSide = 1; [self collapseToEdge]; }
+        else { gFCBadgeCollapsed = NO; gFCBadgeNormalFrame = f; }
         FCUpdateBadge();
         return;
     }
@@ -777,26 +869,31 @@ static BOOL gFCDidDrag = NO;
 
 - (void)expandBadgeFrame {
     CGRect s = self.bounds;
-    CGFloat w = MIN(s.size.width - 24, 360);
+    CGFloat w = MIN(s.size.width - 40, 250);   // v6：收窄胶囊
     CGFloat h = 40;
-    CGFloat x = gFCBadgeSide == 1 ? (s.size.width - w - 6) : 6;
-    CGFloat y = MIN(MAX(gFCBadgeFrame.origin.y, 100), s.size.height - h - 120);
+    // v6：优先恢复到用户拖到的自由位置，否则按吸附边展开，再否则默认中上
+    CGRect base = CGRectIsEmpty(gFCBadgeNormalFrame) ? FCDefaultBadgeFrame() : gFCBadgeNormalFrame;
+    CGFloat x = base.origin.x, y = base.origin.y;
+    x = MAX(0, MIN(x, s.size.width - w));
+    y = MIN(MAX(y, 60), s.size.height - h - 40);
     gFCBadgeFrame = CGRectMake(x, y, w, h);
+    gFCBadgeNormalFrame = gFCBadgeFrame;
     gFCBadgeBar.frame = gFCBadgeFrame;
     gFCBadgeLabel.frame = CGRectInset(gFCBadgeBar.bounds, 6, 2);
 }
 
 - (void)collapseToEdge {
     CGRect s = self.bounds;
-    CGFloat w = 14, h = 56;
+    CGFloat w = 20, h = 64;                    // v6：加宽小白条，便于点按展开
     CGFloat x = gFCBadgeSide == 1 ? (s.size.width - w) : 0;
     CGFloat y = MIN(MAX(CGRectGetMidY(gFCBadgeFrame) - h / 2, 120), s.size.height - h - 100);
+    if (!gFCBadgeCollapsed && !CGRectIsEmpty(gFCBadgeFrame)) gFCBadgeNormalFrame = gFCBadgeFrame;
     gFCBadgeCollapsed = YES;
     gFCBadgeFrame = CGRectMake(x, y, w, h);
     gFCBadgeBar.frame = gFCBadgeFrame;
     gFCBadgeLabel.frame = gFCBadgeBar.bounds;
     gFCBadgeLabel.text = @"⋮";
-    gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.2 green:0.5 blue:0.9 alpha:0.8] colorWithAlphaComponent:0.85];
+    gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.2 green:0.5 blue:0.9 alpha:0.8] colorWithAlphaComponent:0.9];
 }
 
 @end
@@ -814,8 +911,8 @@ static void FCEnsureBadgeWindow(void) {
             }
         }
     }
-    CGFloat w = MIN(s.size.width - 24, 360);
-    gFCBadgeFrame = CGRectMake((s.size.width - w) / 2, 108, w, 40);
+    gFCBadgeFrame = FCDefaultBadgeFrame();
+    gFCBadgeNormalFrame = gFCBadgeFrame;
     gFCBadgeBar = [[UIView alloc] initWithFrame:gFCBadgeFrame];
     gFCBadgeBar.tag = 9527;
     gFCBadgeBar.userInteractionEnabled = NO;
@@ -838,7 +935,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv5 规则%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv6 规则%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -850,7 +947,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv5 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv6 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -860,7 +957,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v5"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v6"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ gFCBadgeWindow.picking = YES;
@@ -870,6 +967,7 @@ static void FCShowActionMenu(void) {
                  handler:^(UIAlertAction *a){ FCShowRulePanel(); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"浮标复位" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ gFCBadgeCollapsed = NO; gFCBadgeSide = 0;
+                     gFCBadgeNormalFrame = FCDefaultBadgeFrame();
                      [gFCBadgeWindow expandBadgeFrame]; FCUpdateBadge(); }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     if (ac.popoverPresentationController) ac.popoverPresentationController.sourceView = gFCBadgeBar;
@@ -915,7 +1013,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v5 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v6 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         dispatch_async(dispatch_get_main_queue(), ^{
             FCEnsureBadgeWindow();
