@@ -1,5 +1,15 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v17（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v18（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v18 相对 v17（真机截图：淘宝「我的淘宝」页点选运营位，浮标显示「网页·未命中元素」）：
+//    根因：FCPickAtPoint 只要触点祖先链有 WKWebView 就锁死走网页通道，elementFromPoint
+//    返回 MISS/TOOBIG/err 就直接失败、不降级原生。而淘宝页面常驻各种 H5 容器 webview
+//    （预热/广告SDK），会员中心/超级88领券中心/金刚区这些运营位是原生/Weex 渲染，
+//    被 webview 带偏后 JS 抓不到 → 点选永远失败。
+//    修复：①web 通道加前置校验（可见 + 宽高≥160 + frame 覆盖触点），排除 1x1 隐藏 webview；
+//    ②网页 JS 失败(MISS/TOOBIG/err/无特征)自动降级到 FCPickNative 走原生拾取，浮标提示
+//      「网页未中→原生·已记N类」让用户看降级发生；③原生拾取抽成函数两路复用，并排除
+//      WKContentView/WebView 私有类，避免存下无效 cls: 规则。
 //
 //  v17 相对 v16（老大要求：全面分析淘宝 10.56.10 广告，补进列表，标注广告类型，适配通用）：
 //    ①新增「通用广告类型体系」FCAdTypeClassTable——7 大类型（开屏/激励/插屏/横幅/信息流/
@@ -110,6 +120,7 @@ static NSString *FCBuildInjectionJS(void);
 static void FCApplyNativeRules(void);
 static void FCInjectWebViews(BOOL force);
 static void FCPickAtPoint(CGPoint p);
+static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint);  // v18：网页失败降级原生
 static void FCShowActionMenu(void);
 static void FCShowRulePanel(void);
 static void FCHidePanel(void);
@@ -128,8 +139,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===17){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=17;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===18){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=18;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -994,6 +1005,46 @@ static UIView *FCCardContainerFrom(UIView *hit) {
 
 #pragma mark - 点选拾取
 
+// v18：原生拾取——从触点 hit 往上找运营卡片，存「文案 + cls:宿主类 + pos:位置」指纹。
+// 抽成函数供两条路径复用：①无 webview 直接走；②网页 JS 失败(MISS/TOOBIG/err)降级走。
+static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
+    if (!hit) { FCShowBadgeMsg(@"未命中元素"); return; }
+    UIView *card = FCCardContainerFrom(hit);
+    NSString *ruleText = FCPickRuleText(card);
+    CGRect markRect = [card convertRect:card.bounds toView:nil];
+    NSString *cls = NSStringFromClass([hit class]);
+    NSString *show = ruleText.length ? ruleText : cls;
+    FCShowPickMark(markRect, show);
+    card.hidden = YES;
+    gFCNativeHits++;
+    if (ruleText.length >= 2) FCAddUserRule(ruleText);
+    // v18：跳过 webview 私有类(WKContentView 等)，从卡片往上找真正的宿主自定义类
+    NSUInteger clsAdded = 0;
+    UIView *curC = card;
+    for (int depth = 0; curC && depth < 8; depth++) {
+        NSString *c = NSStringFromClass([curC class]);
+        // 排除 webview 及其私有类——否则存下 cls:WKContentView 这类无效规则
+        BOOL webPriv = ([c rangeOfString:@"WK"].location == 0) ||
+                       ([c rangeOfString:@"Web"].location != NSNotFound && [c hasPrefix:@"_"]);
+        BOOL hostClass = ([c rangeOfString:@"."].location != NSNotFound) ||
+            (![c hasPrefix:@"UI"] && ![c hasPrefix:@"NS"] && ![c isEqualToString:@"UIView"]);
+        if (hostClass && !webPriv && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
+            FCAddUserRule([@"cls:" stringByAppendingString:c]);
+            clsAdded++;
+        }
+        curC = curC.superview;
+    }
+    CGSize scr = [UIScreen mainScreen].bounds.size;
+    CGRect nr = [card convertRect:card.bounds toView:nil];
+    if (nr.size.width >= 40 && nr.size.height >= 18) {
+        FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
+            nr.origin.x/scr.width, nr.origin.y/scr.height,
+            nr.size.width/scr.width, nr.size.height/scr.height]);
+    }
+    NSString *prefix = fallbackHint.length ? fallbackHint : @"";
+    FCShowBadgeMsg([NSString stringWithFormat:@"%@原生·已记%lu类+位置", prefix, (unsigned long)clsAdded]);
+}
+
 static void FCPickAtPoint(CGPoint screenP) {
     Class wk = NSClassFromString(@"WKWebView");
     UIView *hit = FCHitViewAtPoint(screenP);
@@ -1003,12 +1054,23 @@ static void FCPickAtPoint(CGPoint screenP) {
         if (wk && [cur isKindOfClass:wk]) { web = cur; break; }
         cur = cur.superview;
     }
-    if (web) {
+    // v18：web 必须「可见、尺寸够大、frame 真覆盖触点」才算网页通道。
+    // 排除常驻的 1x1 预热 webview / 广告 SDK 隐藏 webview 把原生运营位带偏。
+    CGRect webFrame = web ? [web convertRect:web.bounds toView:nil] : CGRectZero;
+    BOOL webReal = web && !web.hidden && web.alpha >= 0.05 &&
+                   webFrame.size.width >= 160 && webFrame.size.height >= 160 &&
+                   CGRectContainsPoint(webFrame, screenP);
+    if (webReal) {
         SEL sel = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
-        if (![web respondsToSelector:sel]) { FCShowBadgeMsg(@"网页注入不可用"); return; }
-        IMP imp = [web methodForSelector:sel]; if (!imp) { FCShowBadgeMsg(@"网页注入不可用"); return; }
+        if (![web respondsToSelector:sel]) {
+            FCPickNative(hit, screenP, @"网页不可用→"); return;  // v18：降级
+        }
+        IMP imp = [web methodForSelector:sel]; if (!imp) {
+            FCPickNative(hit, screenP, @"网页不可用→"); return;  // v18：降级
+        }
         CGPoint lp = [web convertPoint:screenP fromView:nil];
         NSString *js = [NSString stringWithFormat:FCPickJSFmt, lp.x, lp.y];
+        UIView *capturedHit = hit;  // v18：block 里降级要用到触点 view
         ((void (*)(id, SEL, NSString *, void (^)(id, NSError *)))imp)
             (web, sel, js, ^(id result, NSError *err){
                 if (!err && [result isKindOfClass:[NSString class]]) {
@@ -1021,7 +1083,7 @@ static void FCPickAtPoint(CGPoint screenP) {
                         if (xywh.count == 4) {
                             CGRect wr = CGRectMake([xywh[0] doubleValue], [xywh[1] doubleValue],
                                                    [xywh[2] doubleValue], [xywh[3] doubleValue]);
-                            CGRect wf = [web convertRect:web.bounds toView:nil];   // web 在屏幕上的位置
+                            CGRect wf = [web convertRect:web.bounds toView:nil];
                             CGRect sr = CGRectMake(wf.origin.x + wr.origin.x, wf.origin.y + wr.origin.y,
                                                    wr.size.width, wr.size.height);
                             NSString *nm = parts.count > 1 ? parts[1] : @"网页元素";
@@ -1041,50 +1103,28 @@ static void FCPickAtPoint(CGPoint screenP) {
                             if ([rule hasPrefix:@"img:"] && rule.length < 8) continue;
                             FCAddUserRule(rule); added++;
                         }
+                        if (added) {
+                            dispatch_async(dispatch_get_main_queue(), ^{
+                                FCInjectWebViews(NO);
+                                FCShowBadgeMsg(added ? @"网页·已隐藏并记住" : @"网页·已隐藏");
+                            });
+                            return;
+                        }
+                        // v18：JS 命中元素但没提取到任何有效特征 → 也降级原生
                         dispatch_async(dispatch_get_main_queue(), ^{
-                            FCInjectWebViews(NO);
-                            FCShowBadgeMsg(added ? @"网页·已隐藏并记住" : @"网页·已隐藏");
+                            FCPickNative(capturedHit, screenP, @"网页无特征→");
                         });
                         return;
                     }
                 }
-                dispatch_async(dispatch_get_main_queue(), ^{ FCShowBadgeMsg(@"网页·未命中元素"); });
+                // v18：网页 MISS/TOOBIG/err → 自动降级到原生拾取（核心修复）
+                dispatch_async(dispatch_get_main_queue(), ^{
+                    FCPickNative(capturedHit, screenP, @"网页未中→");
+                });
             });
     } else {
-        UIView *card = FCCardContainerFrom(hit);
-        NSString *ruleText = FCPickRuleText(card);
-        // v8：先把选中元素框出来并标注识别到的内容（页面可见反馈）
-        CGRect markRect = [card convertRect:card.bounds toView:nil];
-        NSString *cls = NSStringFromClass([hit class]);
-        NSString *show = ruleText.length ? ruleText : cls;
-        FCShowPickMark(markRect, show);
-        card.hidden = YES;
-        gFCNativeHits++;
-        if (ruleText.length >= 2) FCAddUserRule(ruleText);
-        // v15 修复真 bug：v13 存的是 hit(UIImageView 等系统类，被 FCIsUnsafeClassRule 拒绝)，
-        // 导致点选从来没存下有用的类名。改为从 card 沿祖先链收集所有「宿主自定义类」。
-        // 诊断实证：运营位是 HiveConsumer.PersonaMoreCouponItemView 这种宿主类，文字是 ¥20/洗衣
-        NSUInteger clsAdded = 0;
-        UIView *curC = card;
-        for (int depth = 0; curC && depth < 6; depth++) {
-            NSString *c = NSStringFromClass([curC class]);
-            // 只收宿主自定义类（含点号如 HiveConsumer.XxxView，或带业务前缀），排除系统 UI/NS
-            BOOL hostClass = ([c rangeOfString:@"."].location != NSNotFound) ||
-                (![c hasPrefix:@"UI"] && ![c hasPrefix:@"NS"] && ![c isEqualToString:@"UIView"]);
-            if (hostClass && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
-                FCAddUserRule([@"cls:" stringByAppendingString:c]);
-                clsAdded++;
-            }
-            curC = curC.superview;
-        }
-        CGSize scr = [UIScreen mainScreen].bounds.size;
-        CGRect nr = [card convertRect:card.bounds toView:nil];
-        if (nr.size.width >= 40 && nr.size.height >= 18) {
-            FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
-                nr.origin.x/scr.width, nr.origin.y/scr.height,
-                nr.size.width/scr.width, nr.size.height/scr.height]);
-        }
-        FCShowBadgeMsg([NSString stringWithFormat:@"原生·已记%lu类+位置", (unsigned long)clsAdded]);
+        // v18：无有效 webview（含被 1x1 隐藏 webview 带偏的情况）→ 直接走原生
+        FCPickNative(hit, screenP, nil);
     }
 }
 
@@ -1397,7 +1437,7 @@ static void FCAppendDiagText(NSString *s) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v17 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v18 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCTopViewController() class]) ?: @"-"]);
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
@@ -1759,7 +1799,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv17 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv18 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1772,7 +1812,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv17 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv18 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1782,7 +1822,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v17"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v18"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1863,7 +1903,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v17 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v18 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
