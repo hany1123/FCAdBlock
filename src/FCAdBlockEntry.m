@@ -1,5 +1,16 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v23（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v24（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v24 相对 v23（老大真机：不再黑屏，但「界面元素都无法选取」，浮标「H5内元素·网页拾取
+//  失败」/「这是输入控件」；诊断显示残留 pos:0,0,1,1 全屏垃圾规则）：
+//    根因：①FCHitViewAtPoint 自写深度遍历把覆盖在最上的空壳 WKWebView 内部 WKScrollView 当
+//    hit（DOM空），引擎判 H5→JS失败→降级又被 webInternal(祖先链有WK)拦死；真正运营位在
+//    下面 DX 层够不着。②输入控件误判：rangeOfString:Keyboard/InputSet 太宽泛。③残留全屏
+//    pos 规则:0,0,1,1。
+//    修复：①点选命中落在 WK 内部时，穿透找同坐标下最深的 DX/RN/Flutter 宿主 view 替换 hit；
+//    ②降级原生只看命中元素「自身引擎」是否 H5，不再看祖先链 WK；③输入拦截收紧为精确前缀；
+//    ④pos/cls 规则拒绝占屏≥90% 的根容器，启动时自愈清除历史全屏规则。
+//    网络取证真机已验证：捕获 91 条 URL（alicdn 图片/字体/JS），证明旁听通道有效。
 //
 //  v23 相对 v22（老大真机：打开软件直接黑屏，浮标「原17」=17 个元素被塌陷）：
 //    【黑屏根因】v22 让「用户硬命中」绕过全部尺寸闸门，含 height>50%屏 的根容器保护；
@@ -196,8 +207,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===23){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=23;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===24){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=24;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -293,8 +304,15 @@ static NSString *FCRulesFilePath(void) {
 // v7：系统通用类黑名单——这些类作规则会命中整页控件，造成「页面被吃掉」
 static BOOL FCIsUnsafeClassRule(NSString *rule) {
     if (rule.length < 2) return YES;
+    // v24：全屏 pos 规则判危险——真机残留 pos:0,0,1,1 曾导致点中根容器→整页黑屏。
+    // 覆盖 ≥90% 屏宽的 pos 规则毫无去广告价值（不可能有广告占满整屏），一律拒绝+自愈清除。
+    if ([rule hasPrefix:@"pos:"]) {
+        NSArray *p = [[rule substringFromIndex:4] componentsSeparatedByString:@","];
+        if (p.count == 4 && [p[2] doubleValue] >= 0.90 && [p[3] doubleValue] >= 0.90) return YES;
+        return NO;
+    }
     if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."] || [rule hasPrefix:@"img:"] ||
-        [rule hasPrefix:@"cls:"] || [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"sel:"]) return NO;
+        [rule hasPrefix:@"cls:"] || [rule hasPrefix:@"sel:"]) return NO;
     // 只把「首字母大写、纯字母」的串当作 class 规则来检查
     unichar h = [rule characterAtIndex:0];
     if (!(h >= 'A' && h <= 'Z')) return NO;
@@ -1187,6 +1205,38 @@ static UIView *FCHitViewAtPoint(CGPoint p) {
             for (UIView *s in v.subviews) [stack addObject:s];
         }
     }
+    // v24：穿透空壳 WKWebView——真机淘宝满屏 WKWebView(frame 0,0 430x932, DOM空)的内部
+    // WKScrollView 会盖住真正的 DX 运营位，导致点选判成 H5、JS 拾取失败、降级又被 webInternal
+    // 拦死。若 hit 在 WK 内部，收集同坐标下所有深层 view，优先取引擎为 DX/RN/Flutter 的宿主
+    // view 替换 hit；找不到则保持原样（真 H5 页面下面没有 DX view，不受影响）。
+    NSString *hitCls = found ? NSStringFromClass([found class]) : @"";
+    BOOL hitIsWK = [hitCls hasPrefix:@"WK"] || [hitCls rangeOfString:@"WebView"].location != NSNotFound;
+    if (hitIsWK) {
+        UIView *bestHost = nil;
+        for (UIWindow *w in FCAllWindows()) {
+            NSString *wc = NSStringFromClass([w class]);
+            if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
+                [wc isEqualToString:@"FCDiagWindow"]) continue;
+            if (w.hidden || w.alpha < 0.01) continue;
+            NSMutableArray<UIView *> *st = [NSMutableArray arrayWithObject:w];
+            while (st.count) {
+                UIView *v = st.lastObject; [st removeLastObject];
+                if (v.hidden || v.alpha < 0.05 || v.tag == 9527 || v.tag == 9528) continue;
+                CGRect vr = [v convertRect:v.bounds toView:nil];
+                if (!CGRectContainsPoint(vr, p)) continue;
+                NSString *vc = NSStringFromClass([v class]);
+                BOOL vIsWK = [vc hasPrefix:@"WK"] || [vc rangeOfString:@"WebView"].location != NSNotFound;
+                if (!vIsWK) {
+                    FCEngine e = FCEngineOfClass(vc);
+                    if (e == FCEngineDX || e == FCEngineRN || e == FCEngineFlutter || e == FCEngineMiniApp) {
+                        bestHost = v;   // 取最深的一个宿主动态化 view
+                    }
+                }
+                for (UIView *s in v.subviews) [st addObject:s];
+            }
+        }
+        if (bestHost) found = bestHost;
+    }
     return found;
 }
 
@@ -1218,10 +1268,13 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // v21：跳过系统输入控件——真机点搜索框会命中 UIInputSetContainerView 等键盘私有类，
     // 隐藏/记规则都无意义（老大截图「已选中:UIInputSetContainerView / 原生·已记0类」）。
     NSString *hitCls = NSStringFromClass([hit class]);
-    if ([hit isKindOfClass:[UITextField class]] || [hit isKindOfClass:[UITextView class]] ||
-        [hitCls hasPrefix:@"UIInput"] || [hitCls hasPrefix:@"_UIInput"] ||
-        [hitCls rangeOfString:@"Keyboard"].location != NSNotFound ||
-        [hitCls rangeOfString:@"InputSet"].location != NSNotFound) {
+    // v24：收紧——原 v21 用 rangeOfString:@"Keyboard"/"InputSet" 太宽泛，误把正常元素
+    // 当输入控件（真机点「超级88」券被拦）。改为精确：只拦真正的输入框类 + 系统输入容器
+    // 的精确前缀，且必须类名确实以这些前缀开头（不是包含）。
+    BOOL isInput = [hit isKindOfClass:[UITextField class]] || [hit isKindOfClass:[UITextView class]] ||
+                   [hitCls hasPrefix:@"UIInputSet"] || [hitCls hasPrefix:@"_UIInputSet"] ||
+                   [hitCls hasPrefix:@"UIKeyboard"] || [hitCls hasPrefix:@"_UIKeyboard"];
+    if (isInput) {
         FCShowBadgeMsg(@"这是输入控件,请点广告内容区");
         return;
     }
@@ -1234,18 +1287,12 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // v19：若降级来自网页通道（触点本在 H5 内），card/hit 多半在 webview 内部——
     // 隐藏它=隐藏整个网页、存 pos=全屏误伤规则。此时只记诊断，不隐藏、不存位置。
     BOOL fromWeb = [fallbackHint rangeOfString:@"网页"].location != NSNotFound;
-    // 沿 hit→祖先链检测是否 webview 内部（WKScrollView/WKContentView/WKWebView 等）
-    BOOL webInternal = NO;
-    Class wkCls = NSClassFromString(@"WKWebView");
-    for (UIView *ch = hit; ch && ch != card.superview; ch = ch.superview) {
-        NSString *cc = NSStringFromClass([ch class]);
-        if ((wkCls && [ch isKindOfClass:wkCls]) ||
-            [cc rangeOfString:@"WK"].location == 0 ||
-            [cc hasPrefix:@"_UIWeb"] || [cc rangeOfString:@"Web"].location != NSNotFound) {
-            webInternal = YES; break;
-        }
-    }
-    if (fromWeb && webInternal) {
+    // v24：引擎判定——只有命中元素「自身引擎是 H5」才视为真 H5 内容、禁止降级隐藏。
+    // v23 及之前用「祖先链有 WK」判断，被空壳 WKWebView 带偏：hit 已被 FCHitViewAtPoint
+    // 穿透换成 DX view（引擎非 H5），但祖先链仍可能挂空壳 WK → 误拦死。改为看命中元素引擎。
+    FCEngine hitEngine = FCEngineOfView(hit);
+    BOOL trulyH5 = (hitEngine == FCEngineH5);
+    if (fromWeb && trulyH5) {
         FCShowBadgeMsg(@"H5内元素·网页拾取失败,请点文字处重试");
         return;
     }
@@ -1255,6 +1302,8 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // v18：跳过 webview 私有类(WKContentView 等)，从卡片往上找真正的宿主自定义类
     NSUInteger clsAdded = 0;
     UIView *curC = card;
+    CGFloat fullW = [UIScreen mainScreen].bounds.size.width;
+    CGFloat fullH = [UIScreen mainScreen].bounds.size.height;
     for (int depth = 0; curC && depth < 8; depth++) {
         NSString *c = NSStringFromClass([curC class]);
         // 排除 webview 及其私有类——否则存下 cls:WKContentView 这类无效规则
@@ -1262,7 +1311,11 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
                        ([c rangeOfString:@"Web"].location != NSNotFound && [c hasPrefix:@"_"]);
         BOOL hostClass = ([c rangeOfString:@"."].location != NSNotFound) ||
             (![c hasPrefix:@"UI"] && ![c hasPrefix:@"NS"] && ![c isEqualToString:@"UIView"]);
-        if (hostClass && !webPriv && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
+        // v24：不存占屏≥90% 的容器类名——那基本是页面根容器(DXRootView 等)，
+        // 存下来命中即整页消失。真机「领券中心」这类卡片远小于全屏，照常存。
+        CGRect cr = [curC convertRect:curC.bounds toView:nil];
+        BOOL tooBig = cr.size.width >= fullW * 0.90 && cr.size.height >= fullH * 0.90;
+        if (hostClass && !webPriv && !tooBig && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
             FCAddUserRule([@"cls:" stringByAppendingString:c]);
             clsAdded++;
         }
@@ -1270,7 +1323,9 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     }
     CGSize scr = [UIScreen mainScreen].bounds.size;
     CGRect nr = [card convertRect:card.bounds toView:nil];
-    if (nr.size.width >= 40 && nr.size.height >= 18) {
+    // v24：不存全屏 pos 规则（占屏≥90% 说明点中了根容器，存了必误伤/黑屏）
+    if (nr.size.width >= 40 && nr.size.height >= 18 &&
+        nr.size.width < scr.width * 0.90 && nr.size.height < scr.height * 0.90) {
         FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
             nr.origin.x/scr.width, nr.origin.y/scr.height,
             nr.size.width/scr.width, nr.size.height/scr.height]);
@@ -1801,7 +1856,7 @@ static UIViewController *FCHostTopVC(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v23 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v24 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2224,7 +2279,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv23 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv24 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2237,7 +2292,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv23 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv24 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2248,7 +2303,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v23"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v24"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2336,7 +2391,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v23 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v24 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
