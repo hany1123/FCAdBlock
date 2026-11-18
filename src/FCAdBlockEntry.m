@@ -1,5 +1,18 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v21（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v22（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v22 相对 v21（老大发来 v21 诊断文本——日志能发了，但暴露诊断口径误导 + 小元素隐藏失效）：
+//    诊断证据：领券中心=[DX动态] DXImageView 130x17 (19,663)、顶层VC:-、所有元素「命中:无」
+//    但有 1 条用户规则。三个根因一并修：
+//    ①诊断口径误导：v21 只拿元素「自身文字」(FCOwnTextOf) 判命中，不查 cls:/pos: 指纹与
+//      类名，隐藏已生效也会显示「命中:无」。新增 FCDiagHitRule 完整复刻 FCApplyNativeRules
+//      的真实判定（类名精确→指纹→子树文字），命中行显示「✓规则」。
+//    ②诊断不显示规则内容——无法判断点选存的到底是文字还是指纹。顶部逐条打印
+//      「规则N[类名/位置/文字]: 内容」，精简版也保留。
+//    ③真隐藏 bug：尺寸闸门 height<18 在命中判定之前，真机「领券中心」仅 17pt 被直接跳过，
+//      存了规则也永远隐藏不了。改为先判用户规则硬命中、命中即绕过尺寸闸门；内置词仍走闸门。
+//    ④修顶层VC:-（FCDiagWindow 抢 keyWindow）——新增 FCHostTopVC 遍历非插件 window。
+//    ⑤诊断结束语文案「一键复制全部」→「复制精简」。
 //
 //  v21 相对 v20（老大反馈「日志文件字数太多我无法发送」+ 点搜索框误选键盘容器截图）：
 //    ①诊断日志瘦身：新增 FCOwnTextOf 只取 view 自身文字，不再对每个 view 递归整棵子树
@@ -172,8 +185,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===21){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=21;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===22){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=22;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -971,7 +984,20 @@ static void FCApplyNativeRules(void) {
             }
 
             CGRect r = [v convertRect:v.bounds toView:nil];
-            if (v.hidden || r.size.width < 40 || r.size.height < 18 || r.size.height > sh * 0.5) {
+            // v22：尺寸闸门原在命中判定之前，导致用户点选的小元素（真机「领券中心」
+            // DXImageView 仅 130x17，height<18）被直接跳过、存了规则也永远隐藏不了。
+            // 改为：先判「用户规则硬命中」（类名/cls:/pos: 指纹），命中即不受尺寸闸门限制；
+            // 内置关键词等软命中仍走原闸门防误伤。
+            if (v.hidden) { for (UIView *sub in v.subviews) [q addObject:sub]; continue; }
+            BOOL userHardHit = NO;
+            for (NSString *rule in rules) {
+                if (FCIsBuiltinAdKey(rule)) continue;   // 内置词不算用户硬命中
+                if (rule.length >= 5 && [rule isEqualToString:vcls]) { userHardHit = YES; break; }
+                if (FCRuleMatchesFingerprint(rule, vcls, r, [UIScreen mainScreen].bounds.size.width, sh)) {
+                    userHardHit = YES; break;
+                }
+            }
+            if (!userHardHit && (r.size.width < 40 || r.size.height < 18 || r.size.height > sh * 0.5)) {
                 for (UIView *sub in v.subviews) [q addObject:sub];
                 continue;
             }
@@ -1612,7 +1638,8 @@ static NSString *FCDiagBriefString(void) {
     for (NSString *line in [full componentsSeparatedByString:@"\n"]) {
         BOOL keep = NO;
         if ([line hasPrefix:@"====="] || [line hasPrefix:@"顶层VC"] ||
-            [line hasPrefix:@"用户规则"] || [line hasPrefix:@"[引擎图例]"] ||
+            [line hasPrefix:@"用户规则"] || [line hasPrefix:@"  规则"] ||
+            [line hasPrefix:@"[引擎图例]"] || [line hasPrefix:@"[提示]"] ||
             [line hasPrefix:@"----- WKWebView"] || [line hasPrefix:@"[网页]"] ||
             [line hasPrefix:@"[已截断]"]) keep = YES;
         if ([line rangeOfString:@"[类型:"].location != NSNotFound) keep = YES;  // 命中广告类的行
@@ -1671,12 +1698,64 @@ static void FCAppendDiagText(NSString *s) {
     });
 }
 
+// v22：规则类型标注——让用户看清存的到底是文字还是指纹，一眼定位点选存了什么
+static NSString *FCDiagRuleKind(NSString *rule) {
+    if ([rule hasPrefix:@"cls:"]) return @"类名";
+    if ([rule hasPrefix:@"pos:"]) return @"位置";
+    if ([rule hasPrefix:@"sel:"]) return @"选择器";
+    if ([rule hasPrefix:@"img:"]) return @"图片";
+    if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."]) return @"CSS";
+    return @"文字";
+}
+
+// v22：诊断命中判定——完整复刻 FCApplyNativeRules 的真实顺序（类名精确 → cls:/pos: 指纹
+// → 整棵子树文字）。v21 只看自身文字，导致「隐藏已命中却显示命中:无」的误导，诊断必须
+// 和执行隐藏同口径才有排障价值。
+static NSString *FCDiagHitRule(UIView *v, NSArray<NSString *> *rules) {
+    NSString *vcls = NSStringFromClass([v class]);
+    CGRect r = [v convertRect:v.bounds toView:nil];
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+    for (NSString *rule in rules) {
+        if (rule.length >= 5 && [rule isEqualToString:vcls]) return rule;              // 类名精确
+        if (FCRuleMatchesFingerprint(rule, vcls, r, sw, sh)) return rule;                // cls:/pos:
+    }
+    NSArray *texts = FCTextsOf(v);                                                       // 整棵子树文字
+    for (NSString *s in texts)
+        for (NSString *rule in rules)
+            if (FCRuleMatchesText(rule, s)) return rule;
+    return nil;
+}
+
+// v22：取宿主顶层 VC——FCDiagWindow 自己可以成为 keyWindow，导致 FCTopViewController 拿到
+// 插件窗（无 rootVC）显示「顶层VC:-」。遍历所有非插件 window，找第一个有 rootVC 的。
+static UIViewController *FCHostTopVC(void) {
+    for (UIWindow *w in FCAllWindows()) {
+        NSString *wc = NSStringFromClass([w class]);
+        if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
+            [wc isEqualToString:@"FCDiagWindow"]) continue;
+        UIViewController *vc = w.rootViewController;
+        if (!vc) continue;
+        int guard = 0;
+        while (vc.presentedViewController && guard++ < 12) vc = vc.presentedViewController;
+        return vc;
+    }
+    return nil;
+}
+
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v21 =====");
-    FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCTopViewController() class]) ?: @"-"]);
+    FCAppendDiagText(@"===== FC 页面诊断 v22 =====");
+    FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
+    NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
-        (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
+        (unsigned long)diagUserRules.count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
+    // v22：逐条打印规则真实内容 + 类型——老大一眼看清点选到底存了文字还是 cls:/pos: 指纹
+    for (NSUInteger i = 0; i < diagUserRules.count; i++) {
+        NSString *rule = diagUserRules[i];
+        FCAppendDiagText([NSString stringWithFormat:@"  规则%lu[%@]: %@", (unsigned long)(i + 1),
+                          FCDiagRuleKind(rule), rule]);
+    }
     // v20：引擎图例——让用户看懂每个板块底层是哪类技术，回答「为什么有的选不中」
     FCAppendDiagText(@"[引擎图例] 原生=UIKit控件 / DX动态=阿里DX-Weex原生动态化 / RN=ReactNative / H5=WKWebView内DOM / Flutter / 小程序");
     FCAppendDiagText(@"[提示] 满屏但 DOM空 的 WKWebView 是空壳容器，内容实际是原生/DX，点选按元素真实引擎走。");
@@ -1693,13 +1772,13 @@ static void FCFillDiagnose(void) {
         NSUInteger idx = 0;
         while (idx < q.count && idx < 800 && lines < kMaxDiagLines) {
             UIView *v = q[idx++];
-            NSString *joined = FCOwnTextOf(v);     // v21：只取自身文字，不再递归整棵子树
+            NSString *joined = FCOwnTextOf(v);     // v21：只取自身文字（仅用于显示，不用于判定命中）
             if (joined.length) {
                 CGRect r = [v convertRect:v.bounds toView:nil];
-                NSMutableArray *matched = [NSMutableArray array];
-                for (NSString *rule in rules) {
-                    if (FCRuleMatchesText(rule, joined)) { [matched addObject:rule]; break; }
-                }
+                // v22：命中判定改用 FCDiagHitRule（复刻隐藏的真实口径：类名+指纹+子树文字），
+                // 不再只用 joined 自身文字——否则隐藏已生效也会误报「命中:无」。
+                NSString *matchedRule = FCDiagHitRule(v, rules);
+                NSString *matchShow = matchedRule ? [@"✓" stringByAppendingString:matchedRule] : @"无";
                 NSString *vcls = NSStringFromClass([v class]);
                 FCAdType at = FCAdTypeOfClass(vcls);
                 NSString *typeTag = (at != FCAdTypeUnknown)
@@ -1713,8 +1792,7 @@ static void FCFillDiagnose(void) {
                     [seen addObject:key];
                     FCAppendDiagText([NSString stringWithFormat:@"%@%@ %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
                         engTag, typeTag, vcls, joined,
-                        r.origin.x, r.origin.y, r.size.width, r.size.height,
-                        matched.count ? [matched componentsJoinedByString:@","] : @"无"]);
+                        r.origin.x, r.origin.y, r.size.width, r.size.height, matchShow]);
                     lines++;
                 }
             }
@@ -1758,7 +1836,7 @@ static void FCFillDiagnose(void) {
         }
     }
     if (!found) FCAppendDiagText(@"未找到 WKWebView——运营位大概率是原生绘制");
-    FCAppendDiagText(@"===== 诊断结束（点顶部「一键复制全部」粘贴发我，无需截图）=====");
+    FCAppendDiagText(@"===== 诊断结束（点顶部「复制精简」粘贴发我，无需截图）=====");
 }
 
 static void FCShowDiagnose(void) {
@@ -2077,7 +2155,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv21 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv22 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -2090,7 +2168,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv21 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv22 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -2100,7 +2178,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v21"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v22"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -2181,7 +2259,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v21 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v22 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
