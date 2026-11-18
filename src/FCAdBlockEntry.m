@@ -1,5 +1,13 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v12
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v13
+//
+//  v13 相对 v12（老大问「规则里为什么都是文字」+ 浮标内0挡0）：
+//    根因：点选拾取只取「最长中文串」当规则（FCPickRuleText），图片型运营位
+//    （文字画在图片里、无真实文本节点）根本记不住 → 规则面板清一色「文」。
+//    v13 点选改为「元素指纹」：①网页生成 CSS 选择器路径存 `sel:` 规则，注入脚本
+//    用 querySelectorAll 精确命中；②原生存 `cls:类名` + 屏幕相对位置 `pos:`；
+//    ③规则面板新增「选/位」类型标签；④注入脚本加版本号 __fcadVer，避免
+//    __fcadLoaded 幂等导致旧词表闭包常驻、新关键词不生效。
 //
 //  v12 相对 v11（真机十一次反馈：「FCv11 规则8 内0」，部分运营位仍没隐藏）：
 //    截图「我的」页明确显示 寄件省钱卡/查价领返现/100元寄件券包，但内置命中 0。
@@ -96,8 +104,9 @@ static void FCPickModeExit(void);
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
-"if(W.__fcadLoaded){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadHits=0;"
+// v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
+"if(W.__fcadLoaded&&W.__fcadVer===13){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=13;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -117,6 +126,9 @@ static NSString * const FCJSAdCardsTemplate =
 "if(a.charAt(0)==='.'){if(e.className&&(''+e.className).split(/\\s+/).indexOf(a.slice(1))>=0)return true;continue;}"
 "if(a.indexOf('img:')===0){var s=(e.getAttribute('src')||'')+' '+(e.getAttribute('data-src')||'');"
 "if(s.indexOf(a.slice(4))>=0)return true;continue;}"
+// v13：sel: 精确 CSS 选择器路径——图片型运营位无文字，靠结构指纹命中
+"if(a.indexOf('sel:')===0){var q=a.slice(4);try{if(e.matches&&e.matches(q))return true;"
+"if(e.querySelector&&e.querySelector(q))return true;}catch(ex){}continue;}"
 "if(t&&t.indexOf(a)>=0)return true;"
 "for(var j=0;j<ks.length;j++){if(ks[j].indexOf(a)>=0)return true;}}"
 "return false;}"
@@ -146,6 +158,16 @@ static NSString * const FCPickJSFmt =
 "var pr=p.getBoundingClientRect();var tr=t.getBoundingClientRect();"
 "if(tr.height>0&&pr.height<=tr.height*1.8&&pr.width<=window.innerWidth*0.97){t=p;}else{break;}}"
 "var r=t.getBoundingClientRect();if(r.height>window.innerHeight*0.85)return 'TOOBIG';"
+// v13：为容器生成 CSS 结构指纹——图片型广告无文字，靠路径记住它
+"function cssel(el){var a=[];var p=el;for(var d=0;d<5&&p&&p.tagName&&p.tagName!=='BODY';d++){"
+"var s=p.tagName.toLowerCase();"
+"if(p.id){s+='#'+p.id;a.unshift(s);break;}"
+"var cl=p.className&&(''+p.className).trim().split(/\\s+/)[0];if(cl)s+='.'+cl;"
+"var par=p.parentElement,ix=1;if(par){var sib=par.children;for(var z=0;z<sib.length;z++){"
+"if(sib[z]===p)break;if(sib[z].tagName===p.tagName)ix++;}}"
+"if(ix>1)s+=':nth-of-type('+ix+')';a.unshift(s);p=p.parentElement;}"
+"return a.join(' > ');}"
+"var sel=cssel(t);if(sel&&sel.length>2)add('sel:'+sel);"
 "t.style.setProperty('display','none','important');t.__fcadDone=1;"
 // v8：回传元素位置(x,y,w,h)供原生画标记框，CSSError-free
 "return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+','+Math.round(r.height)+'|'+out.join('|');})();";
@@ -163,7 +185,8 @@ static NSString *FCRulesFilePath(void) {
 // v7：系统通用类黑名单——这些类作规则会命中整页控件，造成「页面被吃掉」
 static BOOL FCIsUnsafeClassRule(NSString *rule) {
     if (rule.length < 2) return YES;
-    if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."] || [rule hasPrefix:@"img:"]) return NO;
+    if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."] || [rule hasPrefix:@"img:"] ||
+        [rule hasPrefix:@"cls:"] || [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"sel:"]) return NO;
     // 只把「首字母大写、纯字母」的串当作 class 规则来检查
     unichar h = [rule characterAtIndex:0];
     if (!(h >= 'A' && h <= 'Z')) return NO;
@@ -230,7 +253,10 @@ static NSString *FCJSSafe(NSString *s) {
     s = [s stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
     s = [s stringByReplacingOccurrencesOfString:@"\r" withString:@" "];
     s = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-    if (s.length > 40) s = [s substringToIndex:40];   // v5：放宽到 40，保留更多辨识度
+    // v13：指纹规则（sel: CSS 路径 / pos: 坐标）必须完整保留，截断就失效；改用更长上限
+    NSUInteger cap = ([s hasPrefix:@"sel:"] || [s hasPrefix:@"pos:"] ||
+                      [s hasPrefix:@"cls:"] || [s hasPrefix:@"img:"]) ? 160 : 40;
+    if (s.length > cap) s = [s substringToIndex:cap];
     return s;
 }
 
@@ -239,9 +265,15 @@ static void FCAddUserRule(NSString *raw) {
     if (rule.length < 2) return;
     if (FCIsUnsafeClassRule(rule)) { FCLog(@"拒绝危险 class 规则：%@", rule); return; }   // v7
     NSMutableArray *a = [NSMutableArray arrayWithArray:FCUserRules()];
-    for (NSString *exist in a)
-        if ([exist rangeOfString:rule].location != NSNotFound ||
-            [rule rangeOfString:exist].location != NSNotFound) return;
+    BOOL isFingerprint = [rule hasPrefix:@"sel:"] || [rule hasPrefix:@"cls:"] ||
+                         [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"img:"] ||
+                         [rule hasPrefix:@"#"] || [rule hasPrefix:@"."];
+    for (NSString *exist in a) {
+        // v13：指纹类规则（不同位置/选择器只是数字或路径不同）必须精确去重，包含判断会误杀
+        if (isFingerprint) { if ([exist isEqualToString:rule]) return; }
+        else if ([exist rangeOfString:rule].location != NSNotFound ||
+                 [rule rangeOfString:exist].location != NSNotFound) return;
+    }
     [a addObject:rule];
     if (a.count > 40) [a removeObjectsInRange:NSMakeRange(0, a.count - 40)];
     FCSetUserRules(a);
@@ -269,6 +301,24 @@ static BOOL FCRuleMatchesText(NSString *rule, NSString *text) {
     if (rule.length < 3 || text.length < 2) return NO;   // 短规则/空文案不匹配，防误伤
     if ([text rangeOfString:rule].location != NSNotFound) return YES;       // 文案含完整规则
     if (text.length >= 3 && [rule rangeOfString:text].location != NSNotFound) return YES;  // 规则含文案（重建后文案变短）
+    return NO;
+}
+
+// v13：原生元素指纹——cls:类名（精确）+ pos:x,y,w,h 屏幕比例（容差 3%）。图片型运营位无文字也能记住
+static BOOL FCRuleMatchesFingerprint(NSString *rule, NSString *cls, CGRect rect, CGFloat sw, CGFloat sh) {
+    if ([rule hasPrefix:@"cls:"]) {
+        NSString *want = [rule substringFromIndex:4];
+        return want.length >= 4 && [want isEqualToString:cls];   // v7 教训：class 必须精确相等
+    }
+    if ([rule hasPrefix:@"pos:"]) {
+        NSArray *p = [[rule substringFromIndex:4] componentsSeparatedByString:@","];
+        if (p.count != 4) return NO;
+        CGFloat x = [p[0] doubleValue] * sw, y = [p[1] doubleValue] * sh;
+        CGFloat w = [p[2] doubleValue] * sw, h = [p[3] doubleValue] * sh;
+        CGFloat tx = 7, ty = 14;   // 容差 pt（top bar 高度浮动）
+        return fabs(rect.origin.x - x) <= tx && fabs(rect.origin.y - y) <= ty &&
+               fabs(rect.size.width - w) <= 20 && fabs(rect.size.height - h) <= 20;
+    }
     return NO;
 }
 
@@ -599,6 +649,10 @@ static void FCApplyNativeRules(void) {
             // v7：class 名改为「精确相等」匹配（子串匹配会让 Cell/Label 命中整页同类）
             for (NSString *rule in rules) {
                 if (rule.length >= 5 && [rule isEqualToString:vcls]) { hit = YES; hitRule = rule; break; }
+                // v13：元素指纹 cls:/pos:——图片型运营位（无文字）靠类名+屏幕位置命中
+                if (FCRuleMatchesFingerprint(rule, vcls, r, [UIScreen mainScreen].bounds.size.width, sh)) {
+                    hit = YES; hitRule = rule; break;
+                }
             }
             if (!hit) for (NSString *s in texts) {
                 for (NSString *rule in rules) {
@@ -778,18 +832,17 @@ static void FCPickAtPoint(CGPoint screenP) {
         card.hidden = YES;
         gFCNativeHits++;
         if (ruleText.length >= 2) FCAddUserRule(ruleText);
-        // v6：无文字/文字短时，退而记录触点 view 的 class 名（去掉数字后缀）作为同类特征
-        if (ruleText.length < 3) {
-            NSMutableString *clean = [NSMutableString string];
-            for (NSUInteger i = 0; i < cls.length; i++) {
-                unichar c = [cls characterAtIndex:i];
-                if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')) [clean appendFormat:@"%C", c];
-                else if (c >= '0' && c <= '9') break;   // 去掉末尾编号
-                else break;
-            }
-            if (clean.length >= 4 && !FCIsUnsafeClassRule(clean)) FCAddUserRule(clean);
+        // v13：元素指纹——无论有无文字都存 cls:类名 + pos:屏幕相对位置，图片型广告也能复现
+        CGSize scr = [UIScreen mainScreen].bounds.size;
+        CGRect nr = [card convertRect:card.bounds toView:nil];
+        if (cls.length >= 4 && !FCIsUnsafeClassRule(cls))
+            FCAddUserRule([@"cls:" stringByAppendingString:cls]);
+        if (nr.size.width >= 40 && nr.size.height >= 18) {
+            FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
+                nr.origin.x/scr.width, nr.origin.y/scr.height,
+                nr.size.width/scr.width, nr.size.height/scr.height]);
         }
-        FCShowBadgeMsg(ruleText.length >= 2 ? @"原生·已隐藏并记住" : @"原生·已隐藏");
+        FCShowBadgeMsg(ruleText.length >= 2 ? @"原生·已记文字+指纹" : @"原生·已记位置指纹");
     }
 }
 
@@ -834,12 +887,16 @@ static NSString *FCRuleTypeText(NSString *r) {
     if ([r hasPrefix:@"#"]) return @"ID";
     if ([r hasPrefix:@"."]) return @"类";
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return @"图";
+    if ([r hasPrefix:@"sel:"]) return @"选";   // v13：CSS 结构指纹
+    if ([r hasPrefix:@"cls:"] || [r hasPrefix:@"pos:"]) return @"位";  // v13：原生位置指纹
     return @"文";
 }
 static UIColor *FCRuleTypeColor(NSString *r) {
     if ([r hasPrefix:@"#"]) return [UIColor colorWithRed:0.55 green:0.35 blue:0.85 alpha:1];
     if ([r hasPrefix:@"."]) return [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return [UIColor colorWithRed:0.2 green:0.65 blue:0.35 alpha:1];
+    if ([r hasPrefix:@"sel:"]) return [UIColor colorWithRed:0.85 green:0.25 blue:0.55 alpha:1];
+    if ([r hasPrefix:@"cls:"] || [r hasPrefix:@"pos:"]) return [UIColor colorWithRed:0.15 green:0.55 blue:0.75 alpha:1];
     return [UIColor colorWithRed:0.42 green:0.48 blue:0.58 alpha:1];
 }
 
@@ -1308,7 +1365,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv12 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv13 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1321,7 +1378,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv12 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv13 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1331,7 +1388,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v12"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v13"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1401,7 +1458,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v12 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v13 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
