@@ -1,6 +1,6 @@
 {
   "FCAdBlock_Pure_v22.dylib": {
-    "yes": ["FCv22", "FCAdBlock v22", "@rpath/FCAdBlock.dylib", "SPSplashController", "TBBootImageSplashDO", "TBRewardKit", "TBTDBannerView", "MunionAdRequestMiddleware", "AKTsAlimamaAdAbility", "UINavigationControllerDidShowViewControllerNotification", "FCFlattenRecord", "UIPasteboard", "u16:开屏", "u16:激励", "u16:横幅", "u16:联盟", "u16:100元寄件券包", "u16:复制精简", "u16:复制全文", "u16:引擎图例", "u16:DX动态", "u16:这是输入控件", "u16:精简已达45行上限", "u16:页面诊断", "u16:规则", "u16:类名", "u16:位置", "u16:命中:✓", "u16:复制精简」粘贴发我"],
+    "yes": ["FCv22", "FCAdBlock v22", "@rpath/FCAdBlock.dylib", "SPSplashController", "TBBootImageSplashDO", "TBRewardKit", "TBTDBannerView", "MunionAdRequestMiddleware", "AKTsAlimamaAdAbility", "UINavigationControllerDidShowViewControllerNotification", "FCFlattenRecord", "UIPasteboard", "u16:开屏", "u16:激励", "u16:横幅", "u16:联盟", "u16:100元寄件券包", "u16:复制精简", "u16:复制全文", "u16:引擎图例", "u16:DX动态", "u16:这是输入控件", "u16:精简已达45行上限", "u16:页面诊断", "u16:规则", "u16:类名", "u16:位置", "u16:命中:", "u16:复制精简」粘贴发我"],
     "no": ["CydiaSubstrate", "MobileSubstrate", "DynamicLibraries", "MSHook", "_logos_", "libsubstrate"]
   },
   "FCAdBlock_Deep_v22.dylib": {
