@@ -1,5 +1,25 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v41（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v42（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v42 相对 v41（老大 v41 真机：不闪退了、白块也没了，但**无法选择广告元素**，且
+//  浮标上「挡」的数字一直往上涨）：
+//    【问题1 · 数字一直涨】v12 加的 gFCBuiltinBlocked 是「命中却被尺寸闸门挡下的**次数**」，
+//    每轮扫描遍历到同一节点就再 +1，真机 978 看着像挡了上千个广告，其实只有几个节点。
+//    修：加弱表 gFCBlockedSeen 按节点只计一次，新增 gFCBlockedUnique 表示「被挡节点数」；
+//    浮标/诊断显示去重数，动作轮次另列。数字从此稳定，不再每 tick 往上涨。
+//    【问题2 · 选不中广告元素】根因是「自己把想选的广告压成 0 了」——那一片是空白，
+//    hitTest 够不着内容，点下去只能命中外层容器；再加上淘宝首页满屏空壳 WKWebView
+//    (frame 0,0 430x932 DOM空) 会抢命中，v24 的穿透只认 DX/RN/Flutter/小程序四种引擎，
+//    兜不住纯 UIKit 运营位 → 走网页通道 → 报「网页拾取失败」。
+//    修：①**点选进入即临时还原全部拦截并冻结扫描**（FCRestoreAllBlockedForPicking +
+//    gFCPickFreeze），退出点选解冻、按最新规则重新拦——这是「选得到」的根本前提；
+//    ②穿透放宽为两档：引擎宿主优先，兜底取同坐标下非 WK、非系统私有、尺寸真实的
+//    最深业务 view；③菜单新增「暂停拦截（恢复原样·用于点选）」——DX 已渲染过的卡片
+//    光还原 frame 不会自动重新 setData，下拉刷新一次才真的回来，这个开关是兜底路径；
+//    ④还原时连实例级 kFCBlockedRoot 标记一起清（弱表 gFCBlockedRoots 登记过），
+//    否则 setData hook 看到旧标记继续 return，还原了也是空白。
+//    【安全】暂停/冻结只作用于本插件自己的行为，不 hook 任何新系统方法；两档残留都会在
+//    退出点选/恢复拦截后由常规扫描重新建立，无需重启进程。
 //
 //  v41 相对 v40（老大 v40 真机：注入后淘宝**闪退**，.ips 已定位到本插件）：
 //    【崩溃铁证】Taobao4iPhone-2026-11-19-002646.ips：EXC_BAD_ACCESS(SIGSEGV)
@@ -430,8 +450,8 @@ static void FCPerformPendingRelayout(void);                   // v41：扫描 ti
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===41){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=41;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===42){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=42;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1233,6 +1253,23 @@ static NSUInteger gFCHeightZeroSkip = 0;
 static NSString *gFCHeightSetEnc = nil;
 // v40：v39 几何空壳压0 的开关（停用：压子视图不减高度，且会误伤正常运营位；留代码便于回退）
 static const BOOL gFCRotorEnabled = NO;
+// v42：被挡计数去重——旧实现每次扫描遍历都把「命中却被闸门挡下」的同一节点再 +1，
+// 于是浮标上的「挡」每 tick 往上涨（真机 978 看着像挡了上千个广告，实际只有几个）。
+// 用弱表记录已计过的节点：同一节点只计一次，数字从此稳定；节点释放自动出表。
+static NSHashTable *gFCBlockedSeen = nil;
+static NSUInteger gFCBlockedUnique = 0;   // 去重后的被挡节点数（浮标/诊断显示这个）
+// v42：被源头拦截过的 DXRootView 弱表——实例级标记 kFCBlockedRoot 是关联对象，遍历不到；
+// 「暂停拦截」时必须能逐个清标记，否则这些 root 会带着旧标记被 setData hook 继续 return。
+static NSHashTable *gFCBlockedRoots = nil;
+// v42：全局暂停开关——老大随时能「一键恢复原样」再点选广告。
+// 暂停期间：不压0、不拦模板、不隐藏；已拦的还原并清标记。刷新页面后广告原样出现。
+static BOOL gFCPaused = NO;
+// v42：点选当场 hidden=YES 的卡片。点选时扫描是冻结的，这些 view 进不了 gFCFlattened，
+// 规则清掉后没人会把它恢复 → 退出点选统一 hidden=NO，交给扫描按规则重新接管。
+static NSHashTable *gFCPickHidden = nil;
+// v42：点选冻结——进点选先把自己所有的拦截临时还原，页面回到原始状态。
+// 不冻结的话「想选的广告早被自己压成0了」，那一片是空白，怎么点都只能点到外层容器。
+static BOOL gFCPickFreeze = NO;
 
 #pragma mark - v40/v41：DX 高度规格归零（唯一能真正减高度的入口）
 // 注意：这几个函数必须放在 #ifdef FC_DEEP_HOOKS 之外——扫描阶段在 A/Pure 档也会调用，
@@ -1341,6 +1378,47 @@ static void FCRestoreZeroRecord(FCFlattenRecord *rec) {
     v.alpha = rec.originalAlpha;
     v.clipsToBounds = rec.originalClips;
     objc_setAssociatedObject(v, &kFCZeroRec, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+// v42：点选专用——把所有拦截临时全部还原，页面回到「没装插件」的原始样子。
+// 四张表一起清：用户规则塌陷(gFCFlattened) / 源头模板压0(gFCSourceZeroed) /
+// 源头坑位外壳(gFCShellZeroed) / 几何空壳(gFRotorZeroed)。
+// 存在意义（老大反馈「无法选择广告元素」的直接修法）：元素已经被自己挡掉了，
+// 视觉上是空白、hitTest 也够不着，点选必然只能点到外层容器 → 永远选不中。
+static void FCRestoreAllBlockedForPicking(void) {
+    NSMutableArray *tables = [NSMutableArray array];
+    if (gFCFlattened) [tables addObject:gFCFlattened];
+    if (gFCSourceZeroed) [tables addObject:gFCSourceZeroed];
+    if (gFCShellZeroed) [tables addObject:gFCShellZeroed];
+    if (gFRotorZeroed) [tables addObject:gFRotorZeroed];
+    NSUInteger n = 0;
+    for (NSMutableArray *tb in tables) {
+        for (FCFlattenRecord *rec in [tb copy]) {
+            @try {
+                FCRestoreZeroRecord(rec);
+                if (rec.view) rec.view.hidden = NO;   // 旧移除模式可能留了 hidden
+                n++;
+            } @catch (NSException *e) { }
+        }
+        [tb removeAllObjects];
+    }
+    if (gFCBlockedSeen) [gFCBlockedSeen removeAllObjects];
+    gFCBlockedUnique = 0;
+    // v42：同时清实例级「源头拦截」标记，否则还原了 frame 也还是空的：
+    // setData/setTemplateItem hook 看到 kFCBlockedRoot 就直接 return，数据永远不灌进去。
+    NSUInteger cleared = 0;
+    if (gFCBlockedRoots) {
+        for (UIView *r in [gFCBlockedRoots allObjects]) {
+            @try {
+                objc_setAssociatedObject(r, &kFCBlockedRoot, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                objc_setAssociatedObject(r, &kFCHeightZeroed, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                cleared++;
+            } @catch (NSException *e) { }
+        }
+        [gFCBlockedRoots removeAllObjects];
+    }
+    FCLog(@"还原全部拦截：%lu 处视图 + %lu 个源头标记（gFCPaused=%d）",
+          (unsigned long)n, (unsigned long)cleared, (int)gFCPaused);
 }
 
 // v32：每轮扫描开头重新施加所有压0压制——DX 引擎下一帧重设 frame 后由这里压回。
@@ -1553,7 +1631,14 @@ static void FCApplyNativeRules(void) {
             if (hit) {
                 // v11：内置关键词命中时加严格尺寸闸门——绝不让「包含 banner 的大卡片」整块消失
                 if (builtinHit && !classHardHit && (r.size.height > sh * 0.30 || r.size.width < 90 || texts.count > 16)) {
-                    gFCBuiltinBlocked++;   // v12：浮标可见，区分「没匹配」和「匹配但被闸门挡」
+                    // v42：计数去重——同一节点每轮都会走到这里，旧写法让「挡」每 tick 上涨。
+                    // 弱表按节点记一次，数字才代表「被闸门挡下的节点数」而非「挡了多少轮」。
+                    gFCBuiltinBlocked++;
+                    if (!gFCBlockedSeen) gFCBlockedSeen = [NSHashTable weakObjectsHashTable];
+                    if (![gFCBlockedSeen containsObject:v]) {
+                        [gFCBlockedSeen addObject:v];
+                        gFCBlockedUnique++;
+                    }
                     for (UIView *sub in v.subviews) [q addObject:sub];
                     continue;
                 }
@@ -1605,6 +1690,9 @@ static void FCApplyNativeRules(void) {
 }
 
 static void FCScanOnce(void) {
+    // v42：暂停拦截 / 点选冻结期间完全不扫——不压0、不隐藏、不拦模板。
+    // 这是「无法选择广告元素」的根治：不扫就不会把用户想点的那块压掉。
+    if (gFCPaused || gFCPickFreeze) { gFCWindows = FCAllWindows().count; return; }
     NSArray *windows = FCAllWindows(); gFCWindows = windows.count;
     for (UIWindow *w in windows) {
         if (!w || w.hidden || w.alpha < 0.01) continue;
@@ -1674,30 +1762,49 @@ static UIView *FCHitViewAtPoint(CGPoint p) {
     NSString *hitCls = found ? NSStringFromClass([found class]) : @"";
     BOOL hitIsWK = [hitCls hasPrefix:@"WK"] || [hitCls rangeOfString:@"WebView"].location != NSNotFound;
     if (hitIsWK) {
-        UIView *bestHost = nil;
+        // v42：穿透放宽。旧逻辑只认 DX/RN/Flutter/小程序四种引擎的宿主，淘宝首页
+        // 满屏空壳 WKWebView（frame 0,0 430x932，DOM 空）下面若没有这四种 view、
+        // 或者它们已被压成 0 尺寸，就退不出去 → 走网页通道 → 报「网页拾取失败」，
+        // 表现为「无法选择广告元素」。现在分两档：
+        //   ①优先：引擎是动态化的宿主（最准，规则存得对）；
+        //   ②兜底：任意非 WK、非系统私有、尺寸正常的业务 view，取层级最深的一个。
+        UIView *bestEngine = nil; NSUInteger bestEngineDepth = 0;
+        UIView *bestAny = nil;    NSUInteger bestAnyDepth = 0;
+        CGFloat scrArea = [UIScreen mainScreen].bounds.size.width *
+                          [UIScreen mainScreen].bounds.size.height;
         for (UIWindow *w in FCAllWindows()) {
             NSString *wc = NSStringFromClass([w class]);
             if ([wc isEqualToString:@"FCBadgeWindow"] || [wc isEqualToString:@"FCPanelWindow"] ||
                 [wc isEqualToString:@"FCDiagWindow"]) continue;
             if (w.hidden || w.alpha < 0.01) continue;
             NSMutableArray<UIView *> *st = [NSMutableArray arrayWithObject:w];
+            NSMutableArray<NSNumber *> *dps = [NSMutableArray arrayWithObject:@0];
             while (st.count) {
                 UIView *v = st.lastObject; [st removeLastObject];
+                NSUInteger d = dps.lastObject.unsignedIntegerValue; [dps removeLastObject];
                 if (v.hidden || v.alpha < 0.05 || v.tag == 9527 || v.tag == 9528) continue;
                 CGRect vr = [v convertRect:v.bounds toView:nil];
                 if (!CGRectContainsPoint(vr, p)) continue;
                 NSString *vc = NSStringFromClass([v class]);
                 BOOL vIsWK = [vc hasPrefix:@"WK"] || [vc rangeOfString:@"WebView"].location != NSNotFound;
+                BOOL priv = [vc hasPrefix:@"_UI"] || [vc hasPrefix:@"UIInput"] || [vc hasPrefix:@"UIKeyboard"];
                 if (!vIsWK) {
                     FCEngine e = FCEngineOfClass(vc);
                     if (e == FCEngineDX || e == FCEngineRN || e == FCEngineFlutter || e == FCEngineMiniApp) {
-                        bestHost = v;   // 取最深的一个宿主动态化 view
+                        if (d >= bestEngineDepth) { bestEngine = v; bestEngineDepth = d; }
                     }
+                    // 兜底候选：尺寸真实存在、不占满屏（占满屏基本是页面根容器）、非系统私有
+                    BOOL realSize = vr.size.width >= 8 && vr.size.height >= 8;
+                    BOOL notRoot = vr.size.width < [UIScreen mainScreen].bounds.size.width * 0.92 ||
+                                   vr.size.height < [UIScreen mainScreen].bounds.size.height * 0.92;
+                    if (!priv && realSize && notRoot && vr.size.width * vr.size.height < scrArea * 0.85 &&
+                        d >= bestAnyDepth) { bestAny = v; bestAnyDepth = d; }
                 }
-                for (UIView *s in v.subviews) [st addObject:s];
+                for (UIView *sv in v.subviews) { [st addObject:sv]; [dps addObject:@(d + 1)]; }
             }
         }
-        if (bestHost) found = bestHost;
+        if (bestEngine) found = bestEngine;
+        else if (bestAny) found = bestAny;
     }
     return found;
 }
@@ -2168,10 +2275,13 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     FCEngine hitEngine = FCEngineOfView(hit);
     BOOL trulyH5 = (hitEngine == FCEngineH5);
     if (fromWeb && trulyH5) {
-        FCShowBadgeMsg(@"H5内元素·网页拾取失败,请点文字处重试");
+        // v42：把下一步直接写在提示里——老大不用猜该干什么。
+        FCShowBadgeMsg(@"H5内元素·网页拾取失败。请先「暂停拦截」→下拉刷新→再点选");
         return;
     }
     card.hidden = YES;
+    if (!gFCPickHidden) gFCPickHidden = [NSHashTable weakObjectsHashTable];
+    [gFCPickHidden addObject:card];
     gFCNativeHits++;
     if (ruleText.length >= 2) FCAddUserRule(ruleText);
     // v29：DX 动态化卡片存模板规则——Deep 档源头 setData: 按此拦截，根治「删了被重绘」
@@ -3015,11 +3125,13 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v41 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v42 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
-    FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
-        (unsigned long)diagUserRules.count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
+    FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
+        (unsigned long)diagUserRules.count, (unsigned long)gFCBuiltinHits,
+        (unsigned long)gFCBlockedUnique, (unsigned long)gFCBuiltinBlocked,
+        gFCPaused ? @" / 已暂停拦截" : @""]);
     // v32：压0塌陷状态——让用户看清当前有几个窗口被压成0、累计压制多少次（对抗DX重绘）
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
@@ -3371,6 +3483,10 @@ static CGRect FCDefaultBadgeFrame(void) {
 static CGRect gFCBadgeFrameBeforePick = {0};
 static void FCPickModeEnter(void) {
     if (!gFCBadgeWindow) return;
+    // v42：进点选先把所有拦截还原、并冻结扫描——页面回到原始样子才点得到广告。
+    // 旧行为下目标广告早被自己压成0，那一片是空白，点下去只能命中外层容器 → 「无法选择广告元素」。
+    gFCPickFreeze = YES;
+    FCRestoreAllBlockedForPicking();
     gFCBadgeFrameBeforePick = gFCBadgeFrame;
     gFCBadgeCollapsed = NO;
     CGRect s = gFCBadgeWindow.bounds;
@@ -3386,6 +3502,14 @@ static void FCPickModeEnter(void) {
 static void FCPickModeExit(void) {
     if (!gFCBadgeWindow) return;
     gFCBadgeWindow.picking = NO;
+    // v42：解冻——下一轮扫描按最新的用户规则重新拦截（新存的 tpl:/cls: 规则立即生效）。
+    gFCPickFreeze = NO;
+    // v42：把点选当场隐藏的卡片恢复显示，让扫描重新按规则接管；
+    // 否则规则清掉后这些 view 永远 hidden，页面缺一块且无从恢复。
+    if (gFCPickHidden) {
+        for (UIView *v in [gFCPickHidden allObjects]) { @try { v.hidden = NO; } @catch (NSException *e) { } }
+        [gFCPickHidden removeAllObjects];
+    }
     // 清掉可能残留的标记
     for (UIView *v in [gFCBadgeWindow.subviews copy]) if (v.tag == 9529) [v removeFromSuperview];
     // 恢复进入点选前的浮标位置
@@ -3480,10 +3604,12 @@ static void FCUpdateBadge(void) {
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
+    // v42：挡=去重节点数（不再每 tick 往上涨）；暂停时整体灰显提示
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv41 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv42%@ 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        gFCPaused ? @"(暂停)" : @"",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
-        (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
+        (unsigned long)gFCBlockedUnique, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 }
@@ -3494,7 +3620,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv41 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv42 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3505,10 +3631,26 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v41"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v42"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
+    // v42：一键暂停——把所有拦截还原、停掉扫描，下拉刷新后页面完全原样，随便点选。
+    // 「点选广告元素」自带的临时还原够用大部分场景；这个开关是兜底（DX 已渲染的卡片
+    // 不会因还原 frame 自动重新 setData，刷新一次才真的回来）。
+    [ac addAction:[UIAlertAction actionWithTitle:(gFCPaused ? @"恢复拦截" : @"暂停拦截（恢复原样·用于点选）")
+                 style:(gFCPaused ? UIAlertActionStyleDefault : UIAlertActionStyleDestructive)
+                 handler:^(UIAlertAction *a){
+                     gFCPaused = !gFCPaused;
+                     if (gFCPaused) {
+                         FCRestoreAllBlockedForPicking();
+                         FCShowBadgeMsg(@"已暂停拦截·下拉刷新页面即恢复原样，再点选广告");
+                     } else {
+                         gFCBadgeCollapsed = NO;
+                         FCShowBadgeMsg(@"已恢复拦截·规则即刻生效");
+                     }
+                     FCUpdateBadge();
+                 }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"管理规则（查看/编辑/新增）" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCShowRulePanel(); }]];
     // v14：诊断当前页面——一次看清运营位在原生还是网页、命中了什么规则
@@ -3714,6 +3856,8 @@ static void FCHookSetHeightSpec(id self, SEL _cmd, id spec) {
 }
 
 static void FCHookSetData(id self, SEL _cmd, id data) {
+    // v42：暂停拦截期间一律放行——老大要看到原始页面才能点选广告。
+    if (gFCPaused) { if (gFCOrigSetData) ((void (*)(id, SEL, id))gFCOrigSetData)(self, _cmd, data); return; }
     // v33：联动拦截——若本实例的 setTemplateItem 已命中 tpl:/内置模板并 return（模板没设），
     // 这里也必须 return，否则数据灌进一个没有模板的半初始化 DXRootView，反而可能异常渲染。
     if (objc_getAssociatedObject(self, &kFCBlockedRoot)) return;
@@ -3723,6 +3867,8 @@ static void FCHookSetData(id self, SEL _cmd, id data) {
     // v30：建立「实例→模板名」映射，供点选直接查表（不依赖 KVC 读属性）
     if (tpl.length) FCTplBridgePut((UIView *)self, tpl);
     if (tpl.length && FCTplIsBlocked(tpl)) {
+        if (!gFCBlockedRoots) gFCBlockedRoots = [NSHashTable weakObjectsHashTable];
+        [gFCBlockedRoots addObject:(UIView *)self];   // v42：登记，暂停拦截时逐个清标记
         objc_setAssociatedObject(self, &kFCBlockedRoot, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         FCProbeRecord(@"源头拦截", tpl);
         FCLog(@"源头拦截模板(setData): %@", tpl);
@@ -3743,11 +3889,15 @@ static void FCHookSetTemplate(id self, SEL _cmd, id tpl) {
     // v30：setTemplateItem 的对象名最完整（含版本），优先刷进 bridge
     NSString *n = FCTplNameFromItem(tpl);
     if (n.length) FCTplBridgePut((UIView *)self, n);
+    // v42：暂停拦截期间不拦模板，照常交给 DX 渲染
+    if (gFCPaused) { if (gFCOrigSetTemplate) ((void (*)(id, SEL, id))gFCOrigSetTemplate)(self, _cmd, tpl); return; }
     @try { FCProbeRecord(@"DXRootView.setTemplateItem", tpl); } @catch (NSException *e) { }
     // v33 关键修复：88 横幅等卡片的模板名只在 setTemplateItem: 出现，setData: 数据里是空模板，
     // 所以 v29~v32 只拦 setData 时日志显示「源头拦截命中」但横幅照常完整渲染。
     // 这里命中即不设模板（不调原 IMP）+ 打实例标记，从源头掐断渲染链路。
     if (n.length && FCTplIsBlocked(n)) {
+        if (!gFCBlockedRoots) gFCBlockedRoots = [NSHashTable weakObjectsHashTable];
+        [gFCBlockedRoots addObject:(UIView *)self];   // v42：登记，暂停拦截时逐个清标记
         objc_setAssociatedObject(self, &kFCBlockedRoot, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         FCProbeRecord(@"源头拦截", n);
         FCLog(@"源头拦截模板(setTemplateItem): %@", n);
@@ -3824,7 +3974,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v41 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v42 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
