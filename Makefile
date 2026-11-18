@@ -1,4 +1,4 @@
-# FCAdBlock —— 丰巢去广告插件（独立插件，运行时不依赖其它 tweak）
+# FCAdBlock —— 通用去广告插件 v17（丰巢 HiveConsumer + 淘宝 Taobao4iPhone；运行时不依赖其它 tweak）
 # 编译：make package          生成 .deb
 # 巨魔注入用 .theos/obj/FCAdBlock.dylib
 ARCHS = arm64

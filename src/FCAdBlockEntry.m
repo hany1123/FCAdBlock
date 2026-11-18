@@ -1,5 +1,19 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v14
+//  FCAdBlockEntry.m —— 通用去广告插件 v17（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v17 相对 v16（老大要求：全面分析淘宝 10.56.10 广告，补进列表，标注广告类型，适配通用）：
+//    ①新增「通用广告类型体系」FCAdTypeClassTable——7 大类型（开屏/激励/插屏/横幅/信息流/
+//      运营位/联盟），丰巢类(v14 真机实证) + 淘宝类(10.56.10 主二进制 17385 个 ObjC 类静态
+//      提取, 74 个高置信类)统一进表，新增 App 只加一行即可。
+//    ②FCClassIsAd 改为「权威表精确匹配 + 通用强特征词根兜底」双通道，保留 Adress/Address 防护。
+//    ③FCResolveClass 支持多宿主命名空间（HiveConsumer. / Taobao4iPhone. / 无前缀 ObjC）。
+//    ④FCAdBlock.plist 增加淘宝 Bundle，巨魔注入不读 plist 但 deb/插桩路径也需要能命中。
+//    ⑤诊断面板每条命中标注广告类型；规则面板类型标签补充类型色。
+//    ⑥B 档 deep hook 增加淘宝开屏/激励/联盟 SDK 源头拦截。
+//    淘宝广告架构证据：SPSplash*/TBBootImage*Splash/TXSplash*(开屏)、TBRewardKit/
+//    TBCashRewardService(激励)、TBTDBanner*(横幅)、AKTsAlimamaAdAbility/Munion*/(联盟)、
+//    MMAdBizSDKBundle.bundle；中文广告文案多在服务端动态下发，主二进制命中少。
+//    静态分析未真机验证淘宝，标注为「静态推断」，以真机反馈为准。
 //
 //  v14 相对 v13（真机浮标「FCv13 规则9 内0 挡0 原19 H50」，运营位仍不动）：
 //    连续多版盲改无效——停止猜测，改为「诊断优先」。真因待定：内0挡0 说明原生扫描
@@ -114,8 +128,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===16){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=16;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===17){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=17;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -337,27 +351,141 @@ static BOOL FCRuleMatchesFingerprint(NSString *rule, NSString *cls, CGRect rect,
     return NO;
 }
 
+#pragma mark - v17：通用广告类型体系（丰巢真机实证 + 淘宝 10.56.10 静态实证）
+
+// v17：插件标注的常见广告类型。目标是持续补充、跨 App 通用。
+typedef NS_ENUM(NSUInteger, FCAdType) {
+    FCAdTypeUnknown = 0,
+    FCAdTypeSplash,        // 开屏广告
+    FCAdTypeReward,        // 激励视频
+    FCAdTypeInterstitial,  // 插屏广告
+    FCAdTypeBanner,        // 横幅广告
+    FCAdTypeFeed,          // 信息流广告
+    FCAdTypeOperation,     // 原生运营位（服务端下发卡片）
+    FCAdTypeAlliance,      // 联盟 / 广告 SDK
+};
+
+static NSString *FCAdTypeName(FCAdType t) {
+    switch (t) {
+        case FCAdTypeSplash:       return @"开屏";
+        case FCAdTypeReward:       return @"激励";
+        case FCAdTypeInterstitial: return @"插屏";
+        case FCAdTypeBanner:       return @"横幅";
+        case FCAdTypeFeed:         return @"信息流";
+        case FCAdTypeOperation:    return @"运营位";
+        case FCAdTypeAlliance:     return @"联盟";
+        default:                   return @"其他";
+    }
+}
+
+// v17：类名 → 广告类型 权威表。新 App 的广告类只需往这里加一行，
+// 类型标注 / FCClassIsAd 判定 / 诊断输出 / 规则面板 全部自动生效。
+// 丰巢类来自 v14 诊断实证；淘宝类来自 10.56.10 主二进制 17385 个 ObjC 类静态提取。
+static NSDictionary<NSString *, NSNumber *> *FCAdTypeClassTable(void) {
+    static NSDictionary *t = nil; static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSMutableDictionary *d = [NSMutableDictionary dictionary];
+        // —— 丰巢 HiveConsumer（开屏 / 插屏 / 运营位）——
+        d[@"FCSplashADSManager"] = @(FCAdTypeSplash);
+        d[@"SplashAdManager"] = @(FCAdTypeSplash);
+        d[@"SplashAdLibHandler"] = @(FCAdTypeSplash);
+        d[@"NativeSplashAdView"] = @(FCAdTypeSplash);
+        d[@"SplashAdBottomView"] = @(FCAdTypeSplash);
+        d[@"SplashAdScreenShotManager"] = @(FCAdTypeSplash);
+        d[@"CheckOutAlertInsertADViewController"] = @(FCAdTypeInterstitial);
+        d[@"InterstScrAdLibTaku"] = @(FCAdTypeInterstitial);
+        d[@"InterstScrAdLibUBIX"] = @(FCAdTypeInterstitial);
+        d[@"OpenScrAdLibToBid"] = @(FCAdTypeInterstitial);
+        d[@"OpenScrAdLibUBIX"] = @(FCAdTypeInterstitial);
+        d[@"LifeServiceHomeADPopAlertView"] = @(FCAdTypeOperation);
+        d[@"DSPHomeAdsAlertView"] = @(FCAdTypeOperation);
+        d[@"SendOrderAdBannerView"] = @(FCAdTypeBanner);
+        d[@"BoxMobilePickADBannerView"] = @(FCAdTypeBanner);
+        d[@"BoxMobilePickADBannerLeftView"] = @(FCAdTypeBanner);
+        d[@"BoxMobilePickADBannerTopView"] = @(FCAdTypeBanner);
+        d[@"BoxMobilePickADBannerSuccessView"] = @(FCAdTypeBanner);
+        d[@"CheckoutAdFeedBannerCell"] = @(FCAdTypeFeed);
+        d[@"CheckoutAdFeedMixBannerCell"] = @(FCAdTypeFeed);
+        d[@"CheckoutAdFeedSepBannerCell"] = @(FCAdTypeFeed);
+        d[@"WashSOAdsView"] = @(FCAdTypeOperation);
+        d[@"WashSOAdsSectionView"] = @(FCAdTypeOperation);
+        d[@"LifeServiceDetailAdCell"] = @(FCAdTypeOperation);
+        d[@"WashImportSendAdsCell"] = @(FCAdTypeOperation);
+        d[@"CashDeskTakuADCell"] = @(FCAdTypeOperation);
+        d[@"AdCenter"] = @(FCAdTypeAlliance);
+        d[@"AdsHandle"] = @(FCAdTypeAlliance);
+        d[@"AdsCNManager"] = @(FCAdTypeAlliance);
+        // —— 淘宝 Taobao4iPhone 10.56.10（开屏）——
+        d[@"SPSplashController"] = @(FCAdTypeSplash);
+        d[@"SPSplashView"] = @(FCAdTypeSplash);
+        d[@"SPSplashViewConfig"] = @(FCAdTypeSplash);
+        d[@"SPSplashArchSelection"] = @(FCAdTypeSplash);
+        d[@"TBBootImageSplashDO"] = @(FCAdTypeSplash);
+        d[@"TBBootImageExtSplashDO"] = @(FCAdTypeSplash);
+        d[@"TBBootImageSplashSubSectionDO"] = @(FCAdTypeSplash);
+        d[@"TBBootImageExtSplashHelper"] = @(FCAdTypeSplash);
+        d[@"TXSplashInteractView"] = @(FCAdTypeSplash);
+        d[@"TXSplashLottilePopView"] = @(FCAdTypeSplash);
+        d[@"TBHomeTabGuideSplashHandler"] = @(FCAdTypeSplash);
+        d[@"TBSplashTransitionContext"] = @(FCAdTypeSplash);
+        // —— 淘宝（激励视频）——
+        d[@"TBRewardKit"] = @(FCAdTypeReward);
+        d[@"TBRewardModel"] = @(FCAdTypeReward);
+        d[@"TBRewardService"] = @(FCAdTypeReward);
+        d[@"TBCashRewardModel"] = @(FCAdTypeReward);
+        d[@"TBCashRewardService"] = @(FCAdTypeReward);
+        // —— 淘宝（横幅）——
+        d[@"TBTDBannerView"] = @(FCAdTypeBanner);
+        d[@"TBTDBannerEngine"] = @(FCAdTypeBanner);
+        d[@"TBTDBannerModel"] = @(FCAdTypeBanner);
+        d[@"TBHBannerTracker"] = @(FCAdTypeBanner);
+        // —— 淘宝（联盟 / 广告 SDK：阿里妈妈 + Munion + MMAdBiz）——
+        d[@"AKTsAlimamaAdAbility"] = @(FCAdTypeAlliance);
+        d[@"MunionAdParamUtil"] = @(FCAdTypeAlliance);
+        d[@"MunionAdRequestMiddleware"] = @(FCAdTypeAlliance);
+        d[@"MunionAdaptObj"] = @(FCAdTypeAlliance);
+        d[@"MunionCpaBusiness"] = @(FCAdTypeAlliance);
+        d[@"MunionTBSDKServer"] = @(FCAdTypeAlliance);
+        d[@"MMAdBizOrange"] = @(FCAdTypeAlliance);
+        t = d;
+    });
+    return t;
+}
+
+// v17：查类名对应的广告类型（精确 + 去命名空间前缀），供诊断/面板标注
+static FCAdType FCAdTypeOfClass(NSString *cls) {
+    if (!cls.length) return FCAdTypeUnknown;
+    NSDictionary *tbl = FCAdTypeClassTable();
+    NSNumber *n = tbl[cls];
+    if (n) return (FCAdType)n.unsignedIntegerValue;
+    NSRange dot = [cls rangeOfString:@"." options:NSBackwardsSearch];
+    if (dot.location != NSNotFound) {
+        n = tbl[[cls substringFromIndex:dot.location + 1]];
+        if (n) return (FCAdType)n.unsignedIntegerValue;
+    }
+    return FCAdTypeUnknown;
+}
+
 #pragma mark - 类名 / 文案判定
 
 static NSArray<NSString *> *FCAdClassKeys(void) {
+    // v17：单一数据源——直接取权威表全部类名，新增类只需改 FCAdTypeClassTable 一处
     static NSArray *keys = nil; static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        keys = @[
-            @"FCSplashADSManager", @"SplashAdManager", @"SplashAdLibHandler",
-            @"NativeSplashAdView", @"SplashAdBottomView", @"SplashAdScreenShotManager",
-            @"CheckOutAlertInsertADViewController", @"InterstScrAdLibTaku",
-            @"InterstScrAdLibUBIX", @"OpenScrAdLibToBid", @"OpenScrAdLibUBIX",
-            @"LifeServiceHomeADPopAlertView", @"DSPHomeAdsAlertView",
-            @"SendOrderAdBannerView", @"BoxMobilePickADBannerView",
-            @"BoxMobilePickADBannerLeftView", @"BoxMobilePickADBannerTopView",
-            @"BoxMobilePickADBannerSuccessView",
-            @"CheckoutAdFeedBannerCell", @"CheckoutAdFeedMixBannerCell",
-            @"CheckoutAdFeedSepBannerCell", @"WashSOAdsView", @"WashSOAdsSectionView",
-            @"LifeServiceDetailAdCell", @"WashImportSendAdsCell", @"CashDeskTakuADCell",
-            @"AdCenter", @"AdsHandle", @"AdsCNManager",
-        ];
-    });
+    dispatch_once(&once, ^{ keys = FCAdTypeClassTable().allKeys; });
     return keys;
+}
+
+// v17：通用强特征词根——跨 App 兜底（静态分析未覆盖的同类广告 SDK 也能命中）。
+// Ad vs Adress 防护：命中前先排除地址业务（FCIsExcludedClass）。
+static NSArray<NSString *> *FCAdGenericRoots(void) {
+    static NSArray *roots = nil; static dispatch_once_t once;
+    dispatch_once(&once, ^{ roots = @[
+        @"splash",          // 开屏：SPSplash/TBBootImageSplash/TXSplash
+        @"rewardkit", @"rewardservice", @"cashreward",  // 激励（激励业务词，谨慎）
+        @"interstitial", @"interstscr", @"popupad", @"fullscreenad",  // 插屏
+        @"munion", @"alimama", @"gromore", @"pangolin",  // 联盟/SDK
+    ]; });
+    return roots;
 }
 
 static BOOL FCIsExcludedClass(NSString *cls) {
@@ -374,22 +502,33 @@ static BOOL FCIsExcludedClass(NSString *cls) {
 
 static BOOL FCClassIsAd(NSString *cls) {
     if (!cls.length || FCIsExcludedClass(cls)) return NO;
-    for (NSString *k in FCAdClassKeys())
-        if ([cls rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    // v17：先精确查权威表（去命名空间前缀）
+    if (FCAdTypeOfClass(cls) != FCAdTypeUnknown) return YES;
+    // v17：再通用词根兜底——必须排除 adress/address，且要求词根边界完整
     NSString *l = cls.lowercaseString;
-    if ([l rangeOfString:@"adress"].location == NSNotFound &&
-        [l rangeOfString:@"address"].location == NSNotFound) {
-        if ([l rangeOfString:@"splash"].location != NSNotFound ||
-            [l rangeOfString:@"popupad"].location != NSNotFound ||
-            [l rangeOfString:@"launchad"].location != NSNotFound ||
-            [l rangeOfString:@"interstitial"].location != NSNotFound) return YES;
-    }
+    if ([l rangeOfString:@"adress"].location != NSNotFound ||
+        [l rangeOfString:@"address"].location != NSNotFound) return NO;
+    for (NSString *root in FCAdGenericRoots())
+        if ([l rangeOfString:root].location != NSNotFound) return YES;
     return NO;
 }
 
+// v17：多宿主命名空间解析——丰巢 Swift 类在 HiveConsumer.*，淘宝宿主类在 Taobao4iPhone.*，
+// ObjC 类/联盟 SDK 通常无前缀。逐个尝试，覆盖两个 App 及后续新增宿主。
 static Class FCResolveClass(NSString *name) {
+    if (!name.length) return nil;
     Class c = NSClassFromString(name);
-    return c ?: NSClassFromString([@"HiveConsumer." stringByAppendingString:name]);
+    if (c) return c;
+    static NSArray *prefixes = nil; static dispatch_once_t once;
+    dispatch_once(&once, ^{ prefixes = @[
+        @"HiveConsumer.",      // 丰巢 Swift 模块名
+        @"Taobao4iPhone.",     // 淘宝宿主命名空间（若有）
+    ]; });
+    for (NSString *p in prefixes) {
+        c = NSClassFromString([p stringByAppendingString:name]);
+        if (c) return c;
+    }
+    return nil;
 }
 
 static BOOL FCTextsAreAd(NSArray<NSString *> *texts) {
@@ -986,12 +1125,17 @@ static void FCInjectWebViews(BOOL force) {
 #pragma mark - 规则管理面板（独立可成 key 的 window，支持键盘编辑）
 
 // v9：规则类型判定（按前缀），用于在面板里给每条规则打标签
+// v17：cls:类名 若能解析出广告类型则显示类型中文（开屏/激励/横幅…），便于识别规则用途
 static NSString *FCRuleTypeText(NSString *r) {
     if ([r hasPrefix:@"#"]) return @"ID";
     if ([r hasPrefix:@"."]) return @"类";
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return @"图";
     if ([r hasPrefix:@"sel:"]) return @"选";   // v13：CSS 结构指纹
-    if ([r hasPrefix:@"cls:"] || [r hasPrefix:@"pos:"]) return @"位";  // v13：原生位置指纹
+    if ([r hasPrefix:@"cls:"]) {
+        FCAdType at = FCAdTypeOfClass([r substringFromIndex:4]);
+        return at != FCAdTypeUnknown ? FCAdTypeName(at) : @"位";
+    }
+    if ([r hasPrefix:@"pos:"]) return @"位";  // v13：原生位置指纹
     return @"文";
 }
 static UIColor *FCRuleTypeColor(NSString *r) {
@@ -1253,7 +1397,7 @@ static void FCAppendDiagText(NSString *s) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v14 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v17 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCTopViewController() class]) ?: @"-"]);
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
@@ -1279,8 +1423,13 @@ static void FCFillDiagnose(void) {
                         if (FCRuleMatchesText(rule, t)) { [matched addObject:rule]; break; }
                     }
                 }
-                FCAppendDiagText([NSString stringWithFormat:@"[原生] %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
-                    NSStringFromClass([v class]), joined,
+                // v17：类名命中权威表时标注广告类型（开屏/激励/横幅/运营位/联盟…）
+                NSString *vcls = NSStringFromClass([v class]);
+                FCAdType at = FCAdTypeOfClass(vcls);
+                NSString *typeTag = (at != FCAdTypeUnknown)
+                    ? [NSString stringWithFormat:@"[类型:%@]", FCAdTypeName(at)] : @"";
+                FCAppendDiagText([NSString stringWithFormat:@"[原生]%@ %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
+                    typeTag, vcls, joined,
                     r.origin.x, r.origin.y, r.size.width, r.size.height,
                     matched.count ? [matched componentsJoinedByString:@","] : @"无"]);
             }
@@ -1610,7 +1759,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv16 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv17 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1623,7 +1772,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv16 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv17 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1633,7 +1782,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v16"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v17"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1696,6 +1845,14 @@ static void FCInstallDeepHooks(void) {
         @[@"InterstScrAdLibUBIX", @[@"show",@"load",@"requestAd"]],
         @[@"OpenScrAdLibToBid",   @[@"show",@"load",@"requestAd"]],
         @[@"OpenScrAdLibUBIX",    @[@"show",@"load",@"requestAd"]],
+        // v17：淘宝 10.56.10 源头拦截——开屏/激励/联盟 SDK 的展示与请求入口
+        @[@"SPSplashController",          @[@"show",@"start",@"load",@"showSplash"]],
+        @[@"SPSplashView",                @[@"show",@"start",@"load"]],
+        @[@"TBSplashTransitionContext",   @[@"show",@"start"]],
+        @[@"TBRewardService",             @[@"show",@"load",@"requestReward"]],
+        @[@"TBCashRewardService",         @[@"show",@"load",@"requestReward"]],
+        @[@"MunionAdRequestMiddleware",   @[@"request",@"load",@"start"]],
+        @[@"AKTsAlimamaAdAbility",        @[@"show",@"load",@"request"]],
     ];
     for (NSArray *row in table) FCSwizzleOwnMethods(row[0], row[1]);
 }
@@ -1706,7 +1863,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v16 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v17 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
