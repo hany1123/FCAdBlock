@@ -1,5 +1,17 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v19（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v20（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v20 相对 v19（老大三张真机截图 + 诊断输出定案）：
+//    诊断证据：所有板块都是 [原生] DXRootView/DXScrollerLayoutCell/DOOTabItem/AUIconFontView，
+//    顶层VC=TBMainViewController；唯一 WKWebView frame 0,0 430x932 却 DOM空=空壳容器。
+//    → 之前判「运营位是 H5」错误！真相是阿里 DX 原生动态化，被空壳 webview 带偏。
+//    修复三块：
+//    ①新增元素引擎识别体系 FCEngine/FCEngineOfClass/FCEngineOfView——点选按命中元素
+//      真实引擎(DX动态/RN/H5/原生/Flutter/小程序)路由：非 H5 直接走原生，不再看祖先链
+//      有无 webview；浮标显示「DX动态·已记N类」让用户看清点中了哪类板块。
+//    ②诊断面板：关闭/复制按钮移到 TextView 上方的固定顶栏（旧版 TextView 覆盖按钮点不到）；
+//      新增「一键复制全部」+ toast，用户粘贴文本发我，无需截图；每行标注板块引擎。
+//    ③诊断开头加引擎图例与「空壳 webview」提示，便于用户理解为何有的板块选不中。
 //
 //  v19 相对 v18（真机截图：浮标「网页未中→原生·已记0类+位置」，红框「已选中:WKScrollView」）：
 //    证据链：v18 降级链路生效，但选中 WKScrollView=运营位其实是 H5 渲染在 WKWebView 内，
@@ -148,8 +160,8 @@ static void FCAppendDiagText(NSString *s);
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===19){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=19;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===20){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=20;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -495,6 +507,66 @@ static FCAdType FCAdTypeOfClass(NSString *cls) {
         if (n) return (FCAdType)n.unsignedIntegerValue;
     }
     return FCAdTypeUnknown;
+}
+
+#pragma mark - v20：元素板块引擎识别（原生 / DX-Weex / RN / H5 / Flutter / 小程序）
+
+// iOS App 板块底层实现识别——按 view 类名特征判定渲染引擎。
+// 依据：真机诊断「超级88领券中心」= DXRootView（阿里 DX 原生动态化），并非 H5；
+// 页面里 frame 0,0 满屏但 DOM空 的 WKWebView 是空壳容器，不能据它判 H5。
+typedef NS_ENUM(NSUInteger, FCEngine) {
+    FCEngineUnknown = 0,
+    FCEngineNative,    // 纯原生 UIKit（UILabel/UIImageView/自定义 UIView）
+    FCEngineDX,        // 阿里 DX / Weex 原生动态化（DXRootView/DXScrollerLayoutCell...）
+    FCEngineRN,        // React Native（RCTView/RCTText...）
+    FCEngineH5,        // WKWebView 内的真 H5 DOM
+    FCEngineFlutter,   // Flutter（FlutterView/FlutterViewController）
+    FCEngineMiniApp,   // 小程序容器
+};
+
+static NSString *FCEngineName(FCEngine e) {
+    switch (e) {
+        case FCEngineNative:  return @"原生";
+        case FCEngineDX:      return @"DX动态";
+        case FCEngineRN:      return @"RN";
+        case FCEngineH5:      return @"H5";
+        case FCEngineFlutter: return @"Flutter";
+        case FCEngineMiniApp: return @"小程序";
+        default:              return @"未知";
+    }
+}
+
+// 从类名判定引擎（用于沿祖先链找板块根容器）
+static FCEngine FCEngineOfClass(NSString *cls) {
+    if (!cls.length) return FCEngineUnknown;
+    NSString *u = cls.uppercaseString;
+    // 阿里 DX / Weex / Utah / Birdge：真机实证 DXRootView / DXScrollerLayoutCell / DOOTabItem
+    if ([u hasPrefix:@"DX"] || [u hasPrefix:@"WX"] || [u rangeOfString:@"WEEX"].location != NSNotFound ||
+        [u hasPrefix:@"Doo"] || [u hasPrefix:@"DOO"] || [u rangeOfString:@"DYNAMIC"].location != NSNotFound)
+        return FCEngineDX;
+    if ([u hasPrefix:@"RCT"] || [u rangeOfString:@"REACTNATIVE"].location != NSNotFound) return FCEngineRN;
+    if ([u rangeOfString:@"FLUTTER"].location != NSNotFound || [u hasPrefix:@"FLT"]) return FCEngineFlutter;
+    if ([u rangeOfString:@"MINIAPP"].location != NSNotFound || [u rangeOfString:@"MINIPROGRAM"].location != NSNotFound)
+        return FCEngineMiniApp;
+    if ([u hasPrefix:@"WK"] || [u rangeOfString:@"WEBVIEW"].location != NSNotFound) return FCEngineH5;
+    if ([u hasPrefix:@"UI"] || [u hasPrefix:@"NS"] || [u isEqualToString:@"UIView"] ||
+        [u hasPrefix:@"_UI"]) return FCEngineNative;
+    // 其它宿主自定义类一律算原生（含 Swift 点号类名）
+    return FCEngineNative;
+}
+
+// 从触点 view 沿祖先链找「板块引擎根」——返回最具体的引擎（DX/RN/H5 优先于原生）
+static FCEngine FCEngineOfView(UIView *view) {
+    FCEngine best = FCEngineUnknown;
+    UIView *cur = view;
+    for (int d = 0; cur && d < 10; d++) {
+        FCEngine e = FCEngineOfClass(NSStringFromClass([cur class]));
+        if (e == FCEngineDX || e == FCEngineRN || e == FCEngineH5 ||
+            e == FCEngineFlutter || e == FCEngineMiniApp) { best = e; break; }
+        if (e == FCEngineNative && best == FCEngineUnknown) best = FCEngineNative;
+        cur = cur.superview;
+    }
+    return best == FCEngineUnknown ? FCEngineNative : best;
 }
 
 #pragma mark - 类名 / 文案判定
@@ -1080,24 +1152,38 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
             nr.size.width/scr.width, nr.size.height/scr.height]);
     }
     NSString *prefix = fallbackHint.length ? fallbackHint : @"";
-    FCShowBadgeMsg([NSString stringWithFormat:@"%@原生·已记%lu类+位置", prefix, (unsigned long)clsAdded]);
+    // v20：网页降级提示(含"网页"/"H5")保持原样；引擎提示(如"DX动态·")不再重复"原生"二字
+    BOOL enginePrefix = [prefix rangeOfString:@"网页"].location == NSNotFound &&
+                        [prefix rangeOfString:@"H5"].location == NSNotFound && prefix.length > 0;
+    NSString *msg = enginePrefix
+        ? [NSString stringWithFormat:@"%@已记%lu类+位置", prefix, (unsigned long)clsAdded]
+        : [NSString stringWithFormat:@"%@原生·已记%lu类+位置", prefix, (unsigned long)clsAdded];
+    FCShowBadgeMsg(msg);
 }
 
 static void FCPickAtPoint(CGPoint screenP) {
     Class wk = NSClassFromString(@"WKWebView");
     UIView *hit = FCHitViewAtPoint(screenP);
     if (!hit) { FCShowBadgeMsg(@"未命中元素"); return; }
+    // v20：先识别触点板块的渲染引擎——这是判定走网页还是原生的根本依据。
+    // 真机实证：淘宝「超级88领券中心」是 DXRootView（DX 原生动态化），而页面里
+    // frame 0,0 满屏的 WKWebView DOM 为空（空壳容器），旧逻辑按祖先链见 webview
+    // 就走网页，被空壳带偏。改为：引擎非 H5 → 直接原生通道。
+    FCEngine eng = FCEngineOfView(hit);
+    NSString *engTag = FCEngineName(eng);
     UIView *cur = hit, *web = nil;
     while (cur) {
         if (wk && [cur isKindOfClass:wk]) { web = cur; break; }
         cur = cur.superview;
     }
-    // v18：web 必须「可见、尺寸够大、frame 真覆盖触点」才算网页通道。
-    // 排除常驻的 1x1 预热 webview / 广告 SDK 隐藏 webview 把原生运营位带偏。
+    // v20：只有「引擎判为 H5」且 web 可见够大覆盖触点，才走网页通道；
+    // DX/RN/Flutter/原生引擎一律走原生（哪怕祖先链挂着空壳 webview）。
     CGRect webFrame = web ? [web convertRect:web.bounds toView:nil] : CGRectZero;
-    BOOL webReal = web && !web.hidden && web.alpha >= 0.05 &&
-                   webFrame.size.width >= 160 && webFrame.size.height >= 160 &&
-                   CGRectContainsPoint(webFrame, screenP);
+    BOOL webVisible = web && !web.hidden && web.alpha >= 0.05 &&
+                      webFrame.size.width >= 160 && webFrame.size.height >= 160 &&
+                      CGRectContainsPoint(webFrame, screenP);
+    BOOL webReal = (eng == FCEngineH5) && webVisible;
+    FCLog(@"点选引擎=%@ web实体=%d 命中类=%@", engTag, webReal, NSStringFromClass([hit class]));
     if (webReal) {
         SEL sel = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
         if (![web respondsToSelector:sel]) {
@@ -1172,8 +1258,8 @@ static void FCPickAtPoint(CGPoint screenP) {
                 });
             });
     } else {
-        // v18：无有效 webview（含被 1x1 隐藏 webview 带偏的情况）→ 直接走原生
-        FCPickNative(hit, screenP, nil);
+        // v20：DX/RN/原生引擎 → 原生拾取，浮标前缀显示识别到的板块引擎类型
+        FCPickNative(hit, screenP, [NSString stringWithFormat:@"%@·", engTag]);
     }
 }
 
@@ -1463,9 +1549,11 @@ static void FCHidePanel(void) {
 
 @interface FCDiagWindow : UIWindow
 - (void)fcCloseDiag;
+- (void)fcCopyDiag;   // v20：一键复制诊断全文
 @end
 static FCDiagWindow *gFCDiagWindow = nil;
 static UITextView *gFCDiagText = nil;
+static UILabel *gFCDiagToast = nil;
 
 @implementation FCDiagWindow
 - (BOOL)canBecomeKeyWindow { return YES; }
@@ -1473,6 +1561,19 @@ static UITextView *gFCDiagText = nil;
     [self.subviews makeObjectsPerformSelector:@selector(removeFromSuperview)];
     self.hidden = YES;
     gFCDiagText = nil;
+    gFCDiagToast = nil;
+}
+- (void)fcCopyDiag {   // v20：复制到剪贴板 + 顶部 toast 反馈，无需截图
+    NSString *t = gFCDiagText.text ?: @"";
+    if (!t.length) return;
+    [UIPasteboard generalPasteboard].string = t;
+    if (gFCDiagToast) {
+        gFCDiagToast.text = [NSString stringWithFormat:@"已复制 %lu 字，可直接粘贴发我",
+                             (unsigned long)t.length];
+        gFCDiagToast.hidden = NO;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.0 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{ gFCDiagToast.hidden = YES; });
+    }
 }
 @end
 
@@ -1486,10 +1587,13 @@ static void FCAppendDiagText(NSString *s) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v19 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v20 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCTopViewController() class]) ?: @"-"]);
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits, (unsigned long)gFCBuiltinBlocked]);
+    // v20：引擎图例——让用户看懂每个板块底层是哪类技术，回答「为什么有的选不中」
+    FCAppendDiagText(@"[引擎图例] 原生=UIKit控件 / DX动态=阿里DX-Weex原生动态化 / RN=ReactNative / H5=WKWebView内DOM / Flutter / 小程序");
+    FCAppendDiagText(@"[提示] 满屏但 DOM空 的 WKWebView 是空壳容器，内容实际是原生/DX，点选按元素真实引擎走。");
     // 1) 原生视图树：列出所有有文字的 view（class + 文字 + frame），并标记它命中了哪条规则
     NSArray *rules = FCEffectiveRules();
     for (UIWindow *w in FCAllWindows()) {
@@ -1517,8 +1621,11 @@ static void FCFillDiagnose(void) {
                 FCAdType at = FCAdTypeOfClass(vcls);
                 NSString *typeTag = (at != FCAdTypeUnknown)
                     ? [NSString stringWithFormat:@"[类型:%@]", FCAdTypeName(at)] : @"";
-                FCAppendDiagText([NSString stringWithFormat:@"[原生]%@ %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
-                    typeTag, vcls, joined,
+                // v20：标注该元素所属板块渲染引擎（DX动态/RN/H5/原生…）
+                FCEngine eng = FCEngineOfView(v);
+                NSString *engTag = [NSString stringWithFormat:@"[%@]", FCEngineName(eng)];
+                FCAppendDiagText([NSString stringWithFormat:@"[原生]%@%@ %@ | %@ | %.0f,%.0f %.0fx%.0f | 命中:%@",
+                    engTag, typeTag, vcls, joined,
                     r.origin.x, r.origin.y, r.size.width, r.size.height,
                     matched.count ? [matched componentsJoinedByString:@","] : @"无"]);
             }
@@ -1558,7 +1665,7 @@ static void FCFillDiagnose(void) {
         }
     }
     if (!found) FCAppendDiagText(@"未找到 WKWebView——运营位大概率是原生绘制");
-    FCAppendDiagText(@"===== 诊断结束（可截图发我）=====");
+    FCAppendDiagText(@"===== 诊断结束（点顶部「一键复制全部」粘贴发我，无需截图）=====");
 }
 
 static void FCShowDiagnose(void) {
@@ -1581,20 +1688,39 @@ static void FCShowDiagnose(void) {
     bg.backgroundColor = [UIColor colorWithWhite:0.08 alpha:0.96];
     [gFCDiagWindow addSubview:bg];
 
-    CGFloat top = 54;
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 18, s.size.width - 110, 30)];
-    title.text = @"页面诊断（上滑查看）";
+    // v20：顶部常驻「标题 + 关闭 + 一键复制」，TextView 从 y=100 起，不再覆盖按钮
+    CGFloat barH = 92;
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 12, s.size.width - 32, 28)];
+    title.text = @"页面诊断 · 复制后粘贴发我";
     title.textColor = [UIColor whiteColor];
-    title.font = [UIFont boldSystemFontOfSize:16];
+    title.font = [UIFont boldSystemFontOfSize:15];
     [bg addSubview:title];
+
     UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-    close.frame = CGRectMake(s.size.width - 90, 16, 76, 34);
+    close.frame = CGRectMake(16, 46, 80, 36);
     [close setTitle:@"关闭" forState:UIControlStateNormal];
     close.titleLabel.font = [UIFont systemFontOfSize:15];
+    close.backgroundColor = [UIColor colorWithWhite:0.92 alpha:0.18];
+    close.layer.cornerRadius = 8;
     [close addTarget:gFCDiagWindow action:@selector(fcCloseDiag) forControlEvents:UIControlEventTouchUpInside];
     [bg addSubview:close];
 
-    gFCDiagText = [[UITextView alloc] initWithFrame:CGRectMake(12, top, s.size.width - 24, s.size.height - top - 20)];
+    UIButton *copy = [UIButton buttonWithType:UIButtonTypeSystem];
+    copy.frame = CGRectMake(104, 46, 130, 36);
+    [copy setTitle:@"一键复制全部" forState:UIControlStateNormal];
+    copy.titleLabel.font = [UIFont systemFontOfSize:15];
+    copy.backgroundColor = [UIColor colorWithRed:0.15 green:0.55 blue:0.95 alpha:0.35];
+    copy.layer.cornerRadius = 8;
+    [copy addTarget:gFCDiagWindow action:@selector(fcCopyDiag) forControlEvents:UIControlEventTouchUpInside];
+    [bg addSubview:copy];
+
+    gFCDiagToast = [[UILabel alloc] initWithFrame:CGRectMake(242, 46, s.size.width - 258, 36)];
+    gFCDiagToast.textColor = [UIColor colorWithRed:0.5 green:1.0 blue:0.6 alpha:1];
+    gFCDiagToast.font = [UIFont systemFontOfSize:12];
+    gFCDiagToast.hidden = YES;
+    [bg addSubview:gFCDiagToast];
+
+    gFCDiagText = [[UITextView alloc] initWithFrame:CGRectMake(12, barH, s.size.width - 24, s.size.height - barH - 16)];
     gFCDiagText.backgroundColor = [UIColor clearColor];
     gFCDiagText.textColor = [UIColor colorWithRed:0.6 green:1.0 blue:0.7 alpha:1];
     gFCDiagText.font = [UIFont fontWithName:@"Menlo" size:10];
@@ -1848,7 +1974,7 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv19 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
+        @"FCv20 规则%lu 内%lu 挡%lu 原%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)gFCH5Hits, top];
@@ -1861,7 +1987,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv19 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv20 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -1871,7 +1997,7 @@ static void FCShowBadgeMsg(NSString *msg) {
 static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v19"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v20"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -1952,7 +2078,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v19 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v20 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
