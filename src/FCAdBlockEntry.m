@@ -1,5 +1,19 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v39（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v40（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v40 相对 v39（老大 v39 真机：浮标 FCv39 压3→压15，但白块不但没消、反而更大——天猫图标和
+//  淘宝秒杀卡也一起没了，商品流起点仍在 y≈590）：
+//    【决定性铁证】把 v35 与 v39 两张截图并排：中间那段区域高度两版都是 ≈480pt，商品流第一行
+//    都在 y≈590（占屏63%）。压掉 12 个东西，高度一毫米没减 → **压内部子视图只删内容、不减高度**。
+//    这才是 v32~v39 八版打不动的真正原因：方向错了，不是判据不够准。
+//    【v39 另一处死因】去类名闸门后函数内第一道排除是 hasPrefix:@"UI" —— 而目标恰恰是 UIView。
+//    诊断里三层 UIView 全「压:否」就是它挡的。
+//    【修法·从布局源头减高度】新增 FCZeroDXHeightSpec：把被拦 DXRootView 的 originalHeightSpec
+//    置 0；同时 hook setOriginalHeightSpec:，让任何来源设的高度都被强制归零；再调
+//    FCTriggerHostRelayout 让最近的 UICollectionView/UITableView invalidateLayout 重排。
+//    安全边界：只在 spec 是 NSNumber 时改写，自定义 spec 对象只记日志不硬塞（绝不搞崩引擎）。
+//    v39 的几何空壳调用停用（代码保留便于回退）。诊断新增 [高度归零]/[高度归属] 两段取证。
+//    例行 __fcadVer 39→40。
 //
 //  v39 相对 v38（老大 v38 真机：白块仍在，浮标「规则3 内0 挡0 原3 压3」——压3全是老逻辑，v38 塌陷零触发）：
 //    【v38 失败根因】v38 把几何判据套在 AliIFDXCollectionViewCell 类名闸门后，但真机撑白块的外层
@@ -389,14 +403,16 @@ static void FCZeroBlockedCellShell(UIView *root);            // v37：源头拦�
 static void FCPruneBlockedCellShells(void);                  // v37：外壳 cell 压0复用自愈
 static void FCZeroRotorCellIfEmpty(UIView *cell);            // v38：满宽矮轮播空壳 cell → 压0（不依赖源头痕迹）
 static void FCPruneRotorCells(void);                         // v38：轮播空壳自愈——内部出现正常文字即还原
+static void FCZeroDXHeightSpec(UIView *root);                 // v40：把被拦 root 的 DX 高度规格置0（真减高度）
+static void FCTriggerHostRelayout(UIView *v);                 // v40：通知宿主列表 invalidateLayout 重排
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===39){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=39;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===40){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=40;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1186,7 +1202,14 @@ static char kFCZeroRec;   // v32：view → FCFlattenRecord（压0标记，扫�
 // v33：实例级标记——setTemplateItem 命中后，后续 setData 也不放行。
 // v37：前移到全局区，扫描阶段据此判定「源头拦截过的 root」（原来定义在 hook 区，扫描够不着）。
 static char kFCBlockedRoot;
+// v40：高度规格已归零标记——每个 root 只做一次，避免每轮反复写属性触发重排抖动。
+static char kFCHeightZeroed;
 static NSUInteger gFCZeroApplied = 0;  // v32：累计压制次数（诊断可见）
+// v40：高度归零结果计数（诊断可见：成功/非NSNumber跳过/无spec）
+static NSUInteger gFCHeightZeroOK = 0;
+static NSUInteger gFCHeightZeroSkip = 0;
+// v40：v39 几何空壳压0 的开关（停用：压子视图不减高度，且会误伤正常运营位；留代码便于回退）
+static const BOOL gFCRotorEnabled = NO;
 
 // v32：规则是否仍匹配这条记录（与 FCRestoreFlattenedIfNeeded 同口径）
 static BOOL FCRecordRuleStillValid(FCFlattenRecord *rec, NSArray<NSString *> *rules) {
@@ -1324,13 +1347,17 @@ static void FCApplyNativeRules(void) {
                 // AliIFDXCollectionViewCell 空壳（内容没了但 cell 仍占满宽高度=白块）。
                 // 只认 DXRootView 级标记：商品流 recommend_* 无此痕迹，绝不误伤。
                 if (objc_getAssociatedObject(v, &kFCBlockedRoot) ||
-                    objc_getAssociatedObject(v, &kFCZeroRec)) FCZeroBlockedCellShell(v);
+                    objc_getAssociatedObject(v, &kFCZeroRec)) {
+                    FCZeroBlockedCellShell(v);
+                    // v40：压子视图只删内容不减高度（v35/v39 两版商品流起点都在 y≈590 铁证），
+                    // 真正的 480pt 高度由 DX 高度规格/宿主 item 决定。这里从布局源头归零：
+                    // 高度规格置 0 + 通知宿主 collection 重排，让容器自己塌下去。
+                    FCZeroDXHeightSpec(v);
+                }
             }
-            // v39：去类名闸门——真机三次证实撑白块的外层容器类名在漂移：
-            //   v36/37 AliIFDXCollectionViewCell → v38/39 普通 UIView / DXRootView。
-            // 靠类名认领必漏。改为对所有容器统一跑几何+可见文字判据，函数内部自带
-            // 系统容器排除 + 秒杀/商品流误伤排除。
-            FCZeroRotorCellIfEmpty(v);
+            // v40：v39 的「几何空壳」压0 已证实无效（压子视图不减高度）且会误伤正常运营位，
+            // 用常量开关停用（代码与自愈保留，便于回退）。白块改由 FCZeroDXHeightSpec 从布局层解决。
+            if (gFCRotorEnabled) FCZeroRotorCellIfEmpty(v);
             // v32：已被本插件压0的元素——每轮重新压制已由 FCReapplyAllZeroFrames 统一处理，
             // 这里直接跳过命中判定，避免 alpha=0/frame=0 的元素反复计数或误判，但仍下钻子视图。
             if (objc_getAssociatedObject(v, &kFCZeroRec)) {
@@ -2838,9 +2865,49 @@ static void FCAppendZeroedList(void) {
     }
 }
 
+// v40：高度归属诊断——白块到底是「内容撑的」还是「高度规格给的」。
+// 打印每个被拦 DXRootView 的高度规格值/类型、宿主列表类名、是否已归零；
+// 若全是 spec=nil 或 非NSNumber，下一版就知道该换哪个字段下手，不用再猜。
+static void FCAppendHeightOwnerDiag(void) {
+    NSMutableArray<NSString *> *out = [NSMutableArray array];
+    for (UIWindow *w in FCAllWindows()) {
+        NSString *wc = NSStringFromClass([w class]);
+        if ([wc hasPrefix:@"FC"]) continue;
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
+        NSUInteger i = 0;
+        while (i < q.count && i < 1200) {
+            UIView *v = q[i++];
+            for (UIView *s in v.subviews) [q addObject:s];
+            if (![NSStringFromClass([v class]) isEqualToString:@"DXRootView"]) continue;
+            if (!objc_getAssociatedObject(v, &kFCBlockedRoot) &&
+                !objc_getAssociatedObject(v, &kFCZeroRec)) continue;
+            id spec = nil;
+            @try { spec = [v valueForKey:@"originalHeightSpec"]; } @catch (NSException *e) { }
+            UIView *host = v.superview; int g = 0;
+            while (host && g++ < 10 && ![host isKindOfClass:[UICollectionView class]] &&
+                   ![host isKindOfClass:[UITableView class]]) host = host.superview;
+            CGRect r = [v convertRect:v.bounds toView:nil];
+            [out addObject:[NSString stringWithFormat:
+                @"%@ | %.0fx%.0f @y%.0f | spec=%@ (%@) | 宿主=%@ | 已归零=%@",
+                NSStringFromClass([v class]), r.size.width, r.size.height, r.origin.y,
+                spec ? [spec description] : @"nil",
+                spec ? NSStringFromClass([spec class]) : @"-",
+                host ? NSStringFromClass([host class]) : @"无",
+                objc_getAssociatedObject(v, &kFCHeightZeroed) ? @"是" : @"否"]];
+        }
+    }
+    FCAppendDiagText([NSString stringWithFormat:
+        @"[高度归零] 成功 %lu / 跳过 %lu（spec 非NSNumber或写失败）",
+        (unsigned long)gFCHeightZeroOK, (unsigned long)gFCHeightZeroSkip]);
+    if (!out.count) { FCAppendDiagText(@"[高度归属] 当前无被拦 DXRootView（可能还没滚到运营位）"); return; }
+    FCAppendDiagText([NSString stringWithFormat:@"[高度归属] 被拦 root %lu 个:", (unsigned long)out.count]);
+    NSUInteger n = MIN(out.count, (NSUInteger)8);
+    for (NSUInteger k = 0; k < n; k++) FCAppendDiagText([@"[高度] " stringByAppendingString:out[k]]);
+}
+
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v39 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v40 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2854,6 +2921,7 @@ static void FCFillDiagnose(void) {
     FCAppendBlankContainerDiag();     // v35/v36：白块候选容器（v36 放宽判据）
     FCAppendCoordinateProbe();        // v36：白块坐标反查——按采样点抓覆盖它的大容器(面积小→大)
     FCAppendZeroedList();             // v36：已压0容器清单——抓「压0后DX重设frame回来」撑白块的那层
+    FCAppendHeightOwnerDiag();        // v40：高度归属——spec 值/类型 + 宿主列表 + 归零计数
     // v22：逐条打印规则真实内容 + 类型——老大一眼看清点选到底存了文字还是 cls:/pos: 指纹
     for (NSUInteger i = 0; i < diagUserRules.count; i++) {
         NSString *rule = diagUserRules[i];
@@ -3305,7 +3373,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv39 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv40 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -3318,7 +3386,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv39 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv40 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3329,7 +3397,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v39"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v40"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3502,9 +3570,79 @@ static Method FCOwnMethod(Class c, NSString *name) {
 static IMP gFCOrigSetData = nil;
 static IMP gFCOrigSetTemplate = nil;
 static IMP gFCOrigSetViewModel = nil;
+static IMP gFCOrigSetHeightSpec = nil;   // v40：DX 高度规格 setter 原实现
 static BOOL gFCDeepScanned = NO;   // v31：secondfloor 深扫只做一次，避免刷屏
 
 // v37：kFCBlockedRoot 已前移到全局压0记录区，扫描阶段据此判定源头拦截过的 root。
+
+#pragma mark - v40：DX 高度规格归零（唯一能真正减高度的入口）
+
+// v40：通知最近的宿主列表重算 item 尺寸。
+// 真机铁证：v35 与 v39 两版商品流起点都在 y≈590，中间 480pt 高度纹丝不动——
+// 说明高度不是内容撑的，而是 DX 高度规格 / 宿主 collection item 给的。
+// 只压子视图永远是「删内容留空壳」，必须让宿主重新布局才塌得下去。
+static void FCTriggerHostRelayout(UIView *v) {
+    UIView *p = v.superview;
+    int guard = 0;
+    while (p && guard++ < 10) {
+        if ([p isKindOfClass:[UICollectionView class]]) {
+            @try {
+                UICollectionView *cv = (UICollectionView *)p;
+                if (cv.collectionViewLayout) [cv.collectionViewLayout invalidateLayout];
+                [cv setNeedsLayout];
+            } @catch (NSException *e) { }
+            return;
+        }
+        if ([p isKindOfClass:[UITableView class]]) {
+            @try {
+                UITableView *tv = (UITableView *)p;
+                [tv beginUpdates];
+                [tv endUpdates];
+            } @catch (NSException *e) { }
+            return;
+        }
+        p = p.superview;
+    }
+}
+
+// v40：把被拦 DXRootView 的高度规格（originalHeightSpec）置 0。
+// 安全边界：只在 spec 是 NSNumber 时改写；自定义 spec 对象（Weex WXLength 之类）不硬塞，
+// 只记日志等下一版按类型处理——宁可这版无效，也不能把引擎布局搞崩。
+static void FCZeroDXHeightSpec(UIView *root) {
+    if (!root) return;
+    if (objc_getAssociatedObject(root, &kFCHeightZeroed)) return;   // 每个 root 只做一次
+    id spec = nil;
+    @try { spec = [root valueForKey:@"originalHeightSpec"]; } @catch (NSException *e) { }
+    if (!spec) return;                       // 还没设置，等下一轮再试（幂等，不计数）
+    objc_setAssociatedObject(root, &kFCHeightZeroed, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    if (![spec isKindOfClass:[NSNumber class]]) {
+        gFCHeightZeroSkip++;
+        FCLog(@"v40 高度规格非 NSNumber，跳过: %@ (%@)", NSStringFromClass([spec class]), spec);
+        return;
+    }
+    if ([spec doubleValue] <= 0.5) return;   // 已经是 0，不必重写
+    @try { [root setValue:@0 forKey:@"originalHeightSpec"]; }
+    @catch (NSException *e) { gFCHeightZeroSkip++; FCLog(@"v40 高度规格写入失败: %@", e.reason); return; }
+    gFCHeightZeroOK++;
+    FCLog(@"v40 高度规格置0: 原 %@ (%@)", spec, NSStringFromClass([root class]));
+    FCTriggerHostRelayout(root);
+}
+
+static void FCHookSetHeightSpec(id self, SEL _cmd, id spec) {
+    // 已判定拦截的实例：无论谁在什么时候设高度，一律压成 0 —— 从布局源头掐掉那个空槽。
+    if (objc_getAssociatedObject(self, &kFCBlockedRoot) ||
+        objc_getAssociatedObject(self, &kFCZeroRec)) {
+        if ([spec isKindOfClass:[NSNumber class]] && [spec doubleValue] > 0.5) {
+            @try { FCProbeRecord(@"DXRootView.setOriginalHeightSpec→0", spec); } @catch (NSException *e) { }
+            if (gFCOrigSetHeightSpec) ((void (*)(id, SEL, id))gFCOrigSetHeightSpec)(self, _cmd, @0);
+            gFCHeightZeroOK++;
+            FCTriggerHostRelayout((UIView *)self);
+            return;
+        }
+    }
+    if (spec) @try { FCProbeRecord(@"DXRootView.setOriginalHeightSpec", spec); } @catch (NSException *e) { }
+    if (gFCOrigSetHeightSpec) ((void (*)(id, SEL, id))gFCOrigSetHeightSpec)(self, _cmd, spec);
+}
 
 static void FCHookSetData(id self, SEL _cmd, id data) {
     // v33：联动拦截——若本实例的 setTemplateItem 已命中 tpl:/内置模板并 return（模板没设），
@@ -3564,6 +3702,9 @@ static void FCInstallProbeHooks(void) {
         if (m) { gFCOrigSetData = method_getImplementation(m); method_setImplementation(m, (IMP)FCHookSetData); }
         Method t = FCOwnMethod(root, @"setTemplateItem:");
         if (t) { gFCOrigSetTemplate = method_getImplementation(t); method_setImplementation(t, (IMP)FCHookSetTemplate); }
+        // v40：高度规格 setter——把被拦运营位的高度从布局源头置 0
+        Method hs = FCOwnMethod(root, @"setOriginalHeightSpec:");
+        if (hs) { gFCOrigSetHeightSpec = method_getImplementation(hs); method_setImplementation(hs, (IMP)FCHookSetHeightSpec); }
     }
     Class cell = NSClassFromString(@"DXScrollerLayoutCell");
     if (cell) {
@@ -3602,7 +3743,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v39 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v40 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
