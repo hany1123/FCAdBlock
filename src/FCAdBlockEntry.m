@@ -1,5 +1,19 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v32（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v33（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v33 相对 v32（老大 v32 真机：压0生效42个/重压81次，但大白块与88横幅仍在）：
+//    【两处根因——源码+真机取证交叉锁定，非猜】
+//    ①大白块：FCRemoveEmptyShellIfNeeded 只查直接父一层 + 高度上限 30%屏；真机
+//      secondfloor 坑位约 35%屏(325pt)、且命中文字隔 2~3 层才到坑位 → 两关都挡掉，
+//      于是「文字压0了、坑位容器仍占一大块高度」= 搜索栏下方纯白空白。
+//      改：向上最多3层逐层判空壳，上限放宽 45%屏（仍低于50%黑屏硬闸门），必须真·空壳
+//      （自身无文字+可见子view≤1且有尺寸）才压，遇根容器/大容器立即停。
+//    ②88横幅：真机取证模板名只在 setTemplateItem:(DXTemplateItem:recommend_m_home_2025_88_
+//      campaign_card_67) 出现，setData: 数据里 template=0键为空；v29~v32 只 hook setData，
+//      所以日志显示「源头拦截命中」但横幅照常完整渲染。
+//      改：FCHookSetTemplate 命中 tpl:/内置模板即不设模板并打实例标记，FCHookSetData 联动
+//      return；模板名不命中时清标记自愈，防 DXRootView 复用导致正常卡片被误拦。
+//    例行 __fcadVer 32→33。
 //
 //  v32 相对 v31（老大 v31 深扫定案 + 明确指令「把窗口大小改成0」）：
 //    【定案】深扫输出「数据里未找到广告文案——文案写在远程模板zip」——证明 secondfloor
@@ -300,8 +314,8 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===32){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=32;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===33){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=33;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1446,20 +1460,32 @@ static UIView *FCCardShellForHide(UIView *hit) {
     return hit;   // 默认：删命中自身。空壳父容器清理交给下方的 FCRemoveEmptyShellIfNeeded。
 }
 
-// v26：删掉命中小元素后，若它的直接父容器被删空（只剩背景、无可见文字、子 view≤1），
-// 一并塌陷这个空壳——专治「删了文字留白框」。只处理直接父容器一层，且尺寸像卡片
-// （宽≥100、高≤30%屏），绝不向上猜，避免碰 DX 大容器触发重绘打架。
+// v33：删掉命中元素后，压掉它上方变成「空壳」的坑位容器——专治 secondfloor 大白块。
+// 【v32 漏判根因】v32 只查直接父一层、且高度上限 30%屏；真机大白块约 35%屏(325pt)、
+// 且命中文字往往隔了 2~3 层容器才到撑高度的坑位 → 两个条件都把它挡在外面，于是
+// 「文字压0了、坑位容器还占着一大块高度」= 截图里搜索栏下方的纯白空白。
+// 【v33 改法】从 removedFrom 向上最多 3 层逐层判空壳，高度上限放宽到 45%屏；
+// 但黑屏底线不破：①仍远低于 50%屏硬闸门；②必须真·空壳（自身无文字 + 可见子 view≤1
+// 且子 view 有实际尺寸）；③遇 TabBar/NavigationBar/UIWindow/非空壳容器立即停，
+// 绝不猜到页面根容器。满足则压0（节点留树、每轮重压），下方内容自然补齐。
 static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule) {
     UIView *p = removedFrom;
-    if (!p || [p isKindOfClass:[UIWindow class]]) return;
-    CGRect pr = [p convertRect:p.bounds toView:nil];
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
-    // 空壳判定：自身无文字 + 可见子 view≤1 + 尺寸像块卡片
-    NSString *ownText = FCOwnTextOf(p);
-    NSUInteger visibleSubs = 0;
-    for (UIView *s in p.subviews) if (!s.hidden && s.alpha >= 0.05) visibleSubs++;
-    if (ownText.length == 0 && visibleSubs <= 1 &&
-        pr.size.width >= 100 && pr.size.height >= 30 && pr.size.height <= sh * 0.30) {
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    for (int up = 0; p && up < 3; up++) {
+        if ([p isKindOfClass:[UIWindow class]]) break;
+        NSString *pcls = NSStringFromClass([p class]);
+        if ([pcls rangeOfString:@"TabBar"].location != NSNotFound ||
+            [pcls rangeOfString:@"NavigationBar"].location != NSNotFound) break;
+        CGRect pr = [p convertRect:p.bounds toView:nil];
+        // 黑屏底线：超过 45%屏的容器绝不碰（50%屏是扫描器硬闸门，这里留 5%缓冲）
+        if (pr.size.height > sh * 0.45 || pr.size.width > sw * 0.95) break;
+        // 空壳判定：自身无文字 + 可见且有尺寸的子 view≤1 + 尺寸像块卡片
+        NSString *ownText = FCOwnTextOf(p);
+        NSUInteger visibleSubs = 0;
+        for (UIView *s in p.subviews)
+            if (!s.hidden && s.alpha >= 0.05 && s.frame.size.width > 0.5 && s.frame.size.height > 0.5) visibleSubs++;
+        if (ownText.length != 0 || visibleSubs > 1 || pr.size.width < 100 || pr.size.height < 30) break;
         BOOL already = NO;
         for (FCFlattenRecord *rec in gFCFlattened) if (rec.view == p) { already = YES; break; }
         if (p.superview && !already) {
@@ -1467,8 +1493,7 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule) {
             rec.view = p; rec.superview = p.superview;
             rec.index = [p.superview.subviews indexOfObject:p];
             rec.rule = rule ?: @"";
-            // v32：空壳父容器同样改为压0——节点留树里，DX 重绘由每轮 FCReapplyAllZeroFrames 压回。
-            // 这正是老大说的「把这个窗口的大小改成0」：外壳不再占空间、下方元素补齐。
+            // 节点留树里压0，DX 重绘由每轮 FCReapplyAllZeroFrames 压回；规则删除时可逆还原。
             rec.zeroCollapsed = YES;
             rec.originalFrame = p.frame;
             rec.originalAlpha = p.alpha;
@@ -1477,8 +1502,9 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule) {
             objc_setAssociatedObject(p, &kFCZeroRec, rec, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
             FCForceZeroFrame(p);
             gFCZeroApplied++;
-            FCLog(@"空壳压0：%@ %.0fx%.0f", NSStringFromClass([p class]), pr.size.width, pr.size.height);
+            FCLog(@"空壳压0(上%d层)：%@ %.0fx%.0f", up, pcls, pr.size.width, pr.size.height);
         }
+        p = p.superview;   // 继续向上一层，直到非空壳/过大/到顶
     }
 }
 
@@ -2305,7 +2331,7 @@ static NSUInteger gFCProbeDropped = 0;
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v32 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v33 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -2965,15 +2991,21 @@ static IMP gFCOrigSetTemplate = nil;
 static IMP gFCOrigSetViewModel = nil;
 static BOOL gFCDeepScanned = NO;   // v31：secondfloor 深扫只做一次，避免刷屏
 
+static char kFCBlockedRoot;   // v33：实例级标记——setTemplateItem 命中后，后续 setData 也不放行
+
 static void FCHookSetData(id self, SEL _cmd, id data) {
+    // v33：联动拦截——若本实例的 setTemplateItem 已命中 tpl:/内置模板并 return（模板没设），
+    // 这里也必须 return，否则数据灌进一个没有模板的半初始化 DXRootView，反而可能异常渲染。
+    if (objc_getAssociatedObject(self, &kFCBlockedRoot)) return;
     // v29：源头拦截——模板名命中 tpl: 规则就不把数据喂给 DX 引擎，卡片无从渲染/重绘。
     // 只精确匹配用户点选的模板；命中即 return，未命中照常调原 IMP（行为不变）。
     NSString *tpl = FCTplNameFromData(data);
     // v30：建立「实例→模板名」映射，供点选直接查表（不依赖 KVC 读属性）
     if (tpl.length) FCTplBridgePut((UIView *)self, tpl);
     if (tpl.length && FCTplIsBlocked(tpl)) {
+        objc_setAssociatedObject(self, &kFCBlockedRoot, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
         FCProbeRecord(@"源头拦截", tpl);
-        FCLog(@"源头拦截模板: %@", tpl);
+        FCLog(@"源头拦截模板(setData): %@", tpl);
         return;
     }
     // v31：secondfloor 深扫一次——把广告文案的完整 key 路径打出来，判定能否 item 级精准删
@@ -2992,6 +3024,19 @@ static void FCHookSetTemplate(id self, SEL _cmd, id tpl) {
     NSString *n = FCTplNameFromItem(tpl);
     if (n.length) FCTplBridgePut((UIView *)self, n);
     @try { FCProbeRecord(@"DXRootView.setTemplateItem", tpl); } @catch (NSException *e) { }
+    // v33 关键修复：88 横幅等卡片的模板名只在 setTemplateItem: 出现，setData: 数据里是空模板，
+    // 所以 v29~v32 只拦 setData 时日志显示「源头拦截命中」但横幅照常完整渲染。
+    // 这里命中即不设模板（不调原 IMP）+ 打实例标记，从源头掐断渲染链路。
+    if (n.length && FCTplIsBlocked(n)) {
+        objc_setAssociatedObject(self, &kFCBlockedRoot, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        FCProbeRecord(@"源头拦截", n);
+        FCLog(@"源头拦截模板(setTemplateItem): %@", n);
+        return;
+    }
+    // v33 复用自愈：DXRootView 会被拿去复用渲染别的模板；这次模板名不命中就清掉旧标记，
+    // 否则实例一旦拦过一次，之后所有正常卡片都会因残留标记被 setData 误拦（整块空白）。
+    if (objc_getAssociatedObject(self, &kFCBlockedRoot))
+        objc_setAssociatedObject(self, &kFCBlockedRoot, nil, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
     if (gFCOrigSetTemplate) ((void (*)(id, SEL, id))gFCOrigSetTemplate)(self, _cmd, tpl);
 }
 static void FCHookSetViewModel(id self, SEL _cmd, id vm) {
