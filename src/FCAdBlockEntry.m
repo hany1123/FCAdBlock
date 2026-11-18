@@ -1,5 +1,18 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v36（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v37（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v37 相对 v36（老大 v36 诊断三修后带回决定性证据——白块真凶第一次锁死）：
+//    【交叉印证】v36 [白块候选] AliIFDXCollectionViewCell 0,400 430x135（压:否 tpl:-）
+//    与 [压0清单·源] DXRootView 原0,0 430x135→0x0（88_campaign）尺寸完全吻合=同一坑位内外两层；
+//    坐标反查采样点覆盖的最内层也全是这个 cell。根因定案：源头拦/压0只作用于内部 DXRootView，
+//    外层 AliIFDXCollectionViewCell 仍占满宽高度=白块。second_pit/campaign_bottom_bar 走 hook
+//    return、连压0表都不进，同样留空壳 cell。
+//    【精准修法·不误伤商品流】新增 FCZeroBlockedCellShell：扫描阶段从「带 kFCBlockedRoot /
+//    bridge模板命中」的 DXRootView 向上最多4层找 AliIFDXCollectionViewCell，满宽+高80~32%屏+
+//    无有效内容(≤2文字)才压0外壳(留树重压,独立gFCShellZeroed表)；商品流 recommend_* 无源头
+//    痕迹、根本不触发。FCPruneBlockedCellShells 每轮自愈：cell离树/内部痕迹消失(模板复用成正常
+//    卡片)即还原。kFCBlockedRoot 前移到全局区供扫描阶段读取。
+//    例行 __fcadVer 36→37。
 //
 //  v36 相对 v35（老大 v35 同页真机：截图+诊断都在首页推荐tab——[源头拦截]secondfloor_10
 //    首次命中，但搜索栏下白块仍在（天猫入口+淘宝秒杀卡片还在）；且诊断[白块候选]报「无」
@@ -346,14 +359,16 @@ static void FCRemoveEmptyShellIfNeeded(UIView *removedFrom, NSString *rule);  //
 static void FCZeroSourceRoot(UIView *root, NSString *tpl);   // v34：源头模板压0
 static void FCZeroSourceRootIfBlocked(UIView *v);            // v34：扫描阶段判定+压0
 static void FCPruneSourceZeros(void);   // v34：源头压0复用自愈
+static void FCZeroBlockedCellShell(UIView *root);            // v37：源头拦截/压0 root → 塌陷外层空壳 cell
+static void FCPruneBlockedCellShells(void);                  // v37：外壳 cell 压0复用自愈
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===36){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=36;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===37){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=37;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1133,7 +1148,13 @@ static UIViewController *FCTopViewController(void) {
 static NSMutableArray<FCFlattenRecord *> *gFCFlattened = nil;
 // v34：源头模板压0记录（second_pit 等），与用户点选记录分开存，复用自愈时互不干扰。
 static NSMutableArray<FCFlattenRecord *> *gFCSourceZeroed = nil;
+// v37：源头坑位外层空壳 cell 压0记录（AliIFDXCollectionViewCell）。
+// 内容被源头拦/压0后，外层 cell 仍占满宽高度=白块；独立表、每轮重压、痕迹消失即还原。
+static NSMutableArray<FCFlattenRecord *> *gFCShellZeroed = nil;
 static char kFCZeroRec;   // v32：view → FCFlattenRecord（压0标记，扫描时快速识别）
+// v33：实例级标记——setTemplateItem 命中后，后续 setData 也不放行。
+// v37：前移到全局区，扫描阶段据此判定「源头拦截过的 root」（原来定义在 hook 区，扫描够不着）。
+static char kFCBlockedRoot;
 static NSUInteger gFCZeroApplied = 0;  // v32：累计压制次数（诊断可见）
 
 // v32：规则是否仍匹配这条记录（与 FCRestoreFlattenedIfNeeded 同口径）
@@ -1189,6 +1210,16 @@ static void FCReapplyAllZeroFrames(void) {
             }
         }
     }
+    // v37：源头坑位外层空壳 cell 每轮重压——UICollectionView 复用会重设 cell 的 frame/alpha。
+    for (FCFlattenRecord *rec in gFCShellZeroed) {
+        if (rec.view) {
+            CGRect f = rec.view.frame;
+            if (f.size.width > 0.5 || f.size.height > 0.5 || rec.view.alpha > 0.01) {
+                FCForceZeroFrame(rec.view);
+                gFCZeroApplied++;
+            }
+        }
+    }
 }
 
 // v16：检查已塌陷的 view——规则还在就保持移除，规则删了就插回原位（可逆）
@@ -1224,6 +1255,7 @@ static void FCApplyNativeRules(void) {
     if (!gFCFlattened) gFCFlattened = [NSMutableArray array];
     FCRestoreFlattenedIfNeeded(rules);     // v16：规则删了的塌陷元素插回原位
     FCPruneSourceZeros();                  // v34：源头压0复用自愈——模板变了就还原，防误伤正常卡片
+    FCPruneBlockedCellShells();            // v37：外壳 cell 复用自愈——坑位内容恢复正常就还原外壳
     FCReapplyAllZeroFrames();              // v32：每轮重新压制——对抗 DX 重设 frame
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     static char kHiddenByFC;
@@ -1244,7 +1276,14 @@ static void FCApplyNativeRules(void) {
             NSString *vcls = NSStringFromClass([v class]);
             // v34：源头模板压0——hook 触发时容器可能还没布局，故在扫描阶段「有尺寸、在树里」时补压。
             // 判定逻辑封装在 FCZeroSourceRootIfBlocked（定义在 bridge/tpl 判定之后），内部幂等。
-            if ([v isKindOfClass:NSClassFromString(@"DXRootView")]) FCZeroSourceRootIfBlocked(v);
+            if ([v isKindOfClass:NSClassFromString(@"DXRootView")]) {
+                FCZeroSourceRootIfBlocked(v);
+                // v37：源头拦截(kFCBlockedRoot)或源头压0(kFCZeroRec)命中的 root → 向上塌陷承载它的
+                // AliIFDXCollectionViewCell 空壳（内容没了但 cell 仍占满宽高度=白块）。
+                // 只认 DXRootView 级标记：商品流 recommend_* 无此痕迹，绝不误伤。
+                if (objc_getAssociatedObject(v, &kFCBlockedRoot) ||
+                    objc_getAssociatedObject(v, &kFCZeroRec)) FCZeroBlockedCellShell(v);
+            }
             // v32：已被本插件压0的元素——每轮重新压制已由 FCReapplyAllZeroFrames 统一处理，
             // 这里直接跳过命中判定，避免 alpha=0/frame=0 的元素反复计数或误判，但仍下钻子视图。
             if (objc_getAssociatedObject(v, &kFCZeroRec)) {
@@ -1736,6 +1775,92 @@ static void FCPruneSourceZeros(void) {
         }
     }
     [gFCSourceZeroed removeObjectsInArray:gone];
+}
+
+// ===== v37：源头坑位外层空壳 cell 塌陷 =====
+// 真机铁证（v36 诊断交叉印证）：白块候选 AliIFDXCollectionViewCell 0,400 430x135（压:否 tpl:-），
+// 与压0清单·源 DXRootView 原0,0 430x135→0x0（88_campaign）尺寸完全吻合——同一坑位内外两层。
+// 源头拦/压0只作用于内部 DXRootView，外层 cell 仍占满宽高度=白块。
+// 防误伤核心：只从「我们亲自拦/压过的 root」向上找 cell；商品流 recommend_* 无痕迹，绝不触发。
+static BOOL FCCellStillHasBlockedTrace(UIView *cell, int depth) {
+    if (!cell || depth > 10) return NO;
+    Class dxRoot = NSClassFromString(@"DXRootView");
+    for (UIView *s in cell.subviews) {
+        if (dxRoot && [s isKindOfClass:dxRoot]) {
+            if (objc_getAssociatedObject(s, &kFCBlockedRoot)) return YES;
+            NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:s] : nil;
+            if (tpl.length && FCTplIsBlocked(tpl)) return YES;
+        }
+        if (FCCellStillHasBlockedTrace(s, depth + 1)) return YES;
+    }
+    return NO;
+}
+
+// cell 内「有效可见内容」文字条数——被本插件压0/拦截的节点整枝不算。
+// 双保险：万一误触发，含正常内容的 cell（商品流）也不会被压。
+static NSUInteger FCCellLiveTextCount(UIView *v, int depth) {
+    if (!v || depth > 10) return 0;
+    if (objc_getAssociatedObject(v, &kFCZeroRec) || objc_getAssociatedObject(v, &kFCBlockedRoot)) return 0;
+    NSUInteger n = 0;
+    if (!v.hidden && v.alpha >= 0.05 && v.frame.size.width > 1 && v.frame.size.height > 1 &&
+        FCOwnTextOf(v).length) n++;
+    for (UIView *s in v.subviews) n += FCCellLiveTextCount(s, depth + 1);
+    return n;
+}
+
+static void FCZeroBlockedCellShell(UIView *root) {
+    if (!root || !root.superview) return;
+    // 再校验一次痕迹，防止误调用（源头拦截=kFCBlockedRoot / 源头压0=bridge模板命中）
+    BOOL trace = objc_getAssociatedObject(root, &kFCBlockedRoot) != nil;
+    NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:root] : nil;
+    if (tpl.length && FCTplIsBlocked(tpl)) trace = YES;
+    if (!trace) return;
+    // 从 root 向上最多 4 层找诊断实证的外层 cell 类（精确类名，不碰普通 UICollectionViewCell）
+    UIView *cell = nil;
+    UIView *cur = root.superview;
+    Class shellCls = NSClassFromString(@"AliIFDXCollectionViewCell");
+    for (int up = 0; cur && up < 4; up++) {
+        if (shellCls && [cur isKindOfClass:shellCls]) { cell = cur; break; }
+        cur = cur.superview;
+    }
+    if (!cell || !cell.superview) return;
+    // 尺寸闸门：满宽坑位、高度 80~32%屏（白块 135/155），远低于 50% 黑屏硬线
+    CGRect r = [cell convertRect:cell.bounds toView:nil];
+    CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    if (r.size.width < sw * 0.75 || r.size.height < 80 || r.size.height > sh * 0.32) return;
+    // 空壳判定：除被拦内容外若还有 >2 条有效文字，说明 cell 里有正常内容，不压（双保险）
+    if (FCCellLiveTextCount(cell, 0) > 2) return;
+    if (!gFCShellZeroed) gFCShellZeroed = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFCShellZeroed) if (rec.view == cell) return;  // 幂等
+    FCFlattenRecord *rec = [FCFlattenRecord new];
+    rec.view = cell; rec.superview = cell.superview;
+    rec.index = [cell.superview.subviews indexOfObject:cell];
+    rec.rule = @"源头坑位外壳";
+    rec.zeroCollapsed = YES;
+    rec.originalFrame = cell.frame;
+    rec.originalAlpha = cell.alpha;
+    rec.originalClips = cell.clipsToBounds;
+    [gFCShellZeroed addObject:rec];
+    objc_setAssociatedObject(cell, &kFCZeroRec, rec, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    FCForceZeroFrame(cell);
+    gFCZeroApplied++;
+    FCLog(@"源头坑位外壳塌陷: %@ %.0fx%.0f", NSStringFromClass([cell class]), r.size.width, r.size.height);
+}
+
+// 每轮自愈：cell 离树、或内部源头痕迹消失（模板复用成正常卡片）→还原外壳，防误伤。
+static void FCPruneBlockedCellShells(void) {
+    if (!gFCShellZeroed.count) return;
+    NSMutableArray *gone = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFCShellZeroed) {
+        UIView *cell = rec.view;
+        if (!cell || !cell.superview) { [gone addObject:rec]; continue; }
+        if (!FCCellStillHasBlockedTrace(cell, 0)) {
+            FCRestoreZeroRecord(rec);
+            [gone addObject:rec];
+        }
+    }
+    [gFCShellZeroed removeObjectsInArray:gone];
 }
 
 static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
@@ -2583,7 +2708,7 @@ static void FCAppendZeroedList(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v36 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v37 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -3048,7 +3173,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv36 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv37 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -3061,7 +3186,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv36 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv37 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3072,7 +3197,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v36"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v37"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3247,7 +3372,7 @@ static IMP gFCOrigSetTemplate = nil;
 static IMP gFCOrigSetViewModel = nil;
 static BOOL gFCDeepScanned = NO;   // v31：secondfloor 深扫只做一次，避免刷屏
 
-static char kFCBlockedRoot;   // v33：实例级标记——setTemplateItem 命中后，后续 setData 也不放行
+// v37：kFCBlockedRoot 已前移到全局压0记录区，扫描阶段据此判定源头拦截过的 root。
 
 static void FCHookSetData(id self, SEL _cmd, id data) {
     // v33：联动拦截——若本实例的 setTemplateItem 已命中 tpl:/内置模板并 return（模板没设），
@@ -3345,7 +3470,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v36 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v37 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
