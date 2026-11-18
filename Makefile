@@ -13,7 +13,8 @@ FCAdBlock_FILES = $(wildcard src/*.m)
 FCAdBlock_FRAMEWORKS = UIKit Foundation
 FCAdBlock_CFLAGS = -fobjc-arc \
                    -Wno-deprecated-declarations -Wno-unused-variable \
-                   -Wno-unused-function -Wno-unused-const-variable
+                   -Wno-unused-function -Wno-unused-const-variable \
+                   -DFC_SHOW_BADGE=1
 FCAdBlock_LDFLAGS = -Wl,-undefined,dynamic_lookup
 
 # 实验对照版：FC_VARIANT=deep 时额外 swizzle 宿主自有广告类，仍不碰任何系统类

@@ -1,28 +1,28 @@
 //
-//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件
+//  FCAdBlockEntry.m —— 丰巢 (HiveConsumer) 去广告插件 v2
 //
-//  静态分析依据（丰巢 6.48.1 主二进制，122MB，arm64）：
-//    宿主 = uni-app + AWM/WindMill 聚合广告中台
-//      (ABU/穿山甲GroMore + GDT广点通 + KS快手 + 百度 + QuMeng趣盟 + Sigmob 多 adn)
-//    宿主自有广告类（Swift，_TtC12HiveConsumer*，已在 __objc_classname 验证）：
-//      开屏: FCSplashADSManager / SplashAdManager / SplashAdLibHandler /
-//            NativeSplashAdView / SplashAdBottomView / SplashAdModel
-//      插屏: CheckOutAlertInsertADViewController / InterstScrAdLibTaku /
-//            InterstScrAdLibUBIX / OpenScrAdLibToBid / OpenScrAdLibUBIX
-//      弹窗: LifeServiceHomeADPopAlertView / DSPHomeAdsAlertView
-//      Banner/信息流: SendOrderAdBannerView / BoxMobilePickADBannerView /
-//            CheckoutAdFeedBannerCell / CheckoutAdFeedMixBannerCell /
-//            CheckoutAdFeedSepBannerCell / WashSOAdsView / WashSOAdsSectionView
+//  v2 相对 v1 的关键修复（针对真机反馈：开屏仍在、页面运营位没去掉）：
+//    1) 取证结论：页面运营位文案（百元券包/寄件省钱卡/洗护券/换季洗羽绒）在整个
+//       IPA 1208 个文件里 UTF-8/UTF-16LE 全部零命中 → 服务端 DSP 下发的 H5，
+//       渲染在 WKWebView（二进制 WKWebView 201 处 + DCUni 295 处引用）。
+//       原生视图树永远够不到 DOM → v2 新增 WKWebView JS 注入移除运营位卡片。
+//    2) 开屏是真机截图里的京东面膜页，只有「跳过 2」没有「广告」角标，
+//       v1 的 FCTextsAreAd 要求「广告角标 AND 动作」→ 判定失败从不点跳过。
+//       v2 新增 FCTextsAreSplash 强特征（摇动或点击/跳转详情页/跳过+数字）。
+//    3) 新增诊断浮标：窗口数/证据数/开屏命中/运营位证据/WebView数/H5命中/顶层VC，
+//       一眼分清「没抓到」与「抓到了没处理」。
+//
+//  静态分析依据（丰巢 6.48.1 主二进制）：
+//    uni-app + AWM/WindMill 聚合广告中台（穿山甲GroMore/GDT/KS/百度/趣盟/Sigmob）
+//    宿主自有广告类 Swift（_TtC12HiveConsumer*，NSClassFromString 双命名兼容）
 //
 //  硬约束（严格遵守）：
-//    1. 不 hook 任何系统类方法（UIApplication/UIViewController/UIView 等）
+//    1. 不 hook 任何系统类方法；WKWebView 只调用公开 API evaluateJavaScript，不是 hook
 //    2. 不用 Logos / CydiaSubstrate，入口为纯 .m + constructor 构造函数
-//    3. B 档只 swizzle 宿主自有广告类（class_copyMethodList 限定类自身方法）
-//    4. A 档零 hook：只做定时视图扫描 + 调用公开 API 关闭
-//    5. 类名判定排除 "Adress/Address"（地址业务，丰巢核心功能）
-//
-//  说明：Swift 类的 selector 由 @objc 暴露时，NSClassFromString("HiveConsumer.Xxx")
-//        与 NSClassFromString("Xxx") 均可能命中，两种都尝试。
+//    3. B 档只改宿主自有广告类自身方法，selector 匹配不到安全降级
+//    4. A 档零 hook：定时视图扫描 + WKWebView JS 注入 + 公开 API 关闭
+//    5. 类名/文案判定排除 "Adress/Address"（地址业务，丰巢核心功能）
+//    6. 类名判定排除 "withdraw/提现" 等无关业务同形词
 //
 
 #import <UIKit/UIKit.h>
@@ -31,25 +31,51 @@
 
 #define FCLog(fmt, ...) NSLog((@"[FCAdBlock] " fmt), ##__VA_ARGS__)
 
+#pragma mark - H5 运营位移除脚本
+
+// 关键词来自真机截图红框内的独立文案，避免用「优惠券/福利」等通用词误伤正常功能。
+// 脚本完全用单引号，零反斜杠、零双引号，避免 @"" 字面量提前闭合。
+// MutationObserver 持续监听动态下发的运营位；__fcadLoaded 保证同 document 幂等。
+static NSString * const FCJSAdCards =
+@"(function(){var W=window;if(W.__fcadLoaded){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadHits=0;"
+"var K=['百元券包','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','任选3件'];"
+"function hit(t){if(!t||t.length>160){return false;}"
+"for(var i=0;i<K.length;i++){if(t.indexOf(K[i])>=0){return true;}}return false;}"
+"function sweep(){var all=document.querySelectorAll('div,li,a,section,article');"
+"for(var i=0;i<all.length;i++){var e=all[i];if(!e||e.__fcadDone){continue;}"
+"var txt=(e.innerText||e.textContent||'');if(txt.length<2||txt.length>160){continue;}"
+"if(!hit(txt)){continue;}"
+"var t=e;for(var k=0;k<2;k++){var p=t.parentElement;if(!p||p===document.body){break;}"
+"var pr=p.getBoundingClientRect();var tr=t.getBoundingClientRect();"
+"if(tr.height>0&&pr.height<=tr.height*1.6&&pr.width<=window.innerWidth*0.96){t=p;}else{break;}}"
+"var r=t.getBoundingClientRect();if(r.height>window.innerHeight*0.6){continue;}"
+"t.style.setProperty('display','none','important');t.__fcadDone=1;W.__fcadHits=W.__fcadHits+1;}}"
+"W.__fcadSweep=sweep;sweep();"
+"if(document.documentElement&&!W.__fcadOb){W.__fcadOb=new MutationObserver(function(){sweep();});"
+"W.__fcadOb.observe(document.documentElement,{childList:true,subtree:true});}})();";
+
+#pragma mark - 运行计数（诊断浮标用）
+
+static NSUInteger gFCWindows = 0;
+static NSUInteger gFCEvidences = 0;
+static NSUInteger gFCSplashHits = 0;
+static NSUInteger gFCOpEvidence = 0;
+static NSUInteger gFCWebViewFound = 0;
+static NSUInteger gFCH5Hits = 0;
+
 #pragma mark - 类名判定
 
-// 宿主自有广告类「强特征」白名单。
-// 只收广告专属类，绝不写泛化的 Vip / Member / Pay，避免误伤会员页。
-// 注意：不含任何 "Adress/Address" 地址类。
 static NSArray<NSString *> *FCAdClassKeys(void) {
     static NSArray *keys = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{
         keys = @[
-            // 开屏
             @"FCSplashADSManager", @"SplashAdManager", @"SplashAdLibHandler",
             @"NativeSplashAdView", @"SplashAdBottomView", @"SplashAdScreenShotManager",
-            // 插屏 / 全屏
             @"CheckOutAlertInsertADViewController", @"InterstScrAdLibTaku",
             @"InterstScrAdLibUBIX", @"OpenScrAdLibToBid", @"OpenScrAdLibUBIX",
-            // 广告弹窗
             @"LifeServiceHomeADPopAlertView", @"DSPHomeAdsAlertView",
-            // Banner / 信息流广告位
             @"SendOrderAdBannerView", @"BoxMobilePickADBannerView",
             @"BoxMobilePickADBannerLeftView", @"BoxMobilePickADBannerTopView",
             @"BoxMobilePickADBannerSuccessView",
@@ -57,22 +83,21 @@ static NSArray<NSString *> *FCAdClassKeys(void) {
             @"CheckoutAdFeedSepBannerCell", @"WashSOAdsView", @"WashSOAdsSectionView",
             @"LifeServiceDetailAdCell", @"WashImportSendAdsCell",
             @"CashDeskTakuADCell",
-            // 广告中台管理类
             @"AdCenter", @"AdsHandle", @"AdsCNManager",
         ];
     });
     return keys;
 }
 
-// 明确排除：地址业务（Adress/Address）与系统类
 static BOOL FCIsExcludedClass(NSString *cls) {
-    if ([cls rangeOfString:@"Adress" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
-    if ([cls rangeOfString:@"Address" options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
+    NSString *l = cls.lowercaseString;
+    if ([l rangeOfString:@"adress"].location != NSNotFound) return YES;
+    if ([l rangeOfString:@"address"].location != NSNotFound) return YES;
     if ([cls hasPrefix:@"_UI"] || [cls hasPrefix:@"UI"] || [cls hasPrefix:@"NS"] ||
         [cls isEqualToString:@"UIAlertController"] ||
         [cls isEqualToString:@"UIActivityViewController"] ||
         [cls hasPrefix:@"SFSafari"] || [cls hasPrefix:@"MFMail"] ||
-        [cls hasPrefix:@"QLPreview"]) return YES;
+        [cls hasPrefix:@"QLPreview"] || [cls isEqualToString:@"UILabel"]) return YES;
     return NO;
 }
 
@@ -81,48 +106,78 @@ static BOOL FCClassIsAd(NSString *cls) {
     for (NSString *k in FCAdClassKeys()) {
         if ([cls rangeOfString:k options:NSCaseInsensitiveSearch].location != NSNotFound) return YES;
     }
+    // 单词级强特征（开屏/插屏），排除地址业务同形词
+    NSString *l = cls.lowercaseString;
+    if ([l rangeOfString:@"adress"].location == NSNotFound &&
+        [l rangeOfString:@"address"].location == NSNotFound) {
+        if ([l rangeOfString:@"splash"].location != NSNotFound ||
+            [l rangeOfString:@"popupad"].location != NSNotFound ||
+            [l rangeOfString:@"launchad"].location != NSNotFound ||
+            [l rangeOfString:@"interstitial"].location != NSNotFound) return YES;
+    }
     return NO;
 }
 
-// NSClassFromString 对 Swift 类的两种命名都尝试
 static Class FCResolveClass(NSString *name) {
     Class c = NSClassFromString(name);
     if (c) return c;
-    c = NSClassFromString([@"HiveConsumer." stringByAppendingString:name]);
-    return c;
+    return NSClassFromString([@"HiveConsumer." stringByAppendingString:name]);
 }
 
-#pragma mark - 文案判定（window 级证据）
+#pragma mark - 文案判定
 
+// v1 原始判定：广告角标 + 动作组合（保留，处理激励广告）
 static BOOL FCTextsAreAd(NSArray<NSString *> *texts) {
     BOOL hasAdTag = NO, hasAction = NO;
     for (NSString *raw in texts) {
         NSString *s = [raw stringByTrimmingCharactersInSet:
                        [NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (s.length == 0) continue;
-
-        // 激励/开屏广告独有文案：命中一条即可
-        if ([s containsString:@"秒后可领奖励"] ||
-            [s containsString:@"后可领奖励"] ||
-            [s containsString:@"跳过广告"] ||
-            [s containsString:@"看广告"] ||
-            [s containsString:@"观看广告"] ||
-            [s containsString:@"看视频"] ||
-            [s containsString:@"免广告"] ||
-            [s containsString:@"继续观看"] ||
+        if ([s containsString:@"秒后可领奖励"] || [s containsString:@"后可领奖励"] ||
+            [s containsString:@"跳过广告"] || [s containsString:@"看广告"] ||
+            [s containsString:@"观看广告"] || [s containsString:@"看视频"] ||
+            [s containsString:@"免广告"] || [s containsString:@"继续观看"] ||
             [s containsString:@"可获得奖励"] ||
-            ([s containsString:@"再看"] && [s containsString:@"广告"])) {
-            return YES;
-        }
+            ([s containsString:@"再看"] && [s containsString:@"广告"])) return YES;
         if ([s isEqualToString:@"广告"] || [s isEqualToString:@"广告 |"] ||
             [s isEqualToString:@"广告｜"] ||
             ([s hasPrefix:@"广告"] && s.length <= 5)) hasAdTag = YES;
-        if ([s containsString:@"立即购买"] || [s containsString:@"立即开通"] ||
-            [s containsString:@"跳过"] || [s containsString:@"领奖励"] ||
-            [s containsString:@"去领奖"] || [s containsString:@"领取奖励"] ||
-            [s containsString:@"立即领取"]) hasAction = YES;
+        if ([s containsString:@"立即购买"] || [s containsString:@"跳过"] ||
+            [s containsString:@"领奖励"] || [s containsString:@"去领奖"] ||
+            [s containsString:@"领取奖励"] || [s containsString:@"立即领取"]) hasAction = YES;
     }
     return hasAdTag && hasAction;
+}
+
+// v2 新增：开屏强特征。真机开屏只有「跳过 2」无「广告」角标，v1 因此漏判。
+static BOOL FCTextsAreSplash(NSArray<NSString *> *texts) {
+    for (NSString *raw in texts) {
+        NSString *s = [raw stringByTrimmingCharactersInSet:
+                       [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if ([s containsString:@"摇动或点击"]) return YES;
+        if ([s containsString:@"跳转详情页"]) return YES;
+        if ([s containsString:@"点击查看详情"] && [s containsString:@"第三方"]) return YES;
+        if ([s hasPrefix:@"跳过"] && s.length <= 8) {
+            for (NSUInteger i = 2; i < s.length; i++) {
+                unichar ch = [s characterAtIndex:i];
+                if (ch >= '0' && ch <= '9') return YES;  // 「跳过 2」倒计时
+            }
+        }
+    }
+    return NO;
+}
+
+// v2 新增：页面运营位证据（只计浮标，不据此删主界面 cell，避免误伤）
+static BOOL FCTextsAreOperationAd(NSArray<NSString *> *texts) {
+    static NSArray *keys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        keys = @[@"百元券包", @"限量7折", @"寄件省钱卡", @"查价领返现", @"换季洗羽绒", @"任选3件"];
+    });
+    for (NSString *s in texts) {
+        for (NSString *k in keys) if ([s rangeOfString:k].location != NSNotFound) return YES;
+    }
+    return NO;
 }
 
 #pragma mark - 视图树文案收集
@@ -131,6 +186,7 @@ static void FCCollectText(UIView *v, NSMutableArray<NSString *> *out, int depth,
     if (!v || depth > 8 || out.count > 180 || *budget <= 0) return;
     *budget -= 1;
     if (v.hidden || v.alpha < 0.05) return;
+    if (v.tag == 9527) return;  // 跳过诊断浮标
 
     NSString *s = nil;
     if ([v isKindOfClass:[UILabel class]])       s = ((UILabel *)v).text;
@@ -151,7 +207,7 @@ static NSArray<NSString *> *FCTextsOf(UIView *root) {
     return out;
 }
 
-#pragma mark - 关闭广告
+#pragma mark - 关闭广告（公开 API，非 hook）
 
 static NSMapTable<UIViewController *, NSNumber *> *gFCAttempts = nil;
 
@@ -162,6 +218,7 @@ static UIControl *FCFindCloseControl(UIView *root, CGFloat screenW) {
     NSUInteger idx = 0;
     while (idx < queue.count && idx < 360) {
         UIView *v = queue[idx++];
+        if (v.tag == 9527) continue;
         if ([v isKindOfClass:[UIControl class]]) {
             UIControl *c = (UIControl *)v;
             NSString *t = [c isKindOfClass:[UIButton class]] ? ((UIButton *)c).currentTitle : nil;
@@ -169,16 +226,12 @@ static UIControl *FCFindCloseControl(UIView *root, CGFloat screenW) {
             NSString *low = both.lowercaseString;
             if ([low containsString:@"关闭"] || [low containsString:@"跳过"] ||
                 [low containsString:@"close"] || [low containsString:@"skip"] ||
-                [both containsString:@"×"] || [both containsString:@"✕"]) {
-                return c;
-            }
+                [both containsString:@"×"] || [both containsString:@"✕"]) return c;
             if (!topRight && c.enabled && !c.hidden) {
                 CGRect r = [c convertRect:c.bounds toView:nil];
                 if (r.origin.x > screenW - 150 && r.origin.y < 160 &&
                     r.size.width >= 12 && r.size.width <= 80 &&
-                    r.size.height >= 12 && r.size.height <= 80) {
-                    topRight = c;
-                }
+                    r.size.height >= 12 && r.size.height <= 80) topRight = c;
             }
         }
         for (UIView *s in v.subviews) [queue addObject:s];
@@ -186,18 +239,20 @@ static UIControl *FCFindCloseControl(UIView *root, CGFloat screenW) {
     return topRight;
 }
 
-static void FCCloseAd(UIViewController *vc, UIWindow *w) {
+static void FCCloseAd(UIViewController *vc, UIWindow *w, BOOL isSplash) {
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
     UIView *root = vc.view ?: w;
 
     UIControl *c = FCFindCloseControl(root, sw);
     if (c && c.enabled && !c.hidden) {
         [c sendActionsForControlEvents:UIControlEventTouchUpInside];
+        if (isSplash) gFCSplashHits++;
         FCLog(@"点了关闭按钮：%@（%@）", NSStringFromClass([vc class]), NSStringFromClass([c class]));
         return;
     }
     if (vc.presentingViewController) {
         [vc dismissViewControllerAnimated:NO completion:nil];
+        if (isSplash) gFCSplashHits++;
         FCLog(@"dismiss：%@", NSStringFromClass([vc class]));
         return;
     }
@@ -205,15 +260,17 @@ static void FCCloseAd(UIViewController *vc, UIWindow *w) {
     if (w && w != key && ![NSStringFromClass([w class]) hasPrefix:@"UI"]) {
         w.userInteractionEnabled = NO;
         w.hidden = YES;
+        if (isSplash) gFCSplashHits++;
         FCLog(@"隐藏独立广告 window：%@", NSStringFromClass([w class]));
         return;
     }
     UIView *mainView = w.rootViewController.view;
     for (UIView *s in [w.subviews copy]) {
-        if (s == mainView) continue;
+        if (s == mainView || s.tag == 9527) continue;
         NSString *sc = NSStringFromClass([s class]);
-        if (FCClassIsAd(sc) || FCTextsAreAd(FCTextsOf(s))) {
+        if (FCClassIsAd(sc) || FCTextsAreAd(FCTextsOf(s)) || FCTextsAreSplash(FCTextsOf(s))) {
             [s removeFromSuperview];
+            if (isSplash) gFCSplashHits++;
             FCLog(@"移除 keyWindow 广告覆盖层：%@", sc);
         }
     }
@@ -238,12 +295,27 @@ static NSArray<UIWindow *> *FCAllWindows(void) {
     return a;
 }
 
+static UIViewController *FCTopViewController(void) {
+    UIWindow *key = [UIApplication sharedApplication].keyWindow;
+    UIViewController *vc = key.rootViewController;
+    int guard = 0;
+    while (vc.presentedViewController && guard++ < 12) vc = vc.presentedViewController;
+    return vc;
+}
+
 static void FCScanOnce(void) {
-    for (UIWindow *w in FCAllWindows()) {
+    NSArray<UIWindow *> *windows = FCAllWindows();
+    gFCWindows = (NSUInteger)windows.count;
+    for (UIWindow *w in windows) {
         if (!w || w.hidden || w.alpha < 0.01) continue;
         NSString *wc = NSStringFromClass([w class]);
         if ([wc hasPrefix:@"UITextEffects"] || [wc hasPrefix:@"UIRemoteKeyboard"] ||
             [wc hasPrefix:@"_UI"] || [wc isEqualToString:@"_UITouchEffectWindow"]) continue;
+
+        NSArray<NSString *> *wtexts = FCTextsOf(w);
+        BOOL opAd = FCTextsAreOperationAd(wtexts);
+        if (opAd) gFCOpEvidence++;
+        BOOL splash = FCTextsAreSplash(wtexts);
 
         UIViewController *vc = w.rootViewController;
         int guard = 0;
@@ -251,24 +323,28 @@ static void FCScanOnce(void) {
             NSString *cls = NSStringFromClass([vc class]);
             NSInteger tried = [[gFCAttempts objectForKey:vc] integerValue];
             if (!FCIsExcludedClass(cls) && tried < 4) {
-                BOOL ad = FCClassIsAd(cls) || FCTextsAreAd(FCTextsOf(vc.view));
+                NSArray<NSString *> *vtexts = FCTextsOf(vc.view);
+                BOOL splashVC = FCTextsAreSplash(vtexts);
+                BOOL ad = FCClassIsAd(cls) || FCTextsAreAd(vtexts) || splashVC || splash;
                 if (ad) {
+                    gFCEvidences++;
                     [gFCAttempts setObject:@(tried + 1) forKey:vc];
-                    FCCloseAd(vc, w);
+                    FCCloseAd(vc, w, splash || splashVC);
                     break;
                 }
             }
             vc = vc.presentedViewController;
         }
 
-        // 广告作为 view 直接盖在 window 上
         if (w.subviews.count > 1) {
             UIView *mainView = w.rootViewController.view;
             for (UIView *s in [w.subviews copy]) {
-                if (s == mainView) continue;
+                if (s == mainView || s.tag == 9527) continue;
                 NSString *sc = NSStringFromClass([s class]);
-                if (FCClassIsAd(sc) || FCTextsAreAd(FCTextsOf(s))) {
+                NSArray<NSString *> *st = FCTextsOf(s);
+                if (FCClassIsAd(sc) || FCTextsAreAd(st) || FCTextsAreSplash(st)) {
                     [s removeFromSuperview];
+                    if (FCTextsAreSplash(st)) gFCSplashHits++;
                     FCLog(@"移除广告覆盖层：%@", sc);
                 }
             }
@@ -276,12 +352,76 @@ static void FCScanOnce(void) {
     }
 }
 
+#pragma mark - WKWebView H5 运营位注入（公开 API，非 hook）
+
+static void FCInjectWebViews(void) {
+    Class wk = NSClassFromString(@"WKWebView");
+    if (!wk) return;
+    SEL sel = NSSelectorFromString(@"evaluateJavaScript:completionHandler:");
+    NSDate *now = [NSDate date];
+    static char kKey;
+    gFCWebViewFound = 0;
+
+    for (UIWindow *w in FCAllWindows()) {
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
+        NSUInteger idx = 0;
+        while (idx < q.count && idx < 500) {
+            UIView *v = q[idx++];
+            if ([v isKindOfClass:wk]) {
+                gFCWebViewFound++;
+                NSDate *last = objc_getAssociatedObject(v, &kKey);
+                if (!last || [now timeIntervalSinceDate:last] > 1.5) {
+                    objc_setAssociatedObject(v, &kKey, now, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                    if ([v respondsToSelector:sel]) {
+                        IMP imp = [v methodForSelector:sel];
+                        if (imp) {
+                            void (^cb)(id, NSError *) = ^(id result, NSError *err){
+                                if (!err && result) {
+                                    NSInteger h = [NSString stringWithFormat:@"%@", result].integerValue;
+                                    if (h > (NSInteger)gFCH5Hits) gFCH5Hits = (NSUInteger)h;
+                                }
+                            };
+                            ((void (*)(id, SEL, NSString *, void (^)(id, NSError *)))imp)(v, sel, FCJSAdCards, cb);
+                        }
+                    }
+                }
+            }
+            for (UIView *sub in v.subviews) [q addObject:sub];
+        }
+    }
+}
+
+#pragma mark - 诊断浮标
+
+#ifdef FC_SHOW_BADGE
+static void FCUpdateBadge(void) {
+    UIWindow *key = [UIApplication sharedApplication].keyWindow;
+    if (!key) return;
+    UILabel *b = (UILabel *)[key viewWithTag:9527];
+    if (!b) {
+        b = [[UILabel alloc] initWithFrame:CGRectMake(0, 22, [UIScreen mainScreen].bounds.size.width, 18)];
+        b.tag = 9527;
+        b.font = [UIFont systemFontOfSize:9];
+        b.textColor = [UIColor whiteColor];
+        b.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.5];
+        b.textAlignment = NSTextAlignmentCenter;
+        b.userInteractionEnabled = NO;
+        b.adjustsFontSizeToFitWidth = YES;
+        [key addSubview:b];
+    }
+    NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
+    b.text = [NSString stringWithFormat:@"FCv2 窗%lu/证%lu/屏%lu/运%lu Web%lu H5%lu | %@",
+              (unsigned long)gFCWindows, (unsigned long)gFCEvidences, (unsigned long)gFCSplashHits,
+              (unsigned long)gFCOpEvidence, (unsigned long)gFCWebViewFound,
+              (unsigned long)gFCH5Hits, top];
+}
+#endif
+
 #pragma mark - B 档：源头拦截宿主自有广告类（不碰系统类）
 
 #ifdef FC_DEEP_HOOKS
 static id FCVoidStub(id self, SEL _cmd) { return nil; }
 
-// 只改「该类自己实现」的方法（class_copyMethodList），绝不沿继承链碰系统类
 static void FCSwizzleOwnMethods(NSString *clsName, NSArray<NSString *> *sels) {
     Class c = FCResolveClass(clsName);
     if (!c) return;
@@ -301,9 +441,6 @@ static void FCSwizzleOwnMethods(NSString *clsName, NSArray<NSString *> *sels) {
 }
 
 static void FCInstallDeepHooks(void) {
-    // 只拦截宿主自有广告类的展示/加载入口；不碰任何 UIKit / 系统类。
-    // selector 来自宿主方法表与广告语义，运行时用 class_copyMethodList 精确匹配，
-    // 匹配不到就跳过（Swift 类 selector 名称可能有变化，安全降级）。
     NSArray<NSArray *> *table = @[
         @[@"FCSplashADSManager", @[@"show", @"start", @"requestSplashAd", @"loadSplashAd", @"showSplashAd"]],
         @[@"SplashAdManager",    @[@"show", @"start", @"load", @"requestAd", @"showSplash"]],
@@ -323,11 +460,10 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v2 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            // 冷启动前 8 秒加密扫描，专门抓开屏广告；之后降到 0.3s
             __block NSInteger fastTicks = 0;
             NSTimer *fast = [NSTimer scheduledTimerWithTimeInterval:0.10 repeats:YES
                               block:^(NSTimer *t) {
@@ -336,8 +472,16 @@ static void FCAdBlockInit(void) {
             }];
             [[NSRunLoop mainRunLoop] addTimer:fast forMode:NSRunLoopCommonModes];
 
+            __block NSInteger slowTicks = 0;
             NSTimer *slow = [NSTimer scheduledTimerWithTimeInterval:0.30 repeats:YES
-                              block:^(NSTimer *t) { FCScanOnce(); }];
+                              block:^(NSTimer *t) {
+                FCScanOnce();
+                // 每 5 次（约 1.5s）重新注入一次 H5 脚本，覆盖页面跳转后的新 document
+                if (++slowTicks % 5 == 0) FCInjectWebViews();
+#ifdef FC_SHOW_BADGE
+                FCUpdateBadge();
+#endif
+            }];
             [[NSRunLoop mainRunLoop] addTimer:slow forMode:NSRunLoopCommonModes];
 
 #ifdef FC_DEEP_HOOKS
