@@ -1,10 +1,10 @@
 {
   "FCAdBlock_Pure_v17.dylib": {
-    "yes": ["FCv17", "FCAdBlock v17", "@rpath/FCAdBlock.dylib", "FCAdTypeClassTable", "FCAdGenericRoots", "SPSplashController", "TBBootImageSplashDO", "TBRewardKit", "TBTDBannerView", "MunionAdRequestMiddleware", "AKTsAlimamaAdAbility", "Taobao4iPhone.", "UINavigationControllerDidShowViewControllerNotification", "FCFlattenRecord", "u16:开屏", "u16:激励", "u16:横幅", "u16:联盟", "u16:100元寄件券包"],
+    "yes": ["FCv17", "FCAdBlock v17", "@rpath/FCAdBlock.dylib", "SPSplashController", "TBBootImageSplashDO", "TBRewardKit", "TBTDBannerView", "MunionAdRequestMiddleware", "AKTsAlimamaAdAbility", "MMAdBizOrange", "UINavigationControllerDidShowViewControllerNotification", "FCFlattenRecord", "u16:开屏", "u16:激励", "u16:插屏", "u16:横幅", "u16:联盟", "u16:运营位", "u16:100元寄件券包", "u16:浮标已自动吸附右边缘", "u16:页面诊断"],
     "no": ["CydiaSubstrate", "MobileSubstrate", "DynamicLibraries", "MSHook", "_logos_", "libsubstrate"]
   },
   "FCAdBlock_Deep_v17.dylib": {
-    "yes": ["FCv17", "@rpath/FCAdBlock.dylib", "FCAdTypeClassTable", "method_setImplementation", "TBCashRewardService", "MunionAdRequestMiddleware"],
+    "yes": ["FCv17", "@rpath/FCAdBlock.dylib", "method_setImplementation", "TBCashRewardService", "MunionAdRequestMiddleware", "u16:激励"],
     "no": ["CydiaSubstrate", "MobileSubstrate", "DynamicLibraries", "MSHook", "_logos_", "libsubstrate"]
   }
 }
