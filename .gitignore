@@ -3,3 +3,7 @@ packages/
 out/
 *.deb
 .DS_Store
+_dl_v*/
+dylib_download/
+_crash_v40/
+.tmpchk/

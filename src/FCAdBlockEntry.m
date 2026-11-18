@@ -1,5 +1,22 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v40（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v41（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v41 相对 v40（老大 v40 真机：注入后淘宝**闪退**，.ips 已定位到本插件）：
+//    【崩溃铁证】Taobao4iPhone-2026-11-19-002646.ips：EXC_BAD_ACCESS(SIGSEGV)
+//    KERN_INVALID_ADDRESS at 0x3fffffff，faultingThread = com.apple.uikit.datasource.diffing，
+//    栈为 [objc_retain + 8] ← [FCAdBlock_Deep_v40 + 0x182EC] ← [initializeRootView + 316]
+//    ← cellForItemAtIndexPath ← _createAndAppendViewAnimationsForInserts ← performBatchUpdates。
+//    反汇编核对：0x182EC 正是 FCHookSetHeightSpec 里 objc_getAssociatedObject 之后那条
+//    objc_retainAutoreleasedReturnValue（stub 0x1951c/0x19594 已按 indirect symtab 验证）。
+//    【根因】v40 在被拦实例的 setter 里**同步**调 invalidateLayout/beginUpdates-endUpdates。
+//    diffable data source 正在做 insert 动画、预取 cell 的过程中重入布局，正在初始化的
+//    DXRootView 被提前释放 → initializeRootView 拿着野指针继续调 setOriginalHeightSpec:
+//    → hook 第一行读关联对象就把垃圾指针交给 ARC retain → 崩。另外 FCZeroDXHeightSpec 用
+//    valueForKey: 读 originalHeightSpec 旧值，在半初始化对象上同样会拿到垃圾指针（同类风险）。
+//    【修法】① 重排改为「弱引用入队 FCEnqueueRelayout」+「扫描 tick 里 FCPerformPendingRelayout
+//    统一执行」，hook 内绝不再同步重排；② 高度规格改「只写不读」，直接 objc_msgSend setter @0，
+//    不再 KVC 读旧值；③ hook 内不再对 spec 做 FCProbeRecord/[description] 内省；④ 加重入闸。
+//    例行 __fcadVer 40→41。
 //
 //  v40 相对 v39（老大 v39 真机：浮标 FCv39 压3→压15，但白块不但没消、反而更大——天猫图标和
 //  淘宝秒杀卡也一起没了，商品流起点仍在 y≈590）：
@@ -367,6 +384,7 @@
 #import <UIKit/UIKit.h>
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
+#import <objc/message.h>   // v41：只写不读地调 setter，避免 KVC/读属性碰到野指针
 
 #define FCLog(fmt, ...) NSLog((@"[FCAdBlock] " fmt), ##__VA_ARGS__)
 
@@ -404,15 +422,16 @@ static void FCPruneBlockedCellShells(void);                  // v37：外壳 cel
 static void FCZeroRotorCellIfEmpty(UIView *cell);            // v38：满宽矮轮播空壳 cell → 压0（不依赖源头痕迹）
 static void FCPruneRotorCells(void);                         // v38：轮播空壳自愈——内部出现正常文字即还原
 static void FCZeroDXHeightSpec(UIView *root);                 // v40：把被拦 root 的 DX 高度规格置0（真减高度）
-static void FCTriggerHostRelayout(UIView *v);                 // v40：通知宿主列表 invalidateLayout 重排
+static void FCEnqueueRelayout(UIView *v);                     // v41：重排只入队（弱引用），绝不在 cell 配置期同步重排
+static void FCPerformPendingRelayout(void);                   // v41：扫描 tick 里统一执行入队的重排
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===40){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=40;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===41){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=41;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1211,59 +1230,82 @@ static NSUInteger gFCHeightZeroSkip = 0;
 // v40：v39 几何空壳压0 的开关（停用：压子视图不减高度，且会误伤正常运营位；留代码便于回退）
 static const BOOL gFCRotorEnabled = NO;
 
-#pragma mark - v40：DX 高度规格归零（唯一能真正减高度的入口）
-// 注意：这两个函数必须放在 #ifdef FC_DEEP_HOOKS 之外——扫描阶段在 A/Pure 档也会调用，
+#pragma mark - v40/v41：DX 高度规格归零（唯一能真正减高度的入口）
+// 注意：这几个函数必须放在 #ifdef FC_DEEP_HOOKS 之外——扫描阶段在 A/Pure 档也会调用，
 // 定义若留在 Deep 段内，A 档会报 "function has internal linkage but is not defined"(DL4 坑)。
 
-// v40：通知最近的宿主列表重算 item 尺寸。
-// 真机铁证：v35 与 v39 两版商品流起点都在 y≈590，中间 480pt 高度纹丝不动——
-// 说明高度不是内容撑的，而是 DX 高度规格 / 宿主 collection item 给的。
-// 只压子视图永远是「删内容留空壳」，必须让宿主重新布局才塌得下去。
-static void FCTriggerHostRelayout(UIView *v) {
-    UIView *p = v.superview;
-    int guard = 0;
-    while (p && guard++ < 10) {
-        if ([p isKindOfClass:[UICollectionView class]]) {
-            @try {
-                UICollectionView *cv = (UICollectionView *)p;
-                if (cv.collectionViewLayout) [cv.collectionViewLayout invalidateLayout];
-                [cv setNeedsLayout];
-            } @catch (NSException *e) { }
-            return;
+// v41：重排从「同步执行」改成「弱引用入队 + 扫描 tick 统一执行」。
+// v40 真机崩溃根因（.ips 铁证：objc_retain + 8 崩在 0x3fffffff，栈为
+// cellForItemAtIndexPath → initializeRootView → 本插件）：
+// 在 diffable update 的 cell 配置链上同步调 invalidateLayout，UIKit 正在做 insert
+// 动画/预取 cell，重入布局把「正在初始化的 root」提前释放；随后 initializeRootView
+// 继续用野指针调 setOriginalHeightSpec:，hook 第一行读关联对象就 retain 到垃圾指针。
+// 现在 hook 里只入队，真正 invalidateLayout 挪到 0.12s 扫描 tick（runloop 边界、
+// 不在任何 UIKit update 事务里）。弱引用表还自带「view 已释放即消失」的兜底。
+static NSHashTable *gFCRelayoutViews = nil;   // 弱引用：view 被释放自动从表里消失，不会野指针
+
+static void FCEnqueueRelayout(UIView *v) {
+    if (!v || !v.superview) return;           // 已离树的没必要重排
+    if (!gFCRelayoutViews) gFCRelayoutViews = [NSHashTable weakObjectsHashTable];
+    if (gFCRelayoutViews.count > 32) [gFCRelayoutViews removeAllObjects];  // 上限，防长会话堆积
+    [gFCRelayoutViews addObject:v];
+}
+
+// v41：真正的重排。只在扫描 tick 里调用——主线程、runloop 边界、绝不在 cell 配置期。
+static void FCPerformPendingRelayout(void) {
+    if (!gFCRelayoutViews.count) return;
+    NSArray *snap = gFCRelayoutViews.allObjects;   // 已释放的 view 不会出现在这里
+    [gFCRelayoutViews removeAllObjects];
+    for (UIView *v in snap) {
+        UIView *p = v.superview;
+        int guard = 0;
+        while (p && guard++ < 10) {
+            if ([p isKindOfClass:[UICollectionView class]]) {
+                @try {
+                    UICollectionView *cv = (UICollectionView *)p;
+                    if (cv.collectionViewLayout) [cv.collectionViewLayout invalidateLayout];
+                    [cv setNeedsLayout];
+                } @catch (NSException *e) { }
+                break;
+            }
+            if ([p isKindOfClass:[UITableView class]]) {
+                @try {
+                    UITableView *tv = (UITableView *)p;
+                    [tv beginUpdates];
+                    [tv endUpdates];
+                } @catch (NSException *e) { }
+                break;
+            }
+            p = p.superview;
         }
-        if ([p isKindOfClass:[UITableView class]]) {
-            @try {
-                UITableView *tv = (UITableView *)p;
-                [tv beginUpdates];
-                [tv endUpdates];
-            } @catch (NSException *e) { }
-            return;
-        }
-        p = p.superview;
     }
 }
 
 // v40：把被拦 DXRootView 的高度规格（originalHeightSpec）置 0。
-// 安全边界：只在 spec 是 NSNumber 时改写；自定义 spec 对象（Weex WXLength 之类）不硬塞，
-// 只记日志等下一版按类型处理——宁可这版无效，也不能把引擎布局搞崩。
+// v41：**只写不读**。v40 用 valueForKey: 读回旧值 → 在半初始化/已释放的 DX 对象上
+// 会把垃圾指针当对象 retain（正是这次闪退的崩溃点）。写 0 不需要读旧值，直接调 setter。
+// 另外只碰「自己实现了该 setter」的对象；没有就跳过计数，绝不 KVC 兜底。
 static void FCZeroDXHeightSpec(UIView *root) {
     if (!root) return;
     if (objc_getAssociatedObject(root, &kFCHeightZeroed)) return;   // 每个 root 只做一次
-    id spec = nil;
-    @try { spec = [root valueForKey:@"originalHeightSpec"]; } @catch (NSException *e) { }
-    if (!spec) return;                       // 还没设置，等下一轮再试（幂等，不计数）
-    objc_setAssociatedObject(root, &kFCHeightZeroed, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-    if (![spec isKindOfClass:[NSNumber class]]) {
+    SEL setter = @selector(setOriginalHeightSpec:);
+    if (![root respondsToSelector:setter]) { gFCHeightZeroSkip++; return; }
+    // v41：签名校验——参数必须是对象(@)，否则别拿 id 去调（结构体传值会毁栈）。
+    NSMethodSignature *sig = [root methodSignatureForSelector:setter];
+    if (!sig || sig.numberOfArguments < 3 || [sig getArgumentTypeAtIndex:2][0] != '@') {
         gFCHeightZeroSkip++;
-        FCLog(@"v40 高度规格非 NSNumber，跳过: %@ (%@)", NSStringFromClass([spec class]), spec);
         return;
     }
-    if ([spec doubleValue] <= 0.5) return;   // 已经是 0，不必重写
-    @try { [root setValue:@0 forKey:@"originalHeightSpec"]; }
-    @catch (NSException *e) { gFCHeightZeroSkip++; FCLog(@"v40 高度规格写入失败: %@", e.reason); return; }
-    gFCHeightZeroOK++;
-    FCLog(@"v40 高度规格置0: 原 %@ (%@)", spec, NSStringFromClass([root class]));
-    FCTriggerHostRelayout(root);
+    objc_setAssociatedObject(root, &kFCHeightZeroed, @YES, OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @try {
+        ((void (*)(id, SEL, id))objc_msgSend)(root, setter, @0);
+        gFCHeightZeroOK++;
+    } @catch (NSException *e) {
+        gFCHeightZeroSkip++;
+        FCLog(@"v41 高度规格置0失败: %@", e.reason);
+        return;
+    }
+    FCEnqueueRelayout(root);
 }
 
 // v32：规则是否仍匹配这条记录（与 FCRestoreFlattenedIfNeeded 同口径）
@@ -1597,6 +1639,9 @@ static void FCScanOnce(void) {
         }
     }
     FCApplyNativeRules();
+    // v41：把本 tick 里入队的宿主重排放到扫描末尾统一做——定时器回调里执行，
+    // 不在任何 UIKit update 事务中，避免 v40 那种「cell 配置期重入布局 → 野指针」闪退。
+    FCPerformPendingRelayout();
 }
 
 #pragma mark - 找触点下最底层 view / 原生容器
@@ -2936,23 +2981,23 @@ static void FCAppendHeightOwnerDiag(void) {
             if (![NSStringFromClass([v class]) isEqualToString:@"DXRootView"]) continue;
             if (!objc_getAssociatedObject(v, &kFCBlockedRoot) &&
                 !objc_getAssociatedObject(v, &kFCZeroRec)) continue;
-            id spec = nil;
-            @try { spec = [v valueForKey:@"originalHeightSpec"]; } @catch (NSException *e) { }
+            // v41：只查「有没有 setter」，不读 originalHeightSpec 的值——
+            // 上一版就是读回值把垃圾指针当对象 retain 崩掉的（objc_retain 0x3fffffff）。
+            BOOL canSet = [v respondsToSelector:@selector(setOriginalHeightSpec:)];
             UIView *host = v.superview; int g = 0;
             while (host && g++ < 10 && ![host isKindOfClass:[UICollectionView class]] &&
                    ![host isKindOfClass:[UITableView class]]) host = host.superview;
             CGRect r = [v convertRect:v.bounds toView:nil];
             [out addObject:[NSString stringWithFormat:
-                @"%@ | %.0fx%.0f @y%.0f | spec=%@ (%@) | 宿主=%@ | 已归零=%@",
+                @"%@ | %.0fx%.0f @y%.0f | setter=%@ | 宿主=%@ | 已归零=%@",
                 NSStringFromClass([v class]), r.size.width, r.size.height, r.origin.y,
-                spec ? [spec description] : @"nil",
-                spec ? NSStringFromClass([spec class]) : @"-",
+                canSet ? @"有" : @"无",
                 host ? NSStringFromClass([host class]) : @"无",
                 objc_getAssociatedObject(v, &kFCHeightZeroed) ? @"是" : @"否"]];
         }
     }
     FCAppendDiagText([NSString stringWithFormat:
-        @"[高度归零] 成功 %lu / 跳过 %lu（spec 非NSNumber或写失败）",
+        @"[高度归零] 成功 %lu / 跳过 %lu（v41 只写不读，不再读 spec 旧值）",
         (unsigned long)gFCHeightZeroOK, (unsigned long)gFCHeightZeroSkip]);
     if (!out.count) { FCAppendDiagText(@"[高度归属] 当前无被拦 DXRootView（可能还没滚到运营位）"); return; }
     FCAppendDiagText([NSString stringWithFormat:@"[高度归属] 被拦 root %lu 个:", (unsigned long)out.count]);
@@ -2962,7 +3007,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v40 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v41 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡 %lu",
@@ -3428,7 +3473,7 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv40 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv41 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBuiltinBlocked, (unsigned long)gFCNativeHits,
         (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
@@ -3441,7 +3486,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv40 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv41 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3452,7 +3497,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v40"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v41"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3633,18 +3678,30 @@ static BOOL gFCDeepScanned = NO;   // v31：secondfloor 深扫只做一次，避
 #pragma mark - v40：高度规格 hook（Deep 档）
 
 static void FCHookSetHeightSpec(id self, SEL _cmd, id spec) {
-    // 已判定拦截的实例：无论谁在什么时候设高度，一律压成 0 —— 从布局源头掐掉那个空槽。
-    if (objc_getAssociatedObject(self, &kFCBlockedRoot) ||
-        objc_getAssociatedObject(self, &kFCZeroRec)) {
-        if ([spec isKindOfClass:[NSNumber class]] && [spec doubleValue] > 0.5) {
-            @try { FCProbeRecord(@"DXRootView.setOriginalHeightSpec→0", spec); } @catch (NSException *e) { }
-            if (gFCOrigSetHeightSpec) ((void (*)(id, SEL, id))gFCOrigSetHeightSpec)(self, _cmd, @0);
-            gFCHeightZeroOK++;
-            FCTriggerHostRelayout((UIView *)self);
-            return;
-        }
+    // v41：重入保护——我们给原 IMP 传 @0 后，若原实现内部又回调本 setter，
+    // 没有这道闸就会无限递归（表现为栈爆/随机崩）。重入时一律原样透传。
+    static BOOL inHeightHook = NO;
+    if (inHeightHook) {
+        if (gFCOrigSetHeightSpec) ((void (*)(id, SEL, id))gFCOrigSetHeightSpec)(self, _cmd, spec);
+        return;
     }
-    if (spec) @try { FCProbeRecord(@"DXRootView.setOriginalHeightSpec", spec); } @catch (NSException *e) { }
+    // 已判定拦截的实例：无论谁在什么时候设高度，一律压成 0 —— 从布局源头掐掉那个空槽。
+    BOOL blocked = NO;
+    @try {
+        blocked = (objc_getAssociatedObject(self, &kFCBlockedRoot) ||
+                   objc_getAssociatedObject(self, &kFCZeroRec)) != nil;
+    } @catch (NSException *e) { }
+    if (blocked && [spec isKindOfClass:[NSNumber class]] && [spec doubleValue] > 0.5) {
+        inHeightHook = YES;
+        if (gFCOrigSetHeightSpec) ((void (*)(id, SEL, id))gFCOrigSetHeightSpec)(self, _cmd, @0);
+        inHeightHook = NO;
+        gFCHeightZeroOK++;
+        // v41：只入队。v40 在这里同步 invalidateLayout，撞上 cell 配置期 → 野指针闪退。
+        FCEnqueueRelayout((UIView *)self);
+        return;
+    }
+    // v41：不再对 spec 做 FCProbeRecord/[description] 内省——DX 半初始化对象上
+    // 读属性可能拿到垃圾指针并被 ARC retain（本次闪退的另一条同类路径）。
     if (gFCOrigSetHeightSpec) ((void (*)(id, SEL, id))gFCOrigSetHeightSpec)(self, _cmd, spec);
 }
 
@@ -3708,7 +3765,15 @@ static void FCInstallProbeHooks(void) {
         if (t) { gFCOrigSetTemplate = method_getImplementation(t); method_setImplementation(t, (IMP)FCHookSetTemplate); }
         // v40：高度规格 setter——把被拦运营位的高度从布局源头置 0
         Method hs = FCOwnMethod(root, @"setOriginalHeightSpec:");
-        if (hs) { gFCOrigSetHeightSpec = method_getImplementation(hs); method_setImplementation(hs, (IMP)FCHookSetHeightSpec); }
+        // v41：先验签名，参数必须是对象(@)。万一宿主把它写成 C 结构体（CGSize/WXLength 传值），
+        // 用 id 签名去调会把栈搅烂——宁可不 hook，也不能崩。
+        NSMethodSignature *hsSig = [root instanceMethodSignatureForSelector:@selector(setOriginalHeightSpec:)];
+        BOOL hsOK = (hsSig && hsSig.numberOfArguments >= 3 && [hsSig getArgumentTypeAtIndex:2][0] == '@');
+        if (hs && hsOK) {
+            gFCOrigSetHeightSpec = method_getImplementation(hs);
+            method_setImplementation(hs, (IMP)FCHookSetHeightSpec);
+        }
+        FCLog(@"v41 高度 setter hook=%d(签名%@)", hs ? 1 : 0, hsOK ? @"对象" : @"非对象·已跳过");
     }
     Class cell = NSClassFromString(@"DXScrollerLayoutCell");
     if (cell) {
@@ -3747,7 +3812,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v40 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v41 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
