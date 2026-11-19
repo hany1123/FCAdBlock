@@ -36,6 +36,9 @@ NS_ASSUME_NONNULL_BEGIN
 @property (nonatomic, assign) NSTimeInterval cost;      // 秒
 @property (nonatomic, copy)   NSString *source;         // 协议/会话/连接
 @property (nonatomic, copy, nullable) NSString *note;   // 被哪条规则改过 / 被拦
+// v56：可疑度（0 = 正常）。采集时按 URL 关键词粗算；做过「全站分析」后会被
+// 结构分（响应体里的广告字段）覆盖，列表据此标红。
+@property (nonatomic, assign) NSInteger suspectScore;
 @property (nonatomic, assign) BOOL failed;
 @property (nonatomic, copy, nullable) NSString *errText;
 @end
@@ -133,6 +136,10 @@ BOOL FCNetPatternIsValid(NSString * _Nullable pattern);
 @end
 
 FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void);
+
+// v56：只按 URL 关键词算一个粗分（不解析响应体，采集线程上可以调）。
+// >=3 表示「这条 URL 本身就像广告接口」，列表据此标红。
+NSInteger FCNetUrlSuspectScore(NSString * _Nullable url);
 
 // 启动时调一次：恢复开关状态、装好 NSURLProtocol
 void FCNetBootstrap(void);

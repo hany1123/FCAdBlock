@@ -342,7 +342,7 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     NSString *pattern = FCNetAutoPatternForURL(rec.url);
 
     // ---------- 接口概要 ----------
-    [rep appendString:@"===== 接口 =====\n"];
+    [rep appendString:@"▍接口\n"];
     [rep appendFormat:@"%@ %@\n", rec.method ?: @"?", rec.url ?: @"-"];
     [rep appendFormat:@"状态 %ld · 响应 %@ · %.0fms · 来源 %@\n",
      (long)rec.status,
@@ -351,7 +351,7 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     if (rec.note.length) [rep appendFormat:@"标记 %@\n", rec.note];
 
     // ---------- 请求参数 ----------
-    [rep appendString:@"\n===== 请求参数 =====\n"];
+    [rep appendString:@"\n▍请求参数\n"];
     NSURLComponents *comp = [NSURLComponents componentsWithString:rec.url ?: @""];
     NSArray<NSURLQueryItem *> *q = comp.queryItems;
     if (q.count) {
@@ -378,7 +378,7 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     }
 
     // ---------- 响应结构 ----------
-    [rep appendString:@"\n===== 响应结构 =====\n"];
+    [rep appendString:@"\n▍响应结构\n"];
     id resp = rec.respBody.length
         ? [NSJSONSerialization JSONObjectWithData:rec.respBody options:0 error:nil] : nil;
 
@@ -451,7 +451,7 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     }
 
     // ---------- 广告特征 ----------
-    [rep appendString:@"\n===== 广告特征 =====\n"];
+    [rep appendString:@"\n▍广告特征\n"];
     NSInteger urlScore = FCAdScoreForKey(rec.url ?: @"");
     if (urlScore > 0) {
         total += urlScore;
@@ -468,7 +468,7 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     else if (total >= 3) a.verdict = [NSString stringWithFormat:@"疑似含广告字段（%ld 分）", (long)total];
     else if (total > 0)  a.verdict = [NSString stringWithFormat:@"弱广告特征（%ld 分）", (long)total];
     else                 a.verdict = @"未发现广告特征";
-    [rep appendFormat:@"判定：**%@**\n", a.verdict];
+    [rep appendFormat:@"判定：%@\n", a.verdict];
 
     // ---------- 兜底建议：阻断 ----------
     [rules addObject:@{
@@ -479,10 +479,9 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     }];
 
     // ---------- 建议清单 ----------
-    [rep appendString:@"\n===== 建议动作 =====\n"];
+    [rep appendString:@"\n▍建议动作\n"];
     if (rules.count == 1) {
-        [rep appendString:@"（只有「阻断」这一条。响应体里没有找到可精确改写的字段——\n"
-                       @"  布尔开关/广告数组都没有，说明这条接口的数据结构不直接暴露广告标记。）\n"];
+        [rep appendString:@"（没找到可精确改写的开关，只剩阻断）\n"];
     }
     for (NSUInteger i = 0; i < rules.count; i++) {
         [rep appendFormat:@"%lu. %@\n", (unsigned long)(i + 1),
@@ -614,12 +613,11 @@ FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void) {
     g.recordCount = recs.count;
     if (!recs.count) {
         g.verdict = @"还没抓到数据";
-        g.report = @"还没有抓到任何请求，所以没法分析。\n\n"
-                    @"按这三步来：\n"
-                    @"① 确认上面的大按钮显示「采集：开（正在记录流量）」\n"
-                    @"② 回到 App 里点几下、往下拉刷新几次\n"
-                    @"③ 再回来点这个按钮\n\n"
-                    @"（图片/视频/脚本这类资源不记录，只记录 App 和后端之间的接口请求）";
+        g.report = @"▍还没有记录\n"
+                    @"① 确认上面是「采集：开」\n"
+                    @"② 回 App 点几下、下拉刷新\n"
+                    @"③ 再点这个按钮\n\n"
+                    @"只记录接口请求，图片/视频不算。";
         return g;
     }
 
@@ -689,36 +687,35 @@ FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void) {
     g.rules = rules;
     g.suspectCount = suspects;
 
-    // ---------- 写报告：结论 → 最可疑 → 三步走 → 排行 ----------
+    // ---------- 写报告 ----------
+    // v56：老大要求「精简说明文字」。原来一段「三种原因」占 4 行、三步走占 4 行，
+    // 手机上要滑三屏才看得完。现在压到：结论 1~2 行、可疑条目 2~3 行、下一步 3 行。
     NSMutableString *rep = [NSMutableString string];
-    [rep appendString:@"===== 结论 =====\n"];
-    [rep appendFormat:@"共抓到 %lu 条请求，归成 %lu 个接口。\n",
-     (unsigned long)g.recordCount, (unsigned long)g.groupCount];
+    [rep appendString:@"▍结论\n"];
     if (!rules.count) {
-        g.verdict = @"没发现可以一键处理的广告";
-        [rep appendString:@"没有发现明显的广告开关或广告列表，暂时没有能自动改的地方。\n\n"
-                       @"这种情况通常有三种原因：\n"
-                       @"  · 广告还没加载（回 App 刷新几次，广告出来后再分析）\n"
-                       @"  · 广告内容混在别的字段里，没有被识别出来\n"
-                       @"  · 这个 App 的广告走的是图片/视频，不是接口数据\n"];
+        g.verdict = @"没找到能自动关的广告开关";
+        [rep appendFormat:@"%lu 条请求 / %lu 个接口 · 可自动改 0 处\n",
+         (unsigned long)g.recordCount, (unsigned long)g.groupCount];
+        [rep appendString:@"原因：广告还没刷出来，或广告不在接口里（图片/视频）。\n"];
     } else {
-        g.verdict = [NSString stringWithFormat:@"发现 %lu 个可疑接口，可关闭 %lu 处广告开关",
+        g.verdict = [NSString stringWithFormat:@"%lu 个可疑接口 · 可关 %lu 处",
                      (unsigned long)suspects, (unsigned long)rules.count];
-        [rep appendFormat:@"其中 %lu 个接口很像广告来源，我找到了 **%lu 处能直接改的地方**。\n",
+        [rep appendFormat:@"%lu 条请求 / %lu 个接口\n",
+         (unsigned long)g.recordCount, (unsigned long)g.groupCount];
+        [rep appendFormat:@"可疑接口 %lu 个 · 可自动关 %lu 处（红色是可疑的）\n",
          (unsigned long)suspects, (unsigned long)rules.count];
     }
 
     // 最可疑的 5 个
-    [rep appendString:@"\n===== 最可疑的接口 =====\n"];
+    [rep appendString:@"\n▍最可疑\n"];
     NSUInteger shown = 0;
     for (FCNetGroupStat *st in stats) {
         if (st.score <= 0 || shown >= 5) break;
         shown++;
         NSString *u = st.sample;
         if (u.length > 78) u = [[u substringToIndex:78] stringByAppendingString:@"…"];
-        [rep appendFormat:@"%ld 分 · 抓到 %lu 次\n  %@\n", (long)st.score,
-         (unsigned long)st.hits, u];
-        if (st.why.length) [rep appendFormat:@"  为什么可疑：%@\n", st.why];
+        [rep appendFormat:@"%ld分 ×%lu  %@\n", (long)st.score, (unsigned long)st.hits, u];
+        if (st.why.length) [rep appendFormat:@"  ↳ %@\n", st.why];
         if (st.rules.count) {
             NSMutableArray *names = [NSMutableArray array];
             for (NSDictionary *r in st.rules) {
@@ -726,31 +723,27 @@ FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void) {
                 if (n.length) [names addObject:n];
             }
             if (names.count) {
-                [rep appendFormat:@"  我能帮你：%@\n", [names componentsJoinedByString:@" / "]];
+                [rep appendFormat:@"  ↳ 可改：%@\n", [names componentsJoinedByString:@" / "]];
             }
         }
-        [rep appendString:@"\n"];
     }
-    if (!shown) [rep appendString:@"（没有分数为正的接口，见上面结论里的三种原因）\n"];
+    if (!shown) [rep appendString:@"没有分数为正的接口\n"];
 
-    // 三步走
-    [rep appendString:@"===== 你要做的（不用懂代码） =====\n"];
+    // 下一步
+    [rep appendString:@"\n▍下一步\n"];
     if (rules.count) {
-        [rep appendFormat:@"1. 点右上角「一键处理」——我把上面 %lu 处开关改成关闭\n",
+        [rep appendFormat:@"1 点右上「一键处理」→ 关掉 %lu 处\n",
          (unsigned long)rules.count];
-        [rep appendString:@"2. 回到 App，下拉刷新页面，看广告有没有少\n"
-                       @"3. 少了 → 完事；还有 → 回来再点一次「全站分析」，把新出现的加进去\n"
-                       @"   完全没用 → 点上面「规则」，把刚加的删掉，不会有副作用\n"];
+        [rep appendString:@"2 回 App 下拉刷新看效果\n"
+                       @"3 还有广告 → 再来一次；误伤 → 规则里删掉\n"];
     } else {
-        [rep appendString:@"1. 回 App 把广告刷出来（多点几个页面）\n"
-                       @"2. 回来再点「全站分析」\n"];
+        [rep appendString:@"1 回 App 把广告刷出来（多点几个页面）\n"
+                       @"2 回来再点「一键分析」\n"];
     }
-    [rep appendString:@"\n说明：我不会自动帮你「阻断」接口。阻断会让页面缺块甚至白屏，\n"
-                   @"      风险太大。确实想彻底断掉某个接口，进那条记录的详情页手动加。\n"];
+    [rep appendString:@"不断接口（会白屏），要断请进单条详情手动加。\n"];
 
     // 排行
-    [rep appendString:@"\n===== 接口排行（分数高的在上面） =====\n"];
-    [rep appendString:@"分   次数  接口\n"];
+    [rep appendString:@"\n▍接口排行\n"];
     NSUInteger rank = 0;
     for (FCNetGroupStat *st in stats) {
         if (rank >= 20) break;
@@ -761,18 +754,23 @@ FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void) {
         if (c.host.length) {
             shortU = [NSString stringWithFormat:@"%@%@", c.host, c.path ?: @"/"];
         }
-        if (shortU.length > 52) shortU = [[shortU substringToIndex:52] stringByAppendingString:@"…"];
-        [rep appendFormat:@"%4ld  %4lu  %@\n", (long)st.score, (unsigned long)st.hits, shortU];
+        if (shortU.length > 46) shortU = [[shortU substringToIndex:46] stringByAppendingString:@"…"];
+        [rep appendFormat:@"%3ld ×%-3lu %@\n", (long)st.score, (unsigned long)st.hits, shortU];
     }
     if (stats.count > 20) {
-        [rep appendFormat:@"…另有 %lu 个接口（分数都在 %ld 以下）\n",
+        [rep appendFormat:@"…另有 %lu 个接口（都在 %ld 分以下）\n",
          (unsigned long)(stats.count - 20), (long)(stats.count ? stats[19].score : 0)];
     }
     if (scored >= FC_GLOBAL_MAX_SCORE_RECORDS) {
-        [rep appendFormat:@"\n（记录太多，只细算了前 %lu 条请求；其余按网址粗算）\n",
+        [rep appendFormat:@"（只细算了前 %lu 条请求）\n",
          (unsigned long)FC_GLOBAL_MAX_SCORE_RECORDS];
     }
 
     g.report = rep;
     return g;
+}
+
+NSInteger FCNetUrlSuspectScore(NSString *url) {
+    if (!url.length) return 0;
+    return FCAdScoreForKey(url);
 }

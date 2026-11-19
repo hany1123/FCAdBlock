@@ -12,6 +12,82 @@
 static UIWindow *gNetWin = nil;
 static id gNetVC = nil;
 
+#pragma mark - v56：配色与报告着色
+
+// 一套颜色就够，不再散落在各处手写 RGB。
+static UIColor *FCInk(void)    { return [UIColor colorWithRed:0.11 green:0.12 blue:0.15 alpha:1]; }
+static UIColor *FCMuted(void)  { return [UIColor colorWithRed:0.56 green:0.58 blue:0.63 alpha:1]; }
+static UIColor *FCDeep(void)   { return [UIColor colorWithRed:0.16 green:0.26 blue:0.44 alpha:1]; }
+static UIColor *FCRed(void)    { return [UIColor colorWithRed:0.85 green:0.20 blue:0.16 alpha:1]; }
+static UIColor *FCOrange(void) { return [UIColor colorWithRed:0.86 green:0.45 blue:0.08 alpha:1]; }
+static UIColor *FCGreen(void)  { return [UIColor colorWithRed:0.13 green:0.56 blue:0.31 alpha:1]; }
+static UIColor *FCBg(void)     { return [UIColor colorWithRed:0.95 green:0.955 blue:0.97 alpha:1]; }
+static UIColor *FCLine(void)   { return [UIColor colorWithRed:0.89 green:0.90 blue:0.92 alpha:1]; }
+static UIColor *FCBlue(void)   { return [UIColor colorWithRed:0.13 green:0.45 blue:0.85 alpha:1]; }
+
+// 报告原来是一整块纯文本，所有行一个颜色——老大要「可疑的数据用红色标记」。
+// 这里按行判定轻重：小节标题深蓝加粗，可疑项整行红，可执行动作橙，正常/无分项灰。
+// 判定只看行首特征和关键词，不解析语义——报告格式是本文件自己产的，稳定可控。
+static NSAttributedString *FCNetReportAttr(NSString *text) {
+    NSMutableAttributedString *out = [NSMutableAttributedString new];
+    if (!text.length) return out;
+
+    UIFont *base  = [UIFont systemFontOfSize:11.5];
+    UIFont *mono  = [UIFont fontWithName:@"Menlo" size:10.5] ?: base;
+    NSMutableParagraphStyle *ps = [NSMutableParagraphStyle new];
+    ps.lineSpacing = 2.5;
+    ps.paragraphSpacing = 1.0;
+
+    NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
+    for (NSString *line in lines) {
+        UIFont *f = base;
+        UIColor *col = FCInk;
+        NSString *trim = [line stringByTrimmingCharactersInSet:
+                          [NSCharacterSet whitespaceCharacterSet]];
+
+        if ([trim hasPrefix:@"▍"]) {                       // 小节标题
+            f = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
+            col = FCDeep;
+        } else if ([trim hasPrefix:@"↳"]) {                // 原因 / 可改
+            col = FCOrange;
+        } else if ([trim containsString:@"★"] || [trim containsString:@"判定："] ||
+                   [trim containsString:@"很可能是广告"]) {
+            col = FCRed;                                    // 广告特征命中
+            f = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
+        } else if ([trim hasPrefix:@"✓"]) {
+            col = FCGreen;
+        } else if ([trim containsString:@"·可疑"]) {       // 低分但仍带广告词
+            col = FCOrange;
+        } else if ([trim hasPrefix:@"http"] || [trim hasPrefix:@"GET "] ||
+                   [trim hasPrefix:@"POST "] || [trim hasPrefix:@"PUT "] ||
+                   [trim hasPrefix:@"DELETE "]) {           // 接口地址
+            f = mono;
+            col = [UIColor colorWithRed:0.30 green:0.38 blue:0.52 alpha:1];
+        } else if ([trim containsString:@"×"]) {
+            // 「9分 ×4  url」可疑条目 / 「  9 ×4   host/path」排行行
+            NSScanner *sc = [NSScanner scannerWithString:trim];
+            NSInteger score = 0;
+            if ([sc scanInteger:&score]) {
+                if (score >= 3)      { col = FCRed; }
+                else if (score > 0)  { col = FCOrange; }
+                else                 { col = FCMuted; }
+            }
+        } else if ([trim hasPrefix:@"⚠"]) {
+            col = FCOrange;
+        }
+
+        NSString *body = line.length ? line : @" ";
+        [out appendAttributedString:[[NSAttributedString alloc]
+            initWithString:body
+                attributes:@{NSFontAttributeName: f,
+                             NSForegroundColorAttributeName: col,
+                             NSParagraphStyleAttributeName: ps}]];
+        [out appendAttributedString:[[NSAttributedString alloc]
+            initWithString:@"\n" attributes:@{NSParagraphStyleAttributeName: ps}]];
+    }
+    return out;
+}
+
 #pragma mark - 格式化工具
 
 static NSString *FCNetSizeText(NSUInteger n) {
@@ -61,20 +137,24 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
                                       timeStyle:NSDateFormatterMediumStyle]];
     if (r.note.length) [s appendFormat:@"标记 %@\n", r.note];
     if (r.failed && r.errText.length) [s appendFormat:@"错误 %@\n", r.errText];
-    [s appendString:@"\n===== 请求头 =====\n"];
+    [s appendString:@"\n▍请求头\n"];
     [s appendString:FCNetHeadersText(r.reqHeaders)];
-    [s appendString:@"\n===== 请求体 =====\n"];
+    [s appendString:@"\n▍请求体\n"];
     [s appendString:FCNetBodyText(r.reqBody)];
-    [s appendString:@"\n===== 响应头 =====\n"];
+    [s appendString:@"\n▍响应头\n"];
     [s appendString:FCNetHeadersText(r.respHeaders)];
-    [s appendString:@"\n===== 响应体 =====\n"];
+    [s appendString:@"\n▍响应体\n"];
     [s appendString:FCNetBodyText(r.respBody)];
     return s;
 }
 
 #pragma mark - 列表 cell
 
+// v56：列表改卡片式（白底圆角 + 间距），左侧一条细色条表示状态：
+// 红=疑似广告接口、橙=失败、绿=正常。原来整屏白板 + 灰字，一条条分不出轻重。
 @interface FCNetCell : UITableViewCell
+@property (nonatomic, strong) UIView *card;
+@property (nonatomic, strong) UIView *bar;
 @property (nonatomic, strong) UILabel *line1;
 @property (nonatomic, strong) UILabel *line2;
 @property (nonatomic, strong) UILabel *right;
@@ -84,32 +164,50 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 - (instancetype)initWithStyle:(UITableViewCellStyle)style reuseIdentifier:(NSString *)reuseIdentifier {
     self = [super initWithStyle:style reuseIdentifier:reuseIdentifier];
     if (!self) return nil;
-    self.backgroundColor = [UIColor whiteColor];
-    self.selectionStyle = UITableViewCellSelectionStyleDefault;
+    self.backgroundColor = [UIColor clearColor];
+    self.contentView.backgroundColor = [UIColor clearColor];
+    self.selectionStyle = UITableViewCellSelectionStyleNone;
+
+    _card = [[UIView alloc] init];
+    _card.backgroundColor = [UIColor whiteColor];
+    _card.layer.cornerRadius = 10;
+    _card.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+    _card.layer.borderColor = FCLine().CGColor;
+    [self.contentView addSubview:_card];
+
+    _bar = [[UIView alloc] init];
+    _bar.backgroundColor = [UIColor clearColor];
+    _bar.layer.cornerRadius = 1.5;
+    [_card addSubview:_bar];
+
     _line1 = [[UILabel alloc] init];
-    _line1.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-    _line1.textColor = [UIColor colorWithRed:0.1 green:0.1 blue:0.12 alpha:1];
+    _line1.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightMedium];
+    _line1.textColor = FCInk();
     _line1.lineBreakMode = NSLineBreakByTruncatingMiddle;
-    [self.contentView addSubview:_line1];
+    [_card addSubview:_line1];
+
     _line2 = [[UILabel alloc] init];
-    _line2.font = [UIFont systemFontOfSize:10];
-    _line2.textColor = [UIColor colorWithRed:0.45 green:0.45 blue:0.5 alpha:1];
+    _line2.font = [UIFont systemFontOfSize:10.5];
+    _line2.textColor = FCMuted();
     _line2.lineBreakMode = NSLineBreakByTruncatingTail;
-    [self.contentView addSubview:_line2];
+    [_card addSubview:_line2];
+
     _right = [[UILabel alloc] init];
-    _right.font = [UIFont systemFontOfSize:11 weight:UIFontWeightSemibold];
+    _right.font = [UIFont systemFontOfSize:11.5 weight:UIFontWeightSemibold];
     _right.textAlignment = NSTextAlignmentRight;
-    [self.contentView addSubview:_right];
+    [_card addSubview:_right];
     return self;
 }
 - (void)layoutSubviews {
     [super layoutSubviews];
     CGFloat w = self.contentView.bounds.size.width;
     CGFloat h = self.contentView.bounds.size.height;
-    _right.frame = CGRectMake(w - 96, 8, 88, 16);
-    _line1.frame = CGRectMake(12, 8, w - 12 - 100, 16);
-    _line2.frame = CGRectMake(12, 26, w - 24, 14);
-    (void)h;
+    CGFloat cw = w - 24;
+    _card.frame = CGRectMake(12, 3, cw, h - 6);
+    _bar.frame = CGRectMake(0, 12, 3, h - 24);
+    _right.frame = CGRectMake(cw - 74, 10, 60, 16);
+    _line1.frame = CGRectMake(13, 10, cw - 13 - 80, 16);
+    _line2.frame = CGRectMake(13, 29, cw - 26, 14);
 }
 @end
 
@@ -167,7 +265,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 
 - (void)viewDidLoad {
     [super viewDidLoad];
-    self.view.backgroundColor = [UIColor colorWithRed:0.96 green:0.96 blue:0.97 alpha:1];
+    self.view.backgroundColor = FCBg();
     CGFloat w = self.view.bounds.size.width;
     // v52：顶部留白按真实状态栏算。硬写 44 在灵动岛机型（54pt）上会压住状态栏，
     // 在无刘海机型上又空出一截。statusBarFrame 已废弃但仍可用，取最大值兜底。
@@ -178,14 +276,20 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     UIView *bar = [[UIView alloc] initWithFrame:CGRectMake(0, top, w, 40)];
     bar.backgroundColor = [UIColor whiteColor];
     [self.view addSubview:bar];
+    UIView *barHair = [[UIView alloc] initWithFrame:CGRectMake(0, 39.5, w, 0.5)];
+    barHair.backgroundColor = FCLine();
+    [bar addSubview:barHair];
 
     CGFloat x = 8;
     UIButton *(^mk)(NSString *, SEL) = ^UIButton *(NSString *title, SEL act) {
         UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
         b.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
         [b setTitle:title forState:UIControlStateNormal];
-        b.backgroundColor = [UIColor colorWithRed:0.94 green:0.95 blue:0.97 alpha:1];
-        b.layer.cornerRadius = 6;
+        [b setTitleColor:FCDeep() forState:UIControlStateNormal];
+        b.backgroundColor = [UIColor whiteColor];
+        b.layer.cornerRadius = 8;
+        b.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+        b.layer.borderColor = FCLine().CGColor;
         [b addTarget:self action:act forControlEvents:UIControlEventTouchUpInside];
         return b;
     };
@@ -201,8 +305,11 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 
     // 开关按钮单独一行（要显示当前状态，文字会变）
     self.toggleBtn = mk(@"采集：关", @selector(fcToggle));
-    self.toggleBtn.frame = CGRectMake(8, top + 40, w - 16, 26);
-    self.toggleBtn.backgroundColor = [UIColor colorWithRed:0.2 green:0.55 blue:0.95 alpha:1];
+    self.toggleBtn.frame = CGRectMake(12, top + 46, w - 24, 30);
+    self.toggleBtn.backgroundColor = FCGreen();
+    self.toggleBtn.layer.cornerRadius = 9;
+    self.toggleBtn.layer.borderWidth = 0;
+    self.toggleBtn.titleLabel.font = [UIFont systemFontOfSize:12.5 weight:UIFontWeightSemibold];
     [self.toggleBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [self.view addSubview:self.toggleBtn];
     [self syncToggleTitle];
@@ -210,84 +317,107 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     // v55：一键分析——老大要的是「没有基础的人也能傻瓜式完成」，所以放一个整行大按钮，
     // 不需要先理解列表、不需要先选中某条记录、不需要懂 JSON。
     self.analyzeAllBtn = mk(@"🧠 一键分析全部流量（给建议）", @selector(fcAnalyzeAll));
-    self.analyzeAllBtn.frame = CGRectMake(8, top + 70, w - 16, 32);
-    self.analyzeAllBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    self.analyzeAllBtn.backgroundColor = [UIColor colorWithRed:0.95 green:0.5 blue:0.12 alpha:1];
+    self.analyzeAllBtn.frame = CGRectMake(12, top + 84, w - 24, 38);
+    self.analyzeAllBtn.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightSemibold];
+    self.analyzeAllBtn.backgroundColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.10 alpha:1];
+    self.analyzeAllBtn.layer.cornerRadius = 11;
+    self.analyzeAllBtn.layer.borderWidth = 0;
+    self.analyzeAllBtn.layer.shadowColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.10 alpha:1].CGColor;
+    self.analyzeAllBtn.layer.shadowOpacity = 0.30;
+    self.analyzeAllBtn.layer.shadowRadius = 7;
+    self.analyzeAllBtn.layer.shadowOffset = CGSizeMake(0, 4);
     [self.analyzeAllBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [self.view addSubview:self.analyzeAllBtn];
 
     // v53：状态行——上一版面板什么都没显示，老大只能说「没有记录」，
     // 分不清是「没开采集」「开了但一条没抓到」还是「抓到了但列表是空的」。
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, top + 108, w - 20, 14)];
-    self.statusLabel.font = [UIFont systemFontOfSize:10];
-    self.statusLabel.textColor = [UIColor colorWithRed:0.42 green:0.45 blue:0.5 alpha:1];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, top + 130, w - 28, 14)];
+    self.statusLabel.font = [UIFont systemFontOfSize:10.5];
+    self.statusLabel.textColor = FCMuted();
     [self.view addSubview:self.statusLabel];
 
     // 搜索框
-    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, top + 126, w, 36)];
-    self.search.placeholder = @"过滤：方法 / 域名 / 路径 / 状态码";
+    UIView *searchWrap = [[UIView alloc] initWithFrame:CGRectMake(12, top + 150, w - 24, 36)];
+    searchWrap.backgroundColor = [UIColor whiteColor];
+    searchWrap.layer.cornerRadius = 9;
+    searchWrap.layer.borderWidth = 1.0 / [UIScreen mainScreen].scale;
+    searchWrap.layer.borderColor = FCLine().CGColor;
+    [self.view addSubview:searchWrap];
+    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(2, 0, w - 28, 36)];
+    self.search.searchBarStyle = UISearchBarStyleMinimal;
+    self.search.placeholder = @"过滤：方法 / 域名 / 路径";
     self.search.delegate = self;
     self.search.backgroundImage = [[UIImage alloc] init];
-    [self.view addSubview:self.search];
+    [searchWrap addSubview:self.search];
 
-    CGFloat listTop = top + 166;   // v55：多了一键分析大按钮，列表相应下移
+    CGFloat listTop = top + 192;
     self.table = [[UITableView alloc] initWithFrame:CGRectMake(0, listTop, w, self.view.bounds.size.height - listTop)
                                               style:UITableViewStylePlain];
     self.table.dataSource = self;
     self.table.delegate = self;
-    self.table.rowHeight = 48;
-    self.table.separatorInset = UIEdgeInsetsMake(0, 12, 0, 12);
+    self.table.rowHeight = 58;
+    self.table.backgroundColor = [UIColor clearColor];
+    self.table.separatorStyle = UITableViewCellSeparatorStyleNone;
+    self.table.contentInset = UIEdgeInsetsMake(6, 0, 24, 0);
+    self.table.showsVerticalScrollIndicator = NO;
     [self.view addSubview:self.table];
 
     // v53：空状态说明——列表为空时告诉老大「为什么空、该做什么」，
     // 而不是让他面对一个白板猜。
-    self.emptyLabel = [[UILabel alloc] initWithFrame:CGRectMake(24, listTop + 40, w - 48, 160)];
+    self.emptyLabel = [[UILabel alloc] initWithFrame:CGRectMake(28, listTop + 50, w - 56, 170)];
     self.emptyLabel.numberOfLines = 0;
     self.emptyLabel.textAlignment = NSTextAlignmentCenter;
-    self.emptyLabel.font = [UIFont systemFontOfSize:12];
-    self.emptyLabel.textColor = [UIColor colorWithRed:0.55 green:0.57 blue:0.62 alpha:1];
+    self.emptyLabel.font = [UIFont systemFontOfSize:12.5];
+    self.emptyLabel.textColor = FCMuted();
     self.emptyLabel.text =
         @"还没有记录\n\n"
-        @"① 确认上面按钮显示「采集：开」\n"
-        @"② 回到 App 里点几下、下拉刷新，制造网络请求\n"
-        @"③ 图片/脚本/字体等静态资源不记录（只看 API 接口）\n\n"
-        @"抓到之后点橙色「一键分析全部流量」，\n"
-        @"我会直接告诉你能关掉哪些广告。\n\n"
-        @"若已产生请求仍无记录，点「模式」看是否处于安全模式。";
+        @"① 上面要是「采集：开」\n"
+        @"② 回 App 点几下、下拉刷新\n"
+        @"③ 图片/脚本不算，只看接口\n\n"
+        @"然后点橙色「一键分析」，\n红色就是可疑的广告接口。";
     self.emptyLabel.hidden = YES;
     [self.view addSubview:self.emptyLabel];
 
     // 详情层（默认隐藏）
-    self.detailBar = [[UIView alloc] initWithFrame:CGRectMake(0, top, w, 40)];
+    self.detailBar = [[UIView alloc] initWithFrame:CGRectMake(0, top, w, 44)];
     self.detailBar.backgroundColor = [UIColor whiteColor];
     self.detailBar.hidden = YES;
+    UIView *dbarHair = [[UIView alloc] initWithFrame:CGRectMake(0, 43.5, w, 0.5)];
+    dbarHair.backgroundColor = FCLine();
+    [self.detailBar addSubview:dbarHair];
     UIButton *back = mk(@"← 返回", @selector(fcBack));
-    back.frame = CGRectMake(8, 7, 72, 26);
+    back.frame = CGRectMake(10, 8, 70, 28);
     [self.detailBar addSubview:back];
     // v54：一键分析——放在最显眼的位置，这是本轮的主要入口
     UIButton *analyze = mk(@"🔍 分析", @selector(fcAnalyze));
-    analyze.frame = CGRectMake(88, 7, 76, 26);
-    analyze.backgroundColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    analyze.frame = CGRectMake(88, 8, 72, 28);
+    analyze.backgroundColor = [UIColor colorWithRed:1.0 green:0.45 blue:0.10 alpha:1];
+    analyze.layer.borderWidth = 0;
+    analyze.layer.cornerRadius = 9;
     [analyze setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [analyze setTitleColor:[UIColor whiteColor] forState:UIControlStateHighlighted];
     [self.detailBar addSubview:analyze];
     // v54：分析结果页才出现——把建议规则一键加进规则引擎（v55：全站模式下变「一键处理」）
     self.applyBtn = mk(@"＋ 添加建议", @selector(fcApplySuggestions));
-    self.applyBtn.frame = CGRectMake(w - 200, 7, 124, 26);
-    self.applyBtn.backgroundColor = [UIColor colorWithRed:0.15 green:0.6 blue:0.3 alpha:1];
+    self.applyBtn.frame = CGRectMake(w - 202, 8, 128, 28);
+    self.applyBtn.backgroundColor = FCGreen();
+    self.applyBtn.layer.borderWidth = 0;
+    self.applyBtn.layer.cornerRadius = 9;
     [self.applyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.applyBtn.hidden = YES;
     [self.detailBar addSubview:self.applyBtn];
     UIButton *copyOne = mk(@"复制", @selector(fcCopyOne));
-    copyOne.frame = CGRectMake(w - 66, 7, 58, 26);
+    copyOne.frame = CGRectMake(w - 66, 8, 56, 28);
     [self.detailBar addSubview:copyOne];
     [self.view addSubview:self.detailBar];
 
-    self.detail = [[UITextView alloc] initWithFrame:CGRectMake(0, top + 40, w,
-                                                              self.view.bounds.size.height - top - 40)];
+    self.detail = [[UITextView alloc] initWithFrame:CGRectMake(0, top + 44, w,
+                                                              self.view.bounds.size.height - top - 44)];
     self.detail.editable = NO;
-    self.detail.font = [UIFont fontWithName:@"Menlo" size:10] ?: [UIFont systemFontOfSize:10];
+    self.detail.selectable = YES;
+    self.detail.alwaysBounceVertical = YES;
+    self.detail.textContainerInset = UIEdgeInsetsMake(16, 16, 30, 16);   // v56：留白
     self.detail.backgroundColor = [UIColor whiteColor];
-    self.detail.textColor = [UIColor colorWithRed:0.12 green:0.12 blue:0.15 alpha:1];
     self.detail.hidden = YES;
     [self.view addSubview:self.detail];
 
@@ -298,9 +428,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     BOOL on = FCNetEnabled();
     [self.toggleBtn setTitle:(on ? @"采集：开（正在记录流量）" : @"采集：关（点这里开启）")
                     forState:UIControlStateNormal];
-    self.toggleBtn.backgroundColor = on
-        ? [UIColor colorWithRed:0.15 green:0.6 blue:0.3 alpha:1]
-        : [UIColor colorWithRed:0.55 green:0.55 blue:0.6 alpha:1];
+    self.toggleBtn.backgroundColor = on ? FCGreen() : FCMuted();
 }
 
 - (void)reloadRows {
@@ -337,12 +465,14 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     if (FCNetEnabled()) {
         mode = FCNetListenOnly() ? @"安全模式（不接管）" : @"接管采集中";
     }
+    NSUInteger hot = 0;
+    for (FCNetRecord *r in self.rows) if (r.suspectScore >= 3) hot++;
+    NSString *tail = hot ? [NSString stringWithFormat:@" · 可疑 %lu", (unsigned long)hot] : @"";
     self.statusLabel.text = [NSString stringWithFormat:
-        @"%@ · 接管 %lu · 记录 %lu · 跳过静态 %lu",
+        @"%@ · 接管 %lu · 记录 %lu%@",
         mode,
         (unsigned long)FCNetHandledCount(),
-        (unsigned long)FCNetRecordCount(),
-        (unsigned long)FCNetStaticSkipCount()];
+        (unsigned long)FCNetRecordCount(), tail];
 }
 
 #pragma mark 动作
@@ -431,7 +561,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.analysis = nil;
     self.showingAnalysis = NO;
 
-    self.detail.text = g.report;
+    self.detail.attributedText = FCNetReportAttr(g.report);   // v56：可疑标红
     self.detail.contentOffset = CGPointZero;
     self.detail.hidden = NO;
     self.detailBar.hidden = NO;
@@ -442,12 +572,31 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.statusLabel.hidden = YES;
     self.emptyLabel.hidden = YES;
 
-    self.applyBtn.hidden = (g.rules.count == 0);
-    [self.applyBtn setTitle:(g.rules.count
-                             ? [NSString stringWithFormat:@"一键处理 %lu 处",
-                                (unsigned long)g.rules.count]
-                             : @"无需处理")
+    // v56：老大反馈「报告可以生成，没有一键处理」——上一版在「0 处可改」时把按钮藏了，
+    // 看起来像功能没做。现在按钮常显：有活干就说能关几处，没活干就给手动入口。
+    BOOL has = (g.rules.count > 0);
+    self.applyBtn.hidden = NO;
+    self.applyBtn.enabled = YES;
+    self.applyBtn.backgroundColor = has ? FCGreen()
+                                        : [UIColor colorWithRed:0.55 green:0.58 blue:0.63 alpha:1];
+    [self.applyBtn setTitle:(has ? [NSString stringWithFormat:@"一键处理 %lu 处",
+                                    (unsigned long)g.rules.count]
+                                 : @"怎么手动改")
                    forState:UIControlStateNormal];
+
+    // v56：把每一族的结构分写回记录，返回列表时这些接口就是红的。
+    // 只看 URL 关键词会漏掉 /v2/m/d 这类接口——它们的可疑点全在响应体里。
+    NSMutableDictionary<NSString *, NSNumber *> *scoreOf = [NSMutableDictionary dictionary];
+    for (FCNetGroupStat *st in g.groups) {
+        if (st.pattern.length && st.score > 0) scoreOf[st.pattern] = @(st.score);
+    }
+    if (scoreOf.count) {
+        for (FCNetRecord *r in FCNetRecords()) {
+            NSString *pat = FCNetAutoPatternForURL(r.url ?: @"");
+            NSNumber *sc = pat.length ? scoreOf[pat] : nil;
+            if (sc && sc.integerValue > r.suspectScore) r.suspectScore = sc.integerValue;
+        }
+    }
 
     if (!g.recordCount) {
         [self toast:@"还没有记录，先回 App 刷新几次"];
@@ -463,7 +612,18 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 // 对「没基础的人」来说是不可接受的副作用，这条路只能留在详情页手动做。
 - (void)fcApplyGlobal {
     NSArray<NSDictionary *> *rules = self.globalAnalysis.rules;
-    if (!rules.count) { [self toast:@"没有可处理的项目"]; return; }
+    if (!rules.count) {
+        // 不是「失败」，是「这次没找到」。给两条能立刻走的路，别让老大对着提示发呆。
+        UIAlertController *ac = [UIAlertController
+            alertControllerWithTitle:@"这次没有能自动改的"
+            message:@"广告开关没被认出来。\n\n"
+                     @"① 回 App 多点几个页面，把广告刷出来，再点一次「一键分析」\n"
+                     @"② 或进列表点某一条 →「分析」，看那条有没有可加的建议"
+            preferredStyle:UIAlertControllerStyleAlert];
+        [ac addAction:[UIAlertAction actionWithTitle:@"知道了" style:UIAlertActionStyleCancel handler:nil]];
+        [self fcPresent:ac];
+        return;
+    }
 
     UIAlertController *ac = [UIAlertController
         alertControllerWithTitle:@"一键处理"
@@ -494,10 +654,11 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.showingAnalysis = YES;
     self.showingGlobal = NO;                  // v55：单条模式
     self.globalAnalysis = nil;
-    self.detail.text = self.analysis.report;
+    self.detail.attributedText = FCNetReportAttr(self.analysis.report);   // v56：可疑标红
     self.detail.contentOffset = CGPointZero;
     self.applyBtn.hidden = NO;
     self.applyBtn.enabled = YES;
+    self.applyBtn.backgroundColor = FCGreen();
     [self.applyBtn setTitle:@"＋ 添加建议" forState:UIControlStateNormal];
     // 建议多于「只有阻断」时才值得提示，否则老大点了也只有一个选项
     if (self.analysis.suggestedRules.count > 1) {
@@ -551,7 +712,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.toggleBtn.hidden = NO;
     self.analyzeAllBtn.hidden = NO;   // v55
     self.statusLabel.hidden = NO;
-    self.detail.text = nil;
+    self.detail.attributedText = nil;
     self.currentDetailRecord = nil;
     // v54：退出详情时清掉分析状态，否则下次点开别的记录还带着上一份报告
     self.analysis = nil;
@@ -561,6 +722,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.showingGlobal = NO;
     self.applyBtn.hidden = YES;
     self.applyBtn.enabled = YES;
+    self.applyBtn.backgroundColor = FCGreen();
     [self.applyBtn setTitle:@"＋ 添加建议" forState:UIControlStateNormal];
     [self reloadRows];   // v53：回来时重算空状态与计数
 }
@@ -847,6 +1009,12 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     FCNetCell *c = [tableView dequeueReusableCellWithIdentifier:cid];
     if (!c) c = [[FCNetCell alloc] initWithStyle:UITableViewCellStyleDefault reuseIdentifier:cid];
     FCNetRecord *r = self.rows[indexPath.row];
+    // v56：可疑接口标红——左侧色条 + 接口名。判据是 suspectScore（采集时按 URL 关键词粗算，
+    // 做过「全站分析」后会被结构分覆盖，所以 /v2/m/d 这种没关键词的接口也能被认出来）。
+    BOOL hot = (r.suspectScore >= 3);
+    c.bar.backgroundColor = hot ? FCRed()
+                                : (r.failed ? FCOrange() : [UIColor clearColor]);
+    c.line1.textColor = hot ? FCRed() : FCInk();
     c.line1.text = [NSString stringWithFormat:@"%@  %@%@", r.method ?: @"?", r.host ?: @"", r.path ?: @""];
     c.line2.text = [NSString stringWithFormat:@"%@ · %@ · %.0fms · %@",
                     r.respBody.length ? FCNetSizeText(r.respBody.length) : @"-",
@@ -872,7 +1040,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     [tableView deselectRowAtIndexPath:indexPath animated:YES];
     FCNetRecord *r = self.rows[indexPath.row];
     self.currentDetailRecord = r;
-    self.detail.text = FCNetDetailText(r);
+    self.detail.attributedText = FCNetReportAttr(FCNetDetailText(r));   // v56：着色
     self.detail.hidden = NO;
     self.detailBar.hidden = NO;
     self.table.hidden = YES;

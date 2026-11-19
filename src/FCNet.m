@@ -396,6 +396,7 @@ void FCNetClearRecords(void) {
     rec.date = [NSDate date];
     rec.method = origin.HTTPMethod.length ? origin.HTTPMethod.uppercaseString : @"GET";
     rec.url = origin.URL.absoluteString;
+    rec.suspectScore = FCNetUrlSuspectScore(rec.url);   // v56：列表标红用
     rec.host = origin.URL.host;
     rec.path = origin.URL.path.length ? origin.URL.path : @"/";
     rec.reqHeaders = FCNetHeaders([origin allHTTPHeaderFields]);
@@ -617,6 +618,7 @@ static NSURLSessionDataTask *FCHookDataTaskCH(id self, SEL _cmd, NSURLRequest *r
         rec.date = [NSDate date];
         rec.method = method;
         rec.url = req.URL.absoluteString;
+        rec.suspectScore = FCNetUrlSuspectScore(rec.url);   // v56
         rec.host = req.URL.host;
         rec.path = req.URL.path.length ? req.URL.path : @"/";
         rec.reqHeaders = FCNetHeaders([req allHTTPHeaderFields]);
@@ -656,6 +658,7 @@ static NSURLSessionDataTask *FCHookDataTask(id self, SEL _cmd, NSURLRequest *req
     rec.date = [NSDate date];
     rec.method = req.HTTPMethod.length ? req.HTTPMethod.uppercaseString : @"GET";
     rec.url = req.URL.absoluteString;
+    rec.suspectScore = FCNetUrlSuspectScore(rec.url);   // v56
     rec.host = req.URL.host;
     rec.path = req.URL.path.length ? req.URL.path : @"/";
     rec.reqHeaders = FCNetHeaders([req allHTTPHeaderFields]);
