@@ -149,7 +149,6 @@
    "FCNetAnalyzeAllRecords",
    "FCNetGlobalAnalysis",
    "FCNetGroupStat",
-   "FCScoreRecordQuick",
    "u16:一键分析全部流量",
    "u16:一键处理",
    "u16:===== 结论 =====",
@@ -160,7 +159,8 @@
    "u16:开始处理",
    "u16:还没抓到数据",
    "u16:没发现可以一键处理的广告",
-   "u16:为什么可疑"
+   "u16:为什么可疑",
+   "u16:只细算了前"
   ],
   "no": [
    "CydiaSubstrate",
@@ -324,7 +324,6 @@
    "FCNetAnalyzeAllRecords",
    "FCNetGlobalAnalysis",
    "FCNetGroupStat",
-   "FCScoreRecordQuick",
    "u16:一键分析全部流量",
    "u16:一键处理",
    "u16:===== 结论 =====",
@@ -335,7 +334,8 @@
    "u16:开始处理",
    "u16:还没抓到数据",
    "u16:没发现可以一键处理的广告",
-   "u16:为什么可疑"
+   "u16:为什么可疑",
+   "u16:只细算了前"
   ],
   "no": [
    "CydiaSubstrate",
