@@ -23,7 +23,6 @@ static UIColor *FCOrange(void) { return [UIColor colorWithRed:0.86 green:0.45 bl
 static UIColor *FCGreen(void)  { return [UIColor colorWithRed:0.13 green:0.56 blue:0.31 alpha:1]; }
 static UIColor *FCBg(void)     { return [UIColor colorWithRed:0.95 green:0.955 blue:0.97 alpha:1]; }
 static UIColor *FCLine(void)   { return [UIColor colorWithRed:0.89 green:0.90 blue:0.92 alpha:1]; }
-static UIColor *FCBlue(void)   { return [UIColor colorWithRed:0.13 green:0.45 blue:0.85 alpha:1]; }
 
 // 报告原来是一整块纯文本，所有行一个颜色——老大要「可疑的数据用红色标记」。
 // 这里按行判定轻重：小节标题深蓝加粗，可疑项整行红，可执行动作橙，正常/无分项灰。
