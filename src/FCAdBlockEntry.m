@@ -1,5 +1,19 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v51（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v52（任意 App 通用 + 进程内网络抓包/重写/拦截）
+//
+//  v52 相对 v51（老大原话：「可以使用所有 app，根据页面上的元素点击隐藏内容，所以不能按一个 app
+//  的框架写死；另外把通过网络接口抓包的功能进行加强…可以对数据进行重写、请求拦截等各种操作」）
+//    【方向一·通用化】把「按淘宝/丰巢框架写死」拆成两层：
+//      ① 专属规则包（FCPackForCurrentApp）：丰巢的词表/类名、淘宝的 DX 模板身份，
+//         全部按 BundleID 自动挂载；其它 App 三张内置表一律返回空 → 不会拿淘宝规则误伤别人。
+//      ② 通用能力（点选 + 容器识别 + 多指纹规则）对所有 App 一致生效。
+//    【方向二·网络模块】新增 FCNet.h / FCNet.m / FCNetPanel.m：
+//      · 进程内明文可见（TLS 在 App 进程内已解开，不需要证书、不受 SSL Pinning 影响）；
+//      · 采集请求地址/方法/请求头/请求体 + 响应码/响应头/响应体/耗时；
+//      · 规则引擎：block 阻断 / mock 伪造响应 / 改请求头 / 改请求体 / 改响应头 / 改响应体；
+//      · 面板：列表 + 搜索 + 详情 + 一键「按这条生成规则」三步向导。
+//    注：NSURLProtocol 是合法 API 不是 hook，Pure 档同样具备完整的采集/重写/拦截；
+//        只有 NSURLSession 的 task/delegate 旁听放在 #ifdef FC_DEEP_HOOKS 内。
 //
 //  v51 相对 v50（老大 v50 真机截图：「这里会误判为导航栏」）
 //    【现场】两张截图，浮标都写着 `FCv50 顶部保护区(搜索/导航)不处理`：
@@ -526,6 +540,7 @@
 #import <Foundation/Foundation.h>
 #import <objc/runtime.h>
 #import <objc/message.h>   // v41：只写不读地调 setter，避免 KVC/读属性碰到野指针
+#import "FCNet.h"          // v52：进程内网络抓包 / 重写 / 拦截
 
 #define FCLog(fmt, ...) NSLog((@"[FCAdBlock] " fmt), ##__VA_ARGS__)
 
@@ -577,8 +592,8 @@ static NSString *FCTemplateNameOfView(UIView *v);              // v50：pos 规�
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===51){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=51;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===52){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=52;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -682,7 +697,8 @@ static BOOL FCIsUnsafeClassRule(NSString *rule) {
         return NO;
     }
     if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."] || [rule hasPrefix:@"img:"] ||
-        [rule hasPrefix:@"cls:"] || [rule hasPrefix:@"sel:"]) return NO;
+        [rule hasPrefix:@"cls:"] || [rule hasPrefix:@"sel:"] ||
+        [rule hasPrefix:@"path:"]) return NO;   // v52：结构指纹是用户点选产物，不按 class 规则检查
     // 只把「首字母大写、纯字母」的串当作 class 规则来检查
     unichar h = [rule characterAtIndex:0];
     if (!(h >= 'A' && h <= 'Z')) return NO;
@@ -790,6 +806,7 @@ static NSString *FCJSSafe(NSString *s) {
     // v13：指纹规则（sel: CSS 路径 / pos: 坐标）必须完整保留，截断就失效；改用更长上限
     NSUInteger cap = ([s hasPrefix:@"sel:"] || [s hasPrefix:@"pos:"] ||
                       [s hasPrefix:@"cls:"] || [s hasPrefix:@"img:"] ||
+                      [s hasPrefix:@"path:"] ||                     // v52：结构指纹两段类名
                       [s hasPrefix:@"tpl:"]) ? 160 : 40;   // v29：tpl: 模板名必须完整保留
     if (s.length > cap) s = [s substringToIndex:cap];
     return s;
@@ -804,7 +821,7 @@ static BOOL FCRuleIsJunk(NSString *rule) {
     if (rule.length < 2) return YES;
     BOOL fingerprint = [rule hasPrefix:@"tpl:"] || [rule hasPrefix:@"cls:"] ||
                        [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"sel:"] ||
-                       [rule hasPrefix:@"img:"];
+                       [rule hasPrefix:@"img:"] || [rule hasPrefix:@"path:"];   // v52
     if (fingerprint) return NO;                       // 指纹类规则不参与文字门槛
     // 复合串：点选时多个 label 的文本被拼在一起，一定不是单个广告标题
     NSCharacterSet *sep = [NSCharacterSet characterSetWithCharactersInString:@"，,、;；|｜/／"];
@@ -827,6 +844,7 @@ static void FCAddUserRule(NSString *raw) {
     NSMutableArray *a = [NSMutableArray arrayWithArray:FCUserRules()];
     BOOL isFingerprint = [rule hasPrefix:@"sel:"] || [rule hasPrefix:@"cls:"] ||
                          [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"img:"] ||
+                         [rule hasPrefix:@"path:"] ||                // v52：结构指纹精确去重
                          [rule hasPrefix:@"tpl:"] ||                 // v29：模板指纹精确去重
                          [rule hasPrefix:@"#"] || [rule hasPrefix:@"."];
     for (NSString *exist in a) {
@@ -881,6 +899,68 @@ static BOOL FCRuleMatchesFingerprint(NSString *rule, NSString *cls, CGRect rect,
                fabs(rect.size.width - w) <= 20 && fabs(rect.size.height - h) <= 20;
     }
     return NO;
+}
+
+// ===== v52：path: 结构指纹（「不按一个 App 的框架写死」的核心一环）=====
+// 格式：path:容器类>…>目标类（2~4 段，> 分隔；类名只取最后一段，忽略 HiveConsumer./Ali 之类的模块前缀）。
+// 为什么需要它：
+//   · cls: 太粗——同类的所有实例一起隐藏，点一个广告可能藏掉整屏同类；
+//   · txt: 文案会变——服务端改一个字就失效；
+//   · pos: 坐标会漂——一滚动/换机型就错位。
+//   「这块卡片位于什么容器里 + 它自己是什么类」是三者之外更稳的一维，
+//   同一个 App 的多个版本、甚至同架构的别的 App 都常常对得上。
+// 匹配规则：最后一段必须等于当前 view 的类名；其余段按顺序在祖先链里找（允许跳过中间层），
+//   限 8 层、不许回退——容得住层级微调，又不会乱认亲戚。
+static NSString *FCShortClassName(NSString *c) {
+    if (!c.length) return @"";
+    NSRange dot = [c rangeOfString:@"." options:NSBackwardsSearch];
+    return dot.location == NSNotFound ? c : [c substringFromIndex:dot.location + 1];
+}
+
+// 生成：从 v 往上找最近的「表格行/集合项」祖先，拼成 path:行类>自身类。
+// v52：若 v 自己就是行/项（点选常被升级到整行），改用「父容器类 > 自身类」。
+// 不在列表里就不生成（那种场景 pos:/cls: 已经够用，硬造 path 只会误伤）。
+static NSString *FCPathRuleForView(UIView *v) {
+    if (!v) return nil;
+    NSString *selfCls = FCShortClassName(NSStringFromClass([v class]));
+    if (selfCls.length < 4) return nil;
+    BOOL selfIsRow = [v isKindOfClass:[UITableViewCell class]] ||
+                     [v isKindOfClass:[UICollectionViewCell class]];
+    if (selfIsRow) {
+        UIView *p = v.superview;
+        if (!p) return nil;
+        NSString *pc = FCShortClassName(NSStringFromClass([p class]));
+        if (pc.length < 4) return nil;
+        return [NSString stringWithFormat:@"path:%@>%@", pc, selfCls];
+    }
+    UIView *cur = v.superview; int g = 0;
+    while (cur && g++ < 8) {
+        BOOL isRow = [cur isKindOfClass:[UITableViewCell class]] ||
+                     [cur isKindOfClass:[UICollectionViewCell class]];
+        if (isRow) {
+            NSString *c = FCShortClassName(NSStringFromClass([cur class]));
+            if (c.length >= 4) return [NSString stringWithFormat:@"path:%@>%@", c, selfCls];
+            break;
+        }
+        cur = cur.superview;
+    }
+    return nil;
+}
+
+static BOOL FCViewMatchesPathRule(UIView *v, NSString *rule) {
+    if (!v || ![rule hasPrefix:@"path:"]) return NO;
+    NSArray *segs = [[rule substringFromIndex:5] componentsSeparatedByString:@">"];
+    if (segs.count < 2 || segs.count > 4) return NO;
+    if (![(NSString *)segs.lastObject isEqualToString:
+          FCShortClassName(NSStringFromClass([v class]))]) return NO;
+    NSUInteger want = segs.count - 1;          // 还需匹配掉的祖先段数
+    UIView *cur = v.superview; int g = 0;
+    while (cur && g++ < 8 && want > 0) {
+        NSString *c = FCShortClassName(NSStringFromClass([cur class]));
+        if ([c isEqualToString:segs[want - 1]]) want--;
+        cur = cur.superview;
+    }
+    return want == 0;
 }
 
 #pragma mark - v17：通用广告类型体系（丰巢真机实证 + 淘宝 10.56.10 静态实证）
@@ -1158,7 +1238,41 @@ static BOOL FCTextsAreSplash(NSArray<NSString *> *texts) {
     return NO;
 }
 
+// ===== v52：内置规则包——按 BundleID 自动挂载 =====
+// 老大要求「可以使用所有 app，根据页面上的元素点击隐藏内容，所以不能按一个 app 的框架写死」。
+// 做法：丰巢的词表/类名、淘宝的 DX 模板身份，各自挂在对应的包里；
+//        没匹配到包（其它任意 App）→ 三张内置表全部返回空，只走「点选 + 通用识别」。
+// 这样专有规则不会跑到别的 App 里误伤，通用能力仍然是全 App 可用。
+typedef NS_ENUM(NSInteger, FCPackID) {
+    FCPackNone = 0,
+    FCPackFengchao,     // 丰巢 HiveConsumer：券包类运营文案 + 省钱卡列表项
+    FCPackTaobao,       // 淘宝/天猫：DX 动态化运营楼层模板身份
+};
+
+static FCPackID FCPackForCurrentApp(void) {
+    static FCPackID pid = FCPackNone;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        NSString *bid = [[[NSBundle mainBundle] bundleIdentifier] lowercaseString];
+        if (!bid) bid = @"";
+        if ([bid containsString:@"taobao"] || [bid containsString:@"tmall"]) {
+            pid = FCPackTaobao;
+        } else if ([bid containsString:@"fengchao"] || [bid containsString:@"hiveconsumer"] ||
+                   [bid containsString:@"sfexpress"]) {
+            pid = FCPackFengchao;
+        } else {
+            pid = FCPackNone;
+        }
+        FCLog(@"v52 规则包判定 Bundle=%@ → 包=%ld(0通用/1丰巢/2淘宝)", bid, (long)pid);
+    });
+    return pid;
+}
+
+// v52：当前 App 有专属包吗（菜单/诊断里显示用）
+static BOOL FCPackIsSpecific(void) { return FCPackForCurrentApp() != FCPackNone; }
+
 // v11：内置运营广告文案——真机反馈的 banner 实拍文案，必须真正参与隐藏，不能只做诊断计数
+// v52：全部属于丰巢（寄件券包/洗衣券），按包门控。
 static NSArray<NSString *> *FCBuiltinAdKeys(void) {
     static NSArray *keys = nil; static dispatch_once_t once;
     dispatch_once(&once, ^{ keys = @[
@@ -1168,16 +1282,19 @@ static NSArray<NSString *> *FCBuiltinAdKeys(void) {
         @"69.9元", @"马上抢", @"立即抢购", @"9.9洗衣",
         @"领福利", @"立省30", @"顺丰专享券包",
     ]; });
+    if (FCPackForCurrentApp() != FCPackFengchao) return @[];
     return keys;
 }
 
 // v15：诊断实证的宿主运营组件类——原生卡片文字是「¥20/洗衣」等价格，文字词表永远匹配不上，
 // 只能按类名隐藏。这些类来自真机诊断输出（HiveConsumer.PersonaMoreCouponItemView 等）。
+// v52：丰巢专有类，按包门控。
 static NSArray<NSString *> *FCBuiltinAdClasses(void) {
     static NSArray *keys = nil; static dispatch_once_t once;
     dispatch_once(&once, ^{ keys = @[
         @"PersonaMoreCouponItemView",    // 我的页-更多省钱卡列表项（¥20/洗衣）
     ]; });
+    if (FCPackForCurrentApp() != FCPackFengchao) return @[];
     return keys;
 }
 
@@ -2498,6 +2615,7 @@ static void FCApplyNativeRules(void) {
                 if (FCRuleMatchesFingerprint(rule, vcls, r, [UIScreen mainScreen].bounds.size.width, sh)) {
                     userHardHit = YES; break;
                 }
+                if (FCViewMatchesPathRule(v, rule)) { userHardHit = YES; break; }   // v52
             }
             if (!userHardHit && (r.size.width < 40 || r.size.height < 18)) {
                 for (UIView *sub in v.subviews) [q addObject:sub];
@@ -2520,6 +2638,8 @@ static void FCApplyNativeRules(void) {
                 if (FCRuleMatchesFingerprint(rule, vcls, r, [UIScreen mainScreen].bounds.size.width, sh)) {
                     hit = YES; hitRule = rule; break;
                 }
+                // v52：结构指纹 path:容器类>目标类——跨版本/跨 App 最稳的一维
+                if (FCViewMatchesPathRule(v, rule)) { hit = YES; hitRule = rule; break; }
             }
             // v15：内置运营组件类（诊断实证）——按类名精确命中，不受文案/闸门影响
             if (!hit && FCBuiltinEnabled()) {
@@ -3002,8 +3122,11 @@ static NSString *FCTemplateNameOfView(UIView *v) {
 
 // v30：内置身份型广告模板——真机取证铁证，服务端改文案不改模板身份。
 // 用「核心身份子串」而非完整名，避开版本号（67/72 会随服务端升级变化）。
+// v52：这四条全是淘宝 DX 动态化的模板身份，只对淘宝/天猫生效；
+//      其它 App 的 DX 模板名完全不同，硬拦只会误伤，一律走通用逻辑。
 static BOOL FCTplBuiltinBlocked(NSString *tpl) {
     if (!FCBuiltinEnabled() || !tpl.length) return NO;   // 尊重「内置规则开关」
+    if (FCPackForCurrentApp() != FCPackTaobao) return NO; // v52：按包门控
     static NSArray *ids = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ ids = @[
@@ -3109,13 +3232,13 @@ static void FCPruneSourceZeros(void) {
 // 防误伤核心：只从「我们亲自拦/压过的 root」向上找 cell；商品流 recommend_* 无痕迹，绝不触发。
 static BOOL FCCellStillHasBlockedTrace(UIView *cell, int depth) {
     if (!cell || depth > 10) return NO;
-    Class dxRoot = NSClassFromString(@"DXRootView");
     for (UIView *s in cell.subviews) {
-        if (dxRoot && [s isKindOfClass:dxRoot]) {
-            if (objc_getAssociatedObject(s, &kFCBlockedRoot)) return YES;
-            NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:s] : nil;
-            if (tpl.length && FCTplIsBlocked(tpl)) return YES;
-        }
+        // v52：不再限定 DXRootView——任何被我们拦过（kFCBlockedRoot）或记过被拦模板的节点
+        // 都算「这里原来有广告」的痕迹。淘宝有 DXRootView、别的 App 没有，
+        // 按类名判断等于把通用能力关在门外。
+        if (objc_getAssociatedObject(s, &kFCBlockedRoot)) return YES;
+        NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:s] : nil;
+        if (tpl.length && FCTplIsBlocked(tpl)) return YES;
         if (FCCellStillHasBlockedTrace(s, depth + 1)) return YES;
     }
     return NO;
@@ -3140,14 +3263,23 @@ static void FCZeroBlockedCellShell(UIView *root) {
     NSString *tpl = gFCTplBridge ? [gFCTplBridge objectForKey:root] : nil;
     if (tpl.length && FCTplIsBlocked(tpl)) trace = YES;
     if (!trace) return;
-    // 从 root 向上最多 4 层找诊断实证的外层 cell 类（精确类名，不碰普通 UICollectionViewCell）
+    // 从 root 向上最多 4 层找外层容器。
+    // v52 通用化：真机诊断实证淘宝的空壳类是 AliIFDXCollectionViewCell，但别的 App 可能是
+    // 普通 UIView 外壳（v38/39 就遇到过类名漂移成 UIView/DXRootView 的情况）。
+    // 于是改成三级认领：①淘宝已知空壳（优先，最准）→ ②任意表格行/集合项 → ③普通容器兜底。
+    // 下面还有「满宽 ≥75% + 高 80~32%屏 + 有效文字 ≤2」三道闸门，兜底不会误伤商品流。
     UIView *cell = nil;
     UIView *cur = root.superview;
     Class shellCls = NSClassFromString(@"AliIFDXCollectionViewCell");
+    UIView *fallback = nil;
     for (int up = 0; cur && up < 4; up++) {
         if (shellCls && [cur isKindOfClass:shellCls]) { cell = cur; break; }
+        if ([cur isKindOfClass:[UITableViewCell class]] ||
+            [cur isKindOfClass:[UICollectionViewCell class]]) { cell = cur; break; }
+        if (!fallback && ![cur isKindOfClass:[UIScrollView class]]) fallback = cur;
         cur = cur.superview;
     }
+    if (!cell) cell = fallback;   // v52：其它 App 的普通 UIView 外壳
     if (!cell || !cell.superview) return;
     // 尺寸闸门：满宽坑位、高度 80~32%屏（白块 135/155），远低于 50% 黑屏硬线
     CGRect r = [cell convertRect:cell.bounds toView:nil];
@@ -3399,6 +3531,13 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
         }
         curC = curC.superview;
     }
+    // v52：结构指纹——「所在行/项类 > 自身类」。刷新重建后类名可能漂移、坐标必然变，
+    // 但「这块内容属于哪种容器」通常稳定，是通用化里最抗变的一维。
+    NSString *pathRuleStored = nil;
+    if (!topProtected) {
+        pathRuleStored = FCPathRuleForView(card);
+        if (pathRuleStored.length) FCAddUserRule(pathRuleStored);
+    }
     CGSize scr = [UIScreen mainScreen].bounds.size;
     CGRect nr = [card convertRect:card.bounds toView:nil];
     // v44：门槛与 FCIsUnsafeClassRule 对齐——旧条件要求「宽和高都 <90%屏」，
@@ -3430,6 +3569,7 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     }
     // v29：把模板名带进浮标提示——老大截图即可确认源头拦截规则已存
     if (tplName.length) msg = [NSString stringWithFormat:@"%@|模板已记", msg];
+    if (pathRuleStored.length) msg = [NSString stringWithFormat:@"%@|路径已记", msg];   // v52
     FCShowBadgeMsg(msg);
 }
 
@@ -3579,6 +3719,7 @@ static NSString *FCRuleTypeText(NSString *r) {
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return @"图";
     if ([r hasPrefix:@"sel:"]) return @"选";   // v13：CSS 结构指纹
     if ([r hasPrefix:@"tpl:"]) return @"模";   // v29：DX 模板指纹
+    if ([r hasPrefix:@"path:"]) return @"径";  // v52：结构指纹
     if ([r hasPrefix:@"cls:"]) {
         FCAdType at = FCAdTypeOfClass([r substringFromIndex:4]);
         return at != FCAdTypeUnknown ? FCAdTypeName(at) : @"位";
@@ -3592,6 +3733,7 @@ static UIColor *FCRuleTypeColor(NSString *r) {
     if ([r hasPrefix:@"img:"] || [r hasPrefix:@"IMG:"]) return [UIColor colorWithRed:0.2 green:0.65 blue:0.35 alpha:1];
     if ([r hasPrefix:@"sel:"]) return [UIColor colorWithRed:0.85 green:0.25 blue:0.55 alpha:1];
     if ([r hasPrefix:@"tpl:"]) return [UIColor colorWithRed:0.95 green:0.30 blue:0.20 alpha:1];  // v29：模板=红橙
+    if ([r hasPrefix:@"path:"]) return [UIColor colorWithRed:0.30 green:0.72 blue:0.45 alpha:1]; // v52：结构=青绿
     if ([r hasPrefix:@"cls:"] || [r hasPrefix:@"pos:"]) return [UIColor colorWithRed:0.15 green:0.55 blue:0.75 alpha:1];
     return [UIColor colorWithRed:0.42 green:0.48 blue:0.58 alpha:1];
 }
@@ -3960,6 +4102,7 @@ static NSString *FCDiagRuleKind(NSString *rule) {
     if ([rule hasPrefix:@"sel:"]) return @"选择器";
     if ([rule hasPrefix:@"img:"]) return @"图片";
     if ([rule hasPrefix:@"tpl:"]) return @"模板";   // v29
+    if ([rule hasPrefix:@"path:"]) return @"路径";  // v52
     if ([rule hasPrefix:@"#"] || [rule hasPrefix:@"."]) return @"CSS";
     return @"文字";
 }
@@ -3975,6 +4118,7 @@ static NSString *FCDiagHitRule(UIView *v, NSArray<NSString *> *rules) {
     for (NSString *rule in rules) {
         if (rule.length >= 5 && [rule isEqualToString:vcls]) return rule;              // 类名精确
         if (FCRuleMatchesFingerprint(rule, vcls, r, sw, sh)) return rule;                // cls:/pos:
+        if (FCViewMatchesPathRule(v, rule)) return rule;                                 // v52：path:
     }
     NSArray *texts = FCTextsOf(v);                                                       // 整棵子树文字
     for (NSString *s in texts)
@@ -4322,7 +4466,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v51 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v52 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -4819,7 +4963,7 @@ static void FCUpdateBadge(void) {
     NSString *sys = @"";
 #endif
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv51%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
+        @"FCv52%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
         (unsigned long)FCUserRules().count, whiteH, big, sys, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -4831,7 +4975,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv51 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv52 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -4842,7 +4986,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v51"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v52"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -4905,12 +5049,17 @@ static void FCShowActionMenu(void) {
     // v14：诊断当前页面——一次看清运营位在原生还是网页、命中了什么规则
     [ac addAction:[UIAlertAction actionWithTitle:@"诊断当前页面（发给开发者）" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCShowDiagnose(); }]];
-    // v23：进程内网络取证——旁听 App 请求 URL（只读不改包，绕开 SSL Pinning）
-    [ac addAction:[UIAlertAction actionWithTitle:gFCNetLogOn ? @"关闭网络取证" : @"开启网络取证(看广告接口)"
+    // v52：网络抓包面板——请求/响应全量（地址/头/体），可重写、可拦截、可造 mock。
+    // 这是本版新增的主力能力，放在诊断下面紧邻位置。
+    [ac addAction:[UIAlertAction actionWithTitle:@"🌐 网络抓包（分析 / 重写 / 拦截）"
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){ FCNetShowPanel(); }]];
+    // v23：轻量取证——只记 URL 进诊断文本，不接管请求（排查「这页到底请求了什么」最快）
+    [ac addAction:[UIAlertAction actionWithTitle:gFCNetLogOn ? @"关闭轻量取证(仅记URL)" : @"开启轻量取证(仅记URL)"
                  style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){
                      FCNetProbeToggle();
-                     FCShowBadgeMsg(gFCNetLogOn ? @"网络取证已开·操作App后诊断查看" : @"网络取证已关");
+                     FCShowBadgeMsg(gFCNetLogOn ? @"轻量取证已开·操作App后诊断查看" : @"轻量取证已关");
                  }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"浮标复位" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ gFCBadgeCollapsed = NO; gFCBadgeSide = 0;
@@ -5223,10 +5372,12 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v48 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v52 载入，Bundle=%@ 包=%ld(0通用/1丰巢/2淘宝)",
+              [[NSBundle mainBundle] bundleIdentifier], (long)FCPackForCurrentApp());
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
+            FCNetBootstrap();        // v52：恢复网络采集开关 + 注册 NSURLProtocol（命中规则才接管）
             FCEnsureBadgeWindow();
             // v16：加载后自动吸附右边缘收成小白条，不遮挡页面（点小白条仍可展开操作）
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.2 * NSEC_PER_SEC)),
