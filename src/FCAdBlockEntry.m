@@ -1,5 +1,33 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v45（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v49（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v49 相对 v48（老大原话：「先放宽硬性约束，验证技术上的可行性，增加系统hook开关兜底」；
+//  另反馈两点：首页也是「点选时消失、返回又恢复」；搜索框要保留但规则里找不到、恢复不了）
+//    【需求拆解】
+//      ①留白去不掉已到「不动系统类」的极限（v48 诊断：尺寸钩子已装在 MTDinamicXCell 上，
+//        但行高仍是 -1/automatic，说明 UIKit 在这张表上根本不走 systemLayoutSizeFittingSize）；
+//      ②首页板块在 UICollectionView 里，v46 那道防黑屏闸门只修了 UITableView 侧；
+//      ③顶部搜索条被点选规则误压后，规则列表里十几条 pos 长得一样，用户无从辨认、无法恢复。
+//    【做法一·系统 hook 总开关（Deep 档，默认关）】`FCAdBlockSystemHook_v1`
+//      ·通用安装器 `FCHookGeneric(cls, sel, tramp, argc, retFirst)`：先验参数个数 + 返回类型
+//        再 method_setImplementation（DM2：签名不对去调 = 100% 崩）；
+//      ·接管点：UITableView 的 `heightForRowAtIndexPath:` / `_heightForRowAtIndexPath:`，
+//        UICollectionViewLayout 的 `layoutAttributesForElementsInRect:`（**真正决定摆放的那个**）
+//        与 `layoutAttributesForItemAtIndexPath:`，以及代理的
+//        `collectionView:layout:sizeForItemAtIndexPath:`；
+//      ·只对「登记过的 indexPath」动手，其它一律原样转发；trampoline **每次都查开关**，
+//        关掉立刻恢复，不必重启（这是「兜底」的含义，不是一锤子买卖）。
+//    【做法二·集合视图登记】`FCMarkCollectionItem`：以前 FCMarkRowZero 发现不在表格里就直接
+//      return，首页点选等于什么都没做。现在会向上找 UICollectionViewCell → 登记 indexPath，
+//      并在开关打开时挂上面那几个布局入口。
+//      配套修 `FCPruneRowMarks`：原来一律发 `cellForRowAtIndexPath:`，集合类没这个方法 →
+//      @catch 吞掉 → 登记永不失效 → cell 复用会把正常内容压成 0。现在按 UITableView /
+//      UICollectionView 分开取，撤销逻辑才算真的成立。
+//    【做法三·顶部保护区】`FCIsTopProtectedRect`：满宽（≥85%屏）且整条落在顶部 22% 屏内
+//      = 搜索框/导航条，不是运营位。三处生效：点选不记任何规则、扫描不压、规则自愈清掉存量。
+//      规则删掉后 `FCRestoreFlattenedIfNeeded` 会把搜索框自动插回来 —— 这就是「恢复显示」。
+//    【做法四·规则面板看得懂】pos 规则在列表里显示成「位·顶部 x0% 11%~20% 满宽」，
+//      原文按「展示串→原始串」记在 gFCPosRuleRaw，保存时换回去。这是老大「找不到这个」的正解。
 //
 //  v45 相对 v44（老大 v44 真机：还是那句「这个领券中心总是去不掉」，附诊断 + 截图）：
 //    【现场】我的淘宝页：规则 5 条（全是首页模板/文字）、被挡节点 0、压0 容器 0、留白 0pt，
@@ -502,14 +530,15 @@ static NSUInteger FCCellLiveTextCount(UIView *v, int depth);  // v45：前向声
 static void FCMarkRowZero(UIView *cell);                      // v45：把所在表格行登记为高度 0（Deep 才有实现）
 static void FCPruneRowMarks(void);                            // v45：每轮校验行号归属，防止压错正常行
 static void FCUnmarkRowZero(UIView *cell);                     // v46：撤销行高归零登记（规则被删/记录还原时）
+static void FCMarkCollectionItem(UIView *cell);                // v49：集合视图 cell 登记（Deep 才有实现）
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===48){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=48;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===49){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=49;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -653,7 +682,13 @@ static void FCSanitizeUserRules(void) {
             NSArray *p = [[r substringFromIndex:4] componentsSeparatedByString:@","];
             if (p.count == 4) {
                 CGFloat w = [p[2] doubleValue], h = [p[3] doubleValue];
+                CGFloat y = [p[1] doubleValue];
                 if (w >= 0.90 && h > 0.35) bad = YES;
+                // v49：顶部保护区的 pos 规则——老大要保留搜索框。
+                // 真机 v48：为了选下面的 banner 点到了搜索框，存下 pos:0.000,0.115,1.000,0.197，
+                // 搜索框整条被压掉，规则列表里那条 pos 看着和别的没区别、找不到也删不掉。
+                // 这里清掉它，FCRestoreFlattenedIfNeeded 下一轮就会把搜索框插回来。
+                else if (w >= 0.85 && y >= 0 && (y + h) <= 0.22) bad = YES;
             }
         }
         if (bad) { dropped++; continue; }
@@ -662,7 +697,7 @@ static void FCSanitizeUserRules(void) {
     }
     if (dropped) {
         FCSetUserRules(keep);
-        FCLog(@"规则自愈：清掉 %lu 条「满宽且>1/3屏」或重复的规则，剩 %lu 条",
+        FCLog(@"规则自愈：清掉 %lu 条「满宽且>1/3屏 / 顶部保护区(搜索框) / 重复」的规则，剩 %lu 条",
               (unsigned long)dropped, (unsigned long)keep.count);
     }
 }
@@ -1371,6 +1406,9 @@ static const BOOL gFCRotorEnabled = NO;
 // 用弱表记录已计过的节点：同一节点只计一次，数字从此稳定；节点释放自动出表。
 static NSHashTable *gFCBlockedSeen = nil;
 static NSUInteger gFCBlockedUnique = 0;   // 去重后的被挡节点数（浮标/诊断显示这个）
+// v49：顶部保护区跳过的节点（去重，诊断显示「保护区 N」）
+static NSUInteger gFCTopProtectedSkips = 0;
+static NSHashTable *gFCTopProtectedSeen = nil;
 // v42：被源头拦截过的 DXRootView 弱表——实例级标记 kFCBlockedRoot 是关联对象，遍历不到；
 // 「暂停拦截」时必须能逐个清标记，否则这些 root 会带着旧标记被 setData hook 继续 return。
 static NSHashTable *gFCBlockedRoots = nil;
@@ -1386,6 +1424,28 @@ static const CGFloat kFCBigBlockH = 120.0;
 
 static BOOL FCBigBlockPassOn(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:FCBigBlockKey];
+}
+
+// v49：系统 hook 总开关（默认关，实验性）。老大明确要求「先放宽硬性约束验证可行性」：
+// 打开后允许对 UITableView / UICollectionViewLayout 这类系统类下手，把「被点名的行/项」
+// 的高度真正改成 0。风险：系统方法签名或调用时机变化可能导致布局错乱，所以：
+//   ①默认关；②只对登记过的 indexPath 生效，其它原样转发；③随时可在菜单里关掉。
+static NSString * const FCSystemHookKey = @"FCAdBlockSystemHook_v1";
+static BOOL FCSystemHookOn(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:FCSystemHookKey];
+}
+
+// v49：顶部保护区——搜索框/导航条所在的那一条不压。
+// 真机 v48 教训：老大为了选下面的 banner，点到了搜索框区域，存下 pos:0,0.115,1,0.197，
+// 结果整个搜索框被压没了，而规则列表里那条 pos 看起来和别的位置规则一模一样，找不到、也删不掉。
+// 判定：满宽（>=85%屏）且整个矩形都落在顶部 22% 屏内 —— 这一带是搜索/导航，不是运营位。
+static BOOL FCIsTopProtectedRect(CGRect r) {
+    CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+    CGFloat sw = [UIScreen mainScreen].bounds.size.width;
+    if (r.size.width < sw * 0.85) return NO;
+    if (r.size.height < 1) return NO;
+    if (r.origin.y < 0) return NO;
+    return CGRectGetMaxY(r) <= sh * 0.22;
 }
 
 // v45：向上找「所在表格行」——我的淘宝/丰巢这类列表页，每个板块 = 一个 UITableViewCell
@@ -1516,7 +1576,7 @@ static NSString *gFCRowProbe = nil;                 // v46：最近一次登记�
 
 static CGFloat FCRowHeightTrampoline(id self, SEL _cmd, UITableView *tv, NSIndexPath *ip);
 
-static BOOL FCRowIsMarked(UITableView *tv, NSIndexPath *ip) {
+static BOOL FCRowIsMarked(UIView *tv, NSIndexPath *ip) {
     if (!tv || !ip || !gFCRowMarks) return NO;
     NSMutableSet *s = [gFCRowMarks objectForKey:tv];
     if (!s.count) return NO;
@@ -1591,6 +1651,14 @@ static CGSize FCRowSizeTrampoline(id self, SEL _cmd, CGSize size, float hp, floa
 // v47：真机 v46 的取证——代理 MTTableViewHolder 没有 heightForRow、rowH=-1(automatic)，
 // 而 MTDinamicXCell 自己**没有**重写 systemLayoutSizeFittingSize（定义在 UITableViewCell）。
 // 于是「改 delegate 行高」和「改已有实现」两条路都走不通，行高永远塌不了，压完就留一块白。
+// v49：通用「换实现」安装器——验过参数个数与返回类型才动手（DM2 教训）。
+static BOOL FCHookGeneric(Class cls, SEL sel, IMP tramp, NSUInteger argc, char retFirst);
+static CGFloat FCUITableHeightTrampoline(id self, SEL _cmd, NSIndexPath *ip);
+static id FCLayoutAttrTrampoline(id self, SEL _cmd, NSIndexPath *ip);
+static NSArray *FCLayoutAttrsInRectTrampoline(id self, SEL _cmd, CGRect rect);
+static CGSize FCCollectionSizeTrampoline(id self, SEL _cmd, UICollectionView *cv,
+                                         UICollectionViewLayout *lay, NSIndexPath *ip);
+
 static void FCHookRowSizeSel(Class cls, SEL sel);   // v47：前向声明（下面是新增方法，定义在它之后）
 
 // 解法：给 App 自己的 cell 类**新增**一个同名方法（class_addMethod），此时父类（系统）
@@ -1675,7 +1743,7 @@ static void FCMarkRowZero(UIView *cell) {
     if (!cell) return;
     UITableViewCell *rc = [cell isKindOfClass:[UITableViewCell class]]
         ? (UITableViewCell *)cell : FCEnclosingRowCell(cell);
-    if (!rc) return;
+    if (!rc) { FCMarkCollectionItem(cell); return; }   // v49：不在表格里 → 试集合视图
     UITableView *tv = nil;
     UIView *p = rc.superview;
     int g = 0;
@@ -1683,7 +1751,7 @@ static void FCMarkRowZero(UIView *cell) {
         if ([p isKindOfClass:[UITableView class]]) { tv = (UITableView *)p; break; }
         p = p.superview;
     }
-    if (!tv) return;
+    if (!tv) { FCMarkCollectionItem(cell); return; }
     NSIndexPath *ip = [tv indexPathForCell:rc];
     if (!ip) return;   // 还不在可见区，别登记（indexPath 会错位）
     if (!gFCRowMarks) gFCRowMarks = [NSMapTable weakToStrongObjectsMapTable];
@@ -1715,6 +1783,21 @@ static void FCMarkRowZero(UIView *cell) {
     FCEnsureCellSizeHook(cellCls);
     BOOL sizeHooked = [gFCRowHookedKeys containsObject:
         [NSString stringWithFormat:@"%s|%s", class_getName(cellCls), sel_getName(sSel)]];
+    // v49：开关打开时，直接对 UITableView 自己的行高方法下手（公开 + 私有各试一次）
+    if (FCSystemHookOn()) {
+        BOOL h1 = FCHookGeneric([UITableView class], @selector(heightForRowAtIndexPath:),
+                                (IMP)FCUITableHeightTrampoline, 3, 'd');
+        BOOL h2 = FCHookGeneric([UITableView class], @selector(_heightForRowAtIndexPath:),
+                                (IMP)FCUITableHeightTrampoline, 3, 'd');
+        // 日志限次：登记会随滚动反复发生，NSLog 刷屏没意义，前 3 次足够判断装没装上
+        static NSUInteger sFCSysHookLogs = 0;
+        if (sFCSysHookLogs < 3) {
+            sFCSysHookLogs++;
+            FCLog(@"系统hook：表格行高 公开=%@ 私有=%@",
+                  h1 ? @"装" : @"无", h2 ? @"装" : @"无");
+        }
+        (void)h1; (void)h2;
+    }
     gFCRowProbe = [NSString stringWithFormat:
         @"代理=%@ h=%@ e=%@ rowH=%.0f | cell=%@ 尺寸钩子=%@%@",
         dn, hasH ? @"有" : @"无", hasE ? @"有" : @"无", tv.rowHeight,
@@ -1724,26 +1807,182 @@ static void FCMarkRowZero(UIView *cell) {
     FCEnqueueRelayout(rc);
 }
 
-// v46：撤销一行的归零登记（规则被删 / 记录还原时调用），并让表格重算行高。
-static void FCUnmarkRowZero(UIView *cell) {
-    if (!cell || !gFCRowMarks || !gFCRowMarks.count) return;
-    UITableViewCell *rc = [cell isKindOfClass:[UITableViewCell class]]
-        ? (UITableViewCell *)cell : FCEnclosingRowCell(cell);
-    if (!rc) return;
-    UITableView *tv = nil;
-    UIView *p = rc.superview;
-    int g = 0;
+// ---------- v49：系统 hook（实验，默认关） ----------
+
+static BOOL FCHookGeneric(Class cls, SEL sel, IMP tramp, NSUInteger argc, char retFirst) {
+    if (!cls || !tramp) return NO;
+    Method m = class_getInstanceMethod(cls, sel);
+    if (!m) return NO;
+    if (!gFCRowOrigIMPs) gFCRowOrigIMPs = [NSMutableDictionary dictionary];
+    NSValue *mkey = [NSValue valueWithPointer:(void *)m];
+    if ([gFCRowOrigIMPs objectForKey:mkey]) return YES;   // 已接管
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) return NO;
+    @try {
+        NSMethodSignature *sig = [NSMethodSignature signatureWithObjCTypes:enc];
+        if (!sig || sig.numberOfArguments != argc) return NO;
+        if ([sig methodReturnType][0] != retFirst) return NO;
+    } @catch (NSException *e) { return NO; }
+    IMP orig = method_getImplementation(m);
+    [gFCRowOrigIMPs setObject:[NSValue valueWithPointer:orig] forKey:mkey];
+    method_setImplementation(m, tramp);
+    if (!gFCRowHookedKeys) gFCRowHookedKeys = [NSMutableSet set];
+    [gFCRowHookedKeys addObject:[NSString stringWithFormat:@"%s|%s",
+                                 class_getName(cls), sel_getName(sel)]];
+    FCLog(@"系统hook：已接管 %@ 的 %@", NSStringFromClass(cls), NSStringFromSelector(sel));
+    return YES;
+}
+
+// UITableView 行高（公开 heightForRowAtIndexPath: 与私有 _heightForRowAtIndexPath: 共用）
+// v49：装了 hook 也要**每次查开关**——老大的要求是「开关兜底」，关掉必须立刻恢复，
+// 不能等到重启。开关关着就完全原样转发，和没装 hook 一样。
+static CGFloat FCUITableHeightTrampoline(id self, SEL _cmd, NSIndexPath *ip) {
+    IMP orig = FCOrigRowIMPFor(self, _cmd);
+    if (FCSystemHookOn() && FCRowIsMarked((UIView *)self, ip)) return 0.0;
+    if (!orig) return UITableViewAutomaticDimension;
+    return ((CGFloat (*)(id, SEL, NSIndexPath *))orig)(self, _cmd, ip);
+}
+
+// UICollectionViewLayout 的 item 属性——把被登记项的尺寸高度改成 0
+static id FCLayoutAttrTrampoline(id self, SEL _cmd, NSIndexPath *ip) {    IMP orig = FCOrigRowIMPFor(self, _cmd);
+    if (!orig) return nil;
+    id a = ((id (*)(id, SEL, NSIndexPath *))orig)(self, _cmd, ip);
+    if (!FCSystemHookOn()) return a;   // v49：开关关掉 → 原样返回
+    if (!a || ![a isKindOfClass:[UICollectionViewLayoutAttributes class]]) return a;
+    UICollectionView *cv = nil;
+    if ([self isKindOfClass:[UICollectionViewLayout class]])
+        cv = ((UICollectionViewLayout *)self).collectionView;
+    if (!cv || !FCRowIsMarked((UIView *)cv, ip)) return a;
+    UICollectionViewLayoutAttributes *at = (UICollectionViewLayoutAttributes *)a;
+    CGRect f = at.frame; f.size.height = 0; at.frame = f;
+    CGSize sz = at.size; sz.height = 0; at.size = sz;
+    return a;
+}
+
+// v49：**真正管用的入口**。UICollectionView 摆放 cell 用的是
+// layoutAttributesForElementsInRect: 返回的数组，只改单个 item 的属性不影响实际布局
+// （v49 第一版就只挂了这个，等于白挂）。这里批量把被登记项的高度抹成 0 并标记隐藏。
+static NSArray *FCLayoutAttrsInRectTrampoline(id self, SEL _cmd, CGRect rect) {
+    IMP orig = FCOrigRowIMPFor(self, _cmd);
+    if (!orig) return @[];
+    NSArray *arr = ((NSArray *(*)(id, SEL, CGRect))orig)(self, _cmd, rect);
+    if (!FCSystemHookOn() || ![arr isKindOfClass:[NSArray class]]) return arr;
+    UICollectionView *cv = nil;
+    if ([self isKindOfClass:[UICollectionViewLayout class]])
+        cv = ((UICollectionViewLayout *)self).collectionView;
+    if (!cv || !gFCRowMarks) return arr;
+    NSMutableSet *marks = [gFCRowMarks objectForKey:cv];
+    if (!marks.count) return arr;
+    for (UICollectionViewLayoutAttributes *at in arr) {
+        if (![at isKindOfClass:[UICollectionViewLayoutAttributes class]]) continue;
+        NSIndexPath *ip = at.indexPath;
+        if (!ip) continue;
+        NSString *k = [NSString stringWithFormat:@"%ld,%ld", (long)ip.section, (long)ip.row];
+        if (![marks containsObject:k]) continue;
+        CGRect f = at.frame; f.size.height = 0; at.frame = f;
+        CGSize sz = at.size; sz.height = 0; at.size = sz;
+        at.hidden = YES;   // 双保险：高度压不下去时至少不显示
+    }
+    return arr;
+}
+
+// v49：第二条路——代理给的 item 尺寸。直接把被登记项算成 (0,0)：
+// 单列满宽布局里等价于这一行不存在，后面的内容自动上移；多列网格里该格消失、后续补位。
+static CGSize FCCollectionSizeTrampoline(id self, SEL _cmd, UICollectionView *cv,
+                                         UICollectionViewLayout *lay, NSIndexPath *ip) {
+    IMP orig = FCOrigRowIMPFor(self, _cmd);
+    if (FCSystemHookOn() && FCRowIsMarked((UIView *)cv, ip)) return CGSizeMake(0, 0);
+    if (!orig) return CGSizeZero;
+    return ((CGSize (*)(id, SEL, id, id, NSIndexPath *))orig)(self, _cmd, cv, lay, ip);
+}
+
+// 集合视图里的 cell：登记 + （开关打开时）接管布局类的 item 属性方法
+static void FCMarkCollectionItem(UIView *cell) {
+    UICollectionViewCell *cc = nil;
+    UIView *cur = cell; int g = 0;
+    while (cur && g++ < 7) {
+        if ([cur isKindOfClass:[UICollectionViewCell class]]) { cc = (UICollectionViewCell *)cur; break; }
+        cur = cur.superview;
+    }
+    if (!cc) return;
+    UICollectionView *cv = nil;
+    UIView *p = cc.superview; g = 0;
     while (p && g++ < 8) {
-        if ([p isKindOfClass:[UITableView class]]) { tv = (UITableView *)p; break; }
+        if ([p isKindOfClass:[UICollectionView class]]) { cv = (UICollectionView *)p; break; }
         p = p.superview;
     }
-    if (!tv) return;
-    NSMutableSet *s = [gFCRowMarks objectForKey:tv];
+    if (!cv) return;
+    NSIndexPath *ip = [cv indexPathForCell:cc];
+    if (!ip) return;
+    if (!gFCRowMarks) gFCRowMarks = [NSMapTable weakToStrongObjectsMapTable];
+    if (!gFCRowZeroCells) gFCRowZeroCells = [NSHashTable weakObjectsHashTable];
+    NSMutableSet *set = [gFCRowMarks objectForKey:cv];
+    if (!set) { set = [NSMutableSet set]; [gFCRowMarks setObject:set forKey:cv]; }
+    [set addObject:[NSString stringWithFormat:@"%ld,%ld", (long)ip.section, (long)ip.row]];
+    [gFCRowZeroCells addObject:cc];
+    NSString *layName = cv.collectionViewLayout
+        ? NSStringFromClass([cv.collectionViewLayout class]) : @"nil";
+    if (FCSystemHookOn() && cv.collectionViewLayout) {
+        // v49：三条路一起挂，命中最广的那条就够用——
+        // ①layoutAttributesForElementsInRect:（真正决定摆放，最可靠）
+        // ②layoutAttributesForItemAtIndexPath:（单个查询入口）
+        // ③代理的 sizeForItemAtIndexPath:（尺寸源头）
+        BOOL ok1 = FCHookGeneric([cv.collectionViewLayout class],
+                                 @selector(layoutAttributesForElementsInRect:),
+                                 (IMP)FCLayoutAttrsInRectTrampoline, 3, '@');
+        BOOL ok2 = FCHookGeneric([cv.collectionViewLayout class],
+                                 @selector(layoutAttributesForItemAtIndexPath:),
+                                 (IMP)FCLayoutAttrTrampoline, 3, '@');
+        BOOL ok3 = NO;
+        id dg = cv.delegate;
+        NSString *dn = dg ? NSStringFromClass(object_getClass(dg)) : @"nil";
+        SEL sizeSel = @selector(collectionView:layout:sizeForItemAtIndexPath:);
+        if (dg && [dg respondsToSelector:sizeSel] && !FCIsSystemClassName(dn)) {
+            ok3 = FCHookGeneric(object_getClass(dg), sizeSel,
+                                (IMP)FCCollectionSizeTrampoline, 5, '{');
+        }
+        gFCRowProbe = [NSString stringWithFormat:
+            @"集合=%@ 布局=%@ 系统hook=元素%@/单项%@/代理%@(代理=%@)",
+            NSStringFromClass([cv class]), layName,
+            ok1 ? @"装" : @"无", ok2 ? @"装" : @"无", ok3 ? @"装" : @"无", dn];
+    } else {
+        gFCRowProbe = [NSString stringWithFormat:@"集合=%@ 布局=%@ 系统hook=%@",
+                       NSStringFromClass([cv class]), layName,
+                       FCSystemHookOn() ? @"无布局" : @"关"];
+    }
+    FCEnqueueRelayout(cc);
+}
+
+// v46：撤销一行的归零登记（规则被删 / 记录还原时调用），并让表格重算行高。
+// v49：同时支持集合视图（首页板块在 UICollectionView 里）。
+static void FCUnmarkRowZero(UIView *cell) {
+    if (!cell || !gFCRowMarks || !gFCRowMarks.count) return;
+    UIView *rc = nil;
+    UIView *cur = cell; int g = 0;
+    while (cur && g++ < 8) {
+        if ([cur isKindOfClass:[UITableViewCell class]] ||
+            [cur isKindOfClass:[UICollectionViewCell class]]) { rc = cur; break; }
+        cur = cur.superview;
+    }
+    if (!rc) return;
+    UIView *host = nil;
+    cur = rc.superview; g = 0;
+    while (cur && g++ < 8) {
+        if ([cur isKindOfClass:[UITableView class]] ||
+            [cur isKindOfClass:[UICollectionView class]]) { host = cur; break; }
+        cur = cur.superview;
+    }
+    if (!host) return;
+    NSMutableSet *s = [gFCRowMarks objectForKey:host];
     if (!s) return;
-    NSIndexPath *ip = [tv indexPathForCell:rc];
+    NSIndexPath *ip = nil;
+    if ([host isKindOfClass:[UICollectionView class]])
+        ip = [(UICollectionView *)host indexPathForCell:(UICollectionViewCell *)rc];
+    else
+        ip = [(UITableView *)host indexPathForCell:(UITableViewCell *)rc];
     if (ip) [s removeObject:[NSString stringWithFormat:@"%ld,%ld", (long)ip.section, (long)ip.row]];
     [gFCRowZeroCells removeObject:rc];
-    if (!s.count) [gFCRowMarks removeObjectForKey:tv];
+    if (!s.count) [gFCRowMarks removeObjectForKey:host];
     FCEnqueueRelayout(rc);
 }
 
@@ -1751,7 +1990,10 @@ static void FCUnmarkRowZero(UIView *cell) {
 static void FCPruneRowMarks(void) {
     if (!gFCRowMarks || !gFCRowMarks.count) return;
     NSMutableArray *deadTables = [NSMutableArray array];
-    for (UITableView *tv in gFCRowMarks.keyEnumerator) {
+    // v49：key 可能是 UITableView，也可能是 UICollectionView（首页板块在集合里）。
+    // 旧写法一律发 cellForRowAtIndexPath:，集合类没有这个方法 → @catch 吞掉 → c=nil →
+    // 登记**永远不会被撤销**，cell 一复用就把正常内容压成 0。必须按类型分开取。
+    for (UIView *tv in gFCRowMarks.keyEnumerator) {
         if (!tv || !tv.superview) { [deadTables addObject:tv]; continue; }
         NSMutableSet *s = [gFCRowMarks objectForKey:tv];
         NSMutableSet *gone = [NSMutableSet set];
@@ -1760,15 +2002,20 @@ static void FCPruneRowMarks(void) {
             if (p.count != 2) { [gone addObject:k]; continue; }
             NSIndexPath *ip = [NSIndexPath indexPathForRow:[p[1] integerValue]
                                                  inSection:[p[0] integerValue]];
-            UITableViewCell *c = nil;
-            @try { c = [tv cellForRowAtIndexPath:ip]; } @catch (NSException *e) { c = nil; }
+            UIView *c = nil;
+            @try {
+                if ([tv isKindOfClass:[UICollectionView class]])
+                    c = [(UICollectionView *)tv cellForItemAtIndexPath:ip];
+                else if ([tv isKindOfClass:[UITableView class]])
+                    c = [(UITableView *)tv cellForRowAtIndexPath:ip];
+            } @catch (NSException *e) { c = nil; }
             if (!c) continue;                                   // 不在可见区，先留着
             if (![gFCRowZeroCells containsObject:c]) [gone addObject:k];   // 换人了 → 撤销
         }
         if (gone.count) [s minusSet:gone];
         if (!s.count) [deadTables addObject:tv];
     }
-    for (UITableView *tv in deadTables) [gFCRowMarks removeObjectForKey:tv];
+    for (UIView *tv in deadTables) [gFCRowMarks removeObjectForKey:tv];
 }
 #else
 // Pure 档：零 hook，没有行高归零能力（FCRowZeroCapable 恒 NO），清理也就是空操作。
@@ -1777,6 +2024,7 @@ static void FCPruneRowMarks(void) {
 static void FCPruneRowMarks(void) { }
 static void FCMarkRowZero(UIView *cell) { (void)cell; }
 static void FCUnmarkRowZero(UIView *cell) { (void)cell; }
+static void FCMarkCollectionItem(UIView *cell) { (void)cell; }
 #endif
 
 // v40：把被拦 DXRootView 的高度规格（originalHeightSpec）置 0。
@@ -2151,6 +2399,20 @@ static void FCApplyNativeRules(void) {
                 if (hit) break;
             }
             if (hit) {
+                // v49：顶部保护区——搜索框/导航所在的那一条不压。
+                // 只拦 pos 规则命中的（cls:/文案规则是用户明确指定类型的，照常生效）。
+                // 为什么单独拦：老大要「搜索框保留」，而 pos 规则最容易在点选 banner 时被顺手存到。
+                if (hitRule && [hitRule hasPrefix:@"pos:"] && FCIsTopProtectedRect(r)) {
+                    gFCTopProtectedSkips++;
+                    if (!gFCTopProtectedSeen) gFCTopProtectedSeen = [NSHashTable weakObjectsHashTable];
+                    if (![gFCTopProtectedSeen containsObject:v]) {
+                        [gFCTopProtectedSeen addObject:v];
+                        FCLog(@"顶部保护区：跳过 %@ %.0fx%.0f @y%.0f（规则 %@）",
+                              vcls, r.size.width, r.size.height, r.origin.y, hitRule);
+                    }
+                    for (UIView *sub in v.subviews) [q addObject:sub];
+                    continue;
+                }
                 // v11：内置关键词命中时加严格尺寸闸门——绝不让「包含 banner 的大卡片」整块消失
                 if (builtinHit && !classHardHit && (r.size.height > sh * 0.30 || r.size.width < 90 || texts.count > 16)) {
                     // v42：计数去重——同一节点每轮都会走到这里，旧写法让「挡」每 tick 上涨。
@@ -2866,8 +3128,12 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
             }
         }
     }
+    // v49：顶部保护区——搜索框/导航条。老大明确要求「搜索框要保留」，而点选 banner 时
+    // 最容易顺手点到它。这一带既不隐藏、也不存 pos 规则，当场在浮标上说明白。
+    CGRect pickRect = [card convertRect:card.bounds toView:nil];
+    BOOL topProtected = FCIsTopProtectedRect(pickRect);
     NSString *ruleText = FCPickRuleText(card);
-    CGRect markRect = [card convertRect:card.bounds toView:nil];
+    CGRect markRect = pickRect;
     NSString *cls = NSStringFromClass([hit class]);
     // v25：红框标签带上命中类名——老大反馈「部分元素无法选取」，截图带类名才能一次
     // 定位到底命中了什么（是 DXTextView 还是空壳 WK 还是别的），不再靠猜。
@@ -2895,6 +3161,16 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
         FCLog(@"点选降级：引擎判 H5，只记指纹不隐藏（%@ %.0fx%.0f @y%.0f）",
               NSStringFromClass([card class]), markRect.size.width, markRect.size.height,
               markRect.origin.y);
+    } else if (topProtected) {
+        // v49：顶部保护区只给反馈，不隐藏、不记规则/类名/位置——避免把搜索框压掉后无从恢复
+        FCLog(@"点选跳过：顶部保护区（%@ %.0fx%.0f @y%.0f）",
+              NSStringFromClass([card class]), markRect.size.width, markRect.size.height,
+              markRect.origin.y);
+        FCShowPickMark(markRect, @"顶部保护区·搜索/导航保留");
+        FCShowBadgeMsg([NSString stringWithFormat:
+            @"顶部保护区(搜索/导航)不处理 · %@ %.0fx%.0f", cls,
+            markRect.size.width, markRect.size.height]);
+        return;
     } else {
         card.hidden = YES;
         if (!gFCPickHidden) gFCPickHidden = [NSHashTable weakObjectsHashTable];
@@ -2925,7 +3201,7 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
         // 存下来命中即整页消失。真机「领券中心」这类卡片远小于全屏，照常存。
         CGRect cr = [curC convertRect:curC.bounds toView:nil];
         BOOL tooBig = cr.size.width >= fullW * 0.90 && cr.size.height >= fullH * 0.90;
-        if (hostClass && !webPriv && !tooBig && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
+        if (!topProtected && hostClass && !webPriv && !tooBig && c.length >= 6 && !FCIsUnsafeClassRule(c)) {
             FCAddUserRule([@"cls:" stringByAppendingString:c]);
             clsAdded++;
         }
@@ -2940,7 +3216,7 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // v48：再加一道——满宽且高过 1/3 屏的矩形不存（那是页面板块，压了就是大半页白）
     BOOL tooTallToStore = (nr.size.width >= scr.width * 0.90 &&
                            nr.size.height > scr.height * 0.30);
-    if (nr.size.width >= 40 && nr.size.height >= 18 && !tooTallToStore &&
+    if (!topProtected && nr.size.width >= 40 && nr.size.height >= 18 && !tooTallToStore &&
         !(nr.size.width >= scr.width * 0.90 && nr.size.height >= scr.height * 0.90)) {
         FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
             nr.origin.x/scr.width, nr.origin.y/scr.height,
@@ -3129,6 +3405,24 @@ static UIColor *FCRuleTypeColor(NSString *r) {
 }
 
 // v9：规则行——左侧类型标签 + 可编辑文字，左滑露出「编辑/删除」
+// v49：pos 规则在面板里显示成「看得懂的位置」。
+// 老大原话：「我点击规则里找不到这个，无法恢复显示」——列表里十几条 pos:0.000,0.115,1.000,0.197
+// 长得一模一样，根本认不出哪条是搜索框。显示成「位·顶部 x0% 11%~20% 满宽」就一眼能认。
+// 保存时必须写回原始串，所以原文按「展示串 → 原始串」存在字典里（见 gFCPosRuleRaw）。
+static NSMutableDictionary *gFCPosRuleRaw = nil;
+
+static NSString *FCPosRuleReadable(NSString *rule) {
+    if (![rule hasPrefix:@"pos:"]) return rule;
+    NSArray *p = [[rule substringFromIndex:4] componentsSeparatedByString:@","];
+    if (p.count != 4) return rule;
+    CGFloat x = [p[0] doubleValue], y = [p[1] doubleValue];
+    CGFloat w = [p[2] doubleValue], h = [p[3] doubleValue];
+    NSString *band = (y + h <= 0.22) ? @"顶部" : (y >= 0.80 ? @"底部" : @"中部");
+    NSString *wide = (w >= 0.85) ? @"满宽" : [NSString stringWithFormat:@"宽%.0f%%", w * 100];
+    return [NSString stringWithFormat:@"位·%@ x%.0f%% %.0f%%~%.0f%% %@",
+            band, x * 100, y * 100, (y + h) * 100, wide];
+}
+
 @interface FCRuleRow : UIView <UIGestureRecognizerDelegate>
 @property (nonatomic, strong) UITextField *field;
 @property (nonatomic, strong) UILabel *typeTag;
@@ -3179,7 +3473,13 @@ static UIColor *FCRuleTypeColor(NSString *r) {
     self.typeTag = tag;
 
     UITextField *f = [[UITextField alloc] initWithFrame:CGRectMake(40, 3, w - 46, h - 6)];
-    f.text = ph ? nil : rule;
+    // v49：pos 规则显示可读位置；原文登记进字典，保存时换回来
+    NSString *shown = ph ? nil : FCPosRuleReadable(rule);
+    f.text = shown;
+    if (!ph && shown && ![shown isEqualToString:rule]) {
+        if (!gFCPosRuleRaw) gFCPosRuleRaw = [NSMutableDictionary dictionary];
+        gFCPosRuleRaw[shown] = rule;
+    }
     f.placeholder = ph ? @"新增规则（广告文字）" : nil;
     f.font = [UIFont systemFontOfSize:12];
     f.clearButtonMode = UITextFieldViewModeWhileEditing;
@@ -3256,6 +3556,11 @@ static void FCCloseRulePanelAndCommit(BOOL commit) {
             UIView *v = q[idx++];
             if ([v isKindOfClass:[UITextField class]]) {
                 NSString *t = ((UITextField *)v).text;
+                // v49：pos 规则显示的是「位·顶部 …」，保存要写回原始 pos: 串
+                if (t.length && gFCPosRuleRaw) {
+                    NSString *raw = [gFCPosRuleRaw objectForKey:t];
+                    if (raw.length) t = raw;
+                }
                 if (t.length) [rules addObject:t];
             }
             for (UIView *sub in v.subviews) [q addObject:sub];
@@ -3720,8 +4025,15 @@ static void FCAppendZeroedList(void) {
             wh, sh > 0 ? wh / sh * 100 : 0,
             FCBigBlockPassOn() ? @"开" : @"关", kFCBigBlockH]);
     }
-    if (!out.count) FCAppendDiagText(@"[压0清单] 无高度≥100的压0记录");
-    else {
+    // v49：顶部保护区——满宽且整条落在顶部 22% 屏内的不压（搜索框/导航条）。
+    // 老大原话：「这个搜索框是要保留的」。跳过的节点数放这里，便于确认闸门有没有生效。
+    {
+        CGFloat sh2 = [UIScreen mainScreen].bounds.size.height;
+        FCAppendDiagText([NSString stringWithFormat:
+            @"[顶部保护区] 跳过 %lu 个节点（满宽 且 y+高 ≤ %.0fpt(屏高22%%) 一律不压）",
+            (unsigned long)gFCTopProtectedSkips, sh2 * 0.22]);
+    }
+    if (!out.count) FCAppendDiagText(@"[压0清单] 无高度≥100的压0记录");    else {
         FCAppendDiagText([NSString stringWithFormat:@"[压0清单] 高度≥100的压0记录 %lu 条:",
                           (unsigned long)out.count]);
         NSUInteger lim = out.count > 12 ? 12 : out.count;
@@ -3745,6 +4057,23 @@ static void FCAppendZeroedList(void) {
         }
         if (gFCRowProbe.length)
             FCAppendDiagText([@"[行高归零·代理] " stringByAppendingString:gFCRowProbe]);
+        // v49：系统 hook 取证——老大要验证「打开它留白是否真的归零」，这里能看清装了哪些
+        {
+            NSMutableArray *sysNames = [NSMutableArray array];
+            for (NSString *k in gFCRowHookedKeys) {
+                if ([k hasPrefix:@"UITableView|"]) {
+                    [sysNames addObject:[@"表格." stringByAppendingString:
+                                        [k componentsSeparatedByString:@"|"].lastObject]];
+                } else if ([k rangeOfString:@"Layout|"].location != NSNotFound) {
+                    [sysNames addObject:[@"布局." stringByAppendingString:
+                                        [k componentsSeparatedByString:@"|"].lastObject]];
+                }
+            }
+            FCAppendDiagText([NSString stringWithFormat:
+                @"[系统hook] 开关=%@ 已接管系统方法=%@（关掉立刻恢复，不必重启）",
+                FCSystemHookOn() ? @"开" : @"关",
+                sysNames.count ? [sysNames componentsJoinedByString:@" / "] : @"无"]);
+        }
     }
 #else
     FCAppendDiagText(@"[行高归零] Pure 档不支持（零 hook）");
@@ -3797,7 +4126,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v48 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v49 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -4286,10 +4615,17 @@ static void FCUpdateBadge(void) {
     // 但摆在浮标上只会让人怀疑出错，所以整体挪进诊断（诊断里写明「当前/累计」两种口径）。
     CGFloat whiteH = FCWhiteSpaceEstimate();
     NSString *big = FCBigBlockPassOn() ? @" 大块免压" : @"";
+    // v49：带上系统 hook 状态——老大要验证「打开它留白是不是真的归零」，浮标上得能看见。
+    // Pure 档没有 hook 能力，不显示（免得看着像生效了）。
+#ifdef FC_DEEP_HOOKS
+    NSString *sys = FCSystemHookOn() ? @" 系统hook" : @"";
+#else
+    NSString *sys = @"";
+#endif
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv48%@ 规则%lu 白%.0fpt%@ | 点我操作 | %@",
+        @"FCv49%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
-        (unsigned long)FCUserRules().count, whiteH, big, top];
+        (unsigned long)FCUserRules().count, whiteH, big, sys, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 }
 
@@ -4299,7 +4635,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv48 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv49 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -4310,7 +4646,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v48"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v49"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -4342,6 +4678,32 @@ static void FCShowActionMenu(void) {
                                        : @"大块免压已关·恢复全压(需重进页面生效)");
                      FCUpdateBadge();
                  }]];
+    // v49：系统 hook（实验·默认关）——老大要求「先放宽硬性约束，验证技术上的可行性」。
+    // 打开后允许接管 UITableView / UICollectionViewLayout 的系统行高与布局方法，
+    // 把被点名的行/项真正压成 0 高（解决「内容没了、留白还在」）。
+    // 关掉立刻恢复：trampoline 每次都查开关，关着就完全原样转发。
+#ifdef FC_DEEP_HOOKS
+    [ac addAction:[UIAlertAction actionWithTitle:(FCSystemHookOn() ? @"关闭「系统hook」(实验)" : @"开启「系统hook」(实验·压掉留白)")
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     BOOL on = !FCSystemHookOn();
+                     [[NSUserDefaults standardUserDefaults] setBool:on forKey:FCSystemHookKey];
+                     [[NSUserDefaults standardUserDefaults] synchronize];
+                     FCShowBadgeMsg(on ? @"系统hook已开·重新点选一次广告才登记行"
+                                       : @"系统hook已关·行高立刻恢复（不必重启）");
+                     FCUpdateBadge();
+                 }]];
+#else
+    // Pure 档：零 hook 是硬约束（CI 断言 nm -u 无 method_setImplementation），这里只提示不可用
+    [ac addAction:[UIAlertAction actionWithTitle:@"系统hook：本档不支持（装 Deep 档）"
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     // 这里读一次开关：既给用户准确信息，也保证 FCSystemHookKey 字面量不被裁掉
+                     FCShowBadgeMsg(FCSystemHookOn()
+                         ? @"Pure 档零 hook·此开关无效，请换装 Deep 档"
+                         : @"Pure 档零 hook·系统hook 需换装 Deep 档");
+                 }]];
+#endif
     [ac addAction:[UIAlertAction actionWithTitle:@"管理规则（查看/编辑/新增）" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCShowRulePanel(); }]];
     // v14：诊断当前页面——一次看清运营位在原生还是网页、命中了什么规则
