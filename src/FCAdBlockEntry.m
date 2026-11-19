@@ -508,8 +508,8 @@ static void FCUnmarkRowZero(UIView *cell);                     // v46：撤销�
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===46){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=46;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===47){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=47;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1545,11 +1545,47 @@ static BOOL FCIsSystemClassName(NSString *n) {
 // 被我们点名的 cell 直接返回高度 0，行就塌了（不依赖 delegate 实现 heightForRow）。
 static CGSize FCRowSizeTrampoline(id self, SEL _cmd, CGSize size, float hp, float vp) {
     if (gFCRowZeroCells && [gFCRowZeroCells containsObject:self]) {
-        return CGSizeMake(size.width, 0);
+        return CGSizeMake(size.width, 0);   // 被点名的行：高度算成 0，行自然塌掉
     }
     IMP orig = FCOrigRowIMPFor(self, _cmd);
+    if (!orig) {
+        // v47：本方法是用 class_addMethod 加在 App 类上的，没有「原 IMP」可查——
+        // 直接用父类（系统 UITableViewCell）的实现，注意只是**调用**它，没有改它。
+        Class sup = class_getSuperclass(object_getClass(self));
+        if (sup) orig = class_getMethodImplementation(sup, _cmd);
+    }
     if (!orig) return size;
     return ((CGSize (*)(id, SEL, CGSize, float, float))orig)(self, _cmd, size, hp, vp);
+}
+
+// v47：真机 v46 的取证——代理 MTTableViewHolder 没有 heightForRow、rowH=-1(automatic)，
+// 而 MTDinamicXCell 自己**没有**重写 systemLayoutSizeFittingSize（定义在 UITableViewCell）。
+// 于是「改 delegate 行高」和「改已有实现」两条路都走不通，行高永远塌不了，压完就留一块白。
+// 解法：给 App 自己的 cell 类**新增**一个同名方法（class_addMethod），此时父类（系统）
+// 的实现一个字都没动，只是子类有了自己的版本：被点名的实例返回 0 高，其它实例原样转给父类。
+static void FCEnsureCellSizeHook(Class cellCls) {
+    if (!cellCls) return;
+    if (FCIsSystemClassName(NSStringFromClass(cellCls))) return;
+    SEL sel = @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:);
+    if (!gFCRowHookedKeys) gFCRowHookedKeys = [NSMutableSet set];
+    NSString *key = [NSString stringWithFormat:@"%s|%s",
+                     class_getName(cellCls), sel_getName(sel)];
+    if ([gFCRowHookedKeys containsObject:key]) return;
+    // ① 该类自己已有实现（App 自定义）→ 直接换实现（原来的 IMP 会被存下来）
+    Class defCls = FCDefiningClassOf(cellCls, sel);
+    if (defCls == cellCls) {
+        FCHookRowSizeSel(cellCls, sel);
+        return;
+    }
+    // ② 只有父类（系统）有 → 给子类新增一份，不动系统实现
+    Method base = class_getInstanceMethod([UITableViewCell class], sel);
+    if (!base) return;
+    const char *types = method_getTypeEncoding(base);
+    if (!types) return;
+    if (class_addMethod(cellCls, sel, (IMP)FCRowSizeTrampoline, types)) {
+        [gFCRowHookedKeys addObject:key];
+        FCLog(@"行高归零：已给 %@ 新增尺寸方法（父类实现未改动）", NSStringFromClass(cellCls));
+    }
 }
 
 static void FCHookRowSizeSel(Class cls, SEL sel) {
@@ -1644,11 +1680,9 @@ static void FCMarkRowZero(UIView *cell) {
     Class cellCls = object_getClass(rc);
     SEL sSel = @selector(systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:);
     Class defCls = FCDefiningClassOf(cellCls, sSel);
-    BOOL sizeHooked = NO;
-    if (defCls && !FCIsSystemClassName(NSStringFromClass(defCls))) {
-        FCHookRowSizeSel(defCls, sSel);
-        sizeHooked = YES;
-    }
+    FCEnsureCellSizeHook(cellCls);
+    BOOL sizeHooked = [gFCRowHookedKeys containsObject:
+        [NSString stringWithFormat:@"%s|%s", class_getName(cellCls), sel_getName(sSel)]];
     gFCRowProbe = [NSString stringWithFormat:
         @"代理=%@ h=%@ e=%@ rowH=%.0f | cell=%@ 尺寸钩子=%@%@",
         dn, hasH ? @"有" : @"无", hasE ? @"有" : @"无", tv.rowHeight,
@@ -1837,6 +1871,7 @@ static CGFloat FCWhiteSpaceEstimate(void) {
     for (NSArray *tb in tables) {
         for (FCFlattenRecord *rec in tb) {
             if (!rec.zeroCollapsed || !rec.view) continue;
+            if (!rec.view.window) continue;   // v47：已离树的不算留白（否则数字虚高）
             if (FCViewHasZeroedAncestor(rec.view)) continue;
             h += rec.originalFrame.size.height;
         }
@@ -2168,6 +2203,20 @@ static void FCApplyNativeRules(void) {
     }
 }
 
+// v47：清掉「视图已经不在窗口里」的压0记录。
+// 为什么必须清：rec.view 是强引用 → 被压过的 DX cell 被复用完离树后，记录仍攥着它，
+// 越积越多（真机 v46 诊断里 311 条），于是浮标「压」一直涨、留白估算也虚高。
+// 只按「是否还在窗口里」判断，合理：真需要的节点下一轮扫描会重新压并重建记录。
+static void FCPruneDeadFlattenRecords(void) {
+    if (!gFCFlattened.count) return;
+    NSMutableArray *dead = [NSMutableArray array];
+    for (FCFlattenRecord *rec in gFCFlattened) {
+        UIView *v = rec.view;
+        if (!v || !v.window) [dead addObject:rec];
+    }
+    if (dead.count) [gFCFlattened removeObjectsInArray:dead];
+}
+
 static void FCScanOnce(void) {
     // v42：暂停拦截 / 点选冻结期间完全不扫——不压0、不隐藏、不拦模板。
     // 这是「无法选择广告元素」的根治：不扫就不会把用户想点的那块压掉。
@@ -2212,6 +2261,8 @@ static void FCScanOnce(void) {
     FCApplyNativeRules();
     // v45：行高归零登记的自愈——行号对应的 cell 换人了（数据刷新/复用）就撤销，避免压掉正常行
     FCPruneRowMarks();
+    // v47：清掉失效压0记录——否则「压」的数字只涨不跌（记录攥着已离树的 DX cell）
+    FCPruneDeadFlattenRecords();
     // v41：把本 tick 里入队的宿主重排放到扫描末尾统一做——定时器回调里执行，
     // 不在任何 UIKit update 事务中，避免 v40 那种「cell 配置期重入布局 → 野指针」闪退。
     FCPerformPendingRelayout();
@@ -3701,7 +3752,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v46 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v47 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -4178,18 +4229,22 @@ static void FCUpdateBadge(void) {
     if (gFCBadgeWindow.picking) return;
     if (gFCBadgeCollapsed) return;                        // 小白条不刷文字
     NSString *top = NSStringFromClass([FCTopViewController() class]) ?: @"-";
+    // v47：浮标只放「当前状态」，不放累计动作数。
+    // 老大 v46 反馈「原/压 的数字一直在涨」——那三个数里「原」是 gFCNativeHits（每轮扫描都 +1），
+    // 「压」把已离树的旧记录也算进去（强引用导致只增不减）。现在：
+    //   压 = 当前真正压着、且节点还在窗口里的对象数；
+    //   挡 = 当前还在的被挡节点数（弱表，天然只数活的）。
     NSUInteger zeroNow = 0;
-    for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
-    // v42：挡=去重节点数（不再每 tick 往上涨）；暂停时整体灰显提示
-    // v43：加「白」= 被压掉的坑位高度合计——把代价摆到浮标上，老大一眼看到压这条值不值
+    for (FCFlattenRecord *rec in gFCFlattened)
+        if (rec.zeroCollapsed && rec.view && rec.view.window) zeroNow++;
+    NSUInteger blockedNow = gFCBlockedSeen ? gFCBlockedSeen.count : 0;
     CGFloat whiteH = FCWhiteSpaceEstimate();
     NSString *big = FCBigBlockPassOn() ? @" 大块免压" : @"";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv46%@ 规则%lu 内%lu 挡%lu 原%lu 压%lu 白%.0fpt%@ | 点我操作 | %@",
+        @"FCv47%@ 规则%lu 压%lu 挡%lu 白%.0fpt%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
-        (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
-        (unsigned long)gFCBlockedUnique, (unsigned long)gFCNativeHits,
-        (unsigned long)zeroNow, whiteH, big, top];
+        (unsigned long)FCUserRules().count, (unsigned long)zeroNow,
+        (unsigned long)blockedNow, whiteH, big, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 }
 
@@ -4199,7 +4254,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv46 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv47 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -4210,7 +4265,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v46"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v47"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -4565,7 +4620,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v46 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v47 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
