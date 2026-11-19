@@ -1,5 +1,21 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v43（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v44（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v44 相对 v43（老大 v43 真机：「我的淘宝」里「超级88领券中心」怎么点都去不掉）：
+//    【现场】规则 5 条、压0 12 个、留白 466pt，目标卡片 `MTDinamicXCell 0,501 430x142`
+//    诊断里是 `压:否 tpl:- 拦:否`——没有任何规则认领它，而且规则列表里也没有它的指纹。
+//    【根因一·点选直接被劝退】`FCPickNative` 里 `fromWeb && trulyH5` 一成立就 `return`，
+//    只弹一句「网页拾取失败」。而这块卡片的引擎被判定成 H5（页面有满屏空壳 WKWebView 干扰），
+//    于是**一条 cls:/pos: 规则都没存下来**，用户点多少次都是白点。
+//    修：H5 判定时不再中断——仍然不隐藏（隐藏等于藏整个网页），但 cls:/pos: 指纹照存，
+//    交给扫描阶段的几何匹配去认领；提示也从「失败」改成「判定H5·已记N类+位置(不回退隐藏)」。
+//    【根因二·满宽卡片永远存不了 pos:】原门槛要求「宽 <90%屏 **且** 高 <90%屏」，
+//    可淘宝运营位几乎都满宽（430/430=100%），于是所有满宽卡片都被拒绝。
+//    修：与 `FCIsUnsafeClassRule` 对齐——危险条件是「宽≥90% 且 高≥90%」**同时**成立
+//    （那才是页面根容器的特征），只满足一个是正常卡片，允许保存。
+//    【顺手修】大块免压开关打开后，把「已经压掉的」大位还原——否则开关只对新命中生效，
+//    之前压的 155pt 大位照样留着白，等于没开。还原在 `FCReapplyAllZeroFrames` 开头做一次，
+//    并且四个压0 入口都已带 `FCShouldSkipBigBlock` 判断，不会压回去造成抖动。
 //
 //  v43 相对 v42（老大 v42 真机：点选能用了、挡的数字也不再涨，但首页顶部出现 ~580pt 大白块）：
 //    【现象】浮标 `规则9 挡0 压33`，首页 tab 栏以下到商品流之间整片空白。
@@ -469,8 +485,8 @@ static void FCPerformPendingRelayout(void);                   // v41：扫描 ti
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===43){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=43;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===44){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=44;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -1514,6 +1530,30 @@ static CGFloat FCWhiteSpaceEstimate(void) {
 // v32：每轮扫描开头重新施加所有压0压制——DX 引擎下一帧重设 frame 后由这里压回。
 // 这是压0模式能对抗「重绘复现」的核心：节点一直在树里，扫描器每轮都能找到它。
 static void FCReapplyAllZeroFrames(void) {
+    // v44：大块免压开关打开后，把「已经压掉的」大块逐步还原。
+    // 不做这一步，开关只对「新命中」生效，之前压的 155pt 大位照样留着白——等于没开。
+    if (FCBigBlockPassOn()) {
+        NSMutableArray *tables = [NSMutableArray array];
+        if (gFCFlattened) [tables addObject:gFCFlattened];
+        if (gFCSourceZeroed) [tables addObject:gFCSourceZeroed];
+        if (gFCShellZeroed) [tables addObject:gFCShellZeroed];
+        if (gFRotorZeroed) [tables addObject:gFRotorZeroed];
+        NSUInteger restored = 0;
+        for (NSMutableArray *tb in tables) {
+            NSMutableArray *gone = [NSMutableArray array];
+            for (FCFlattenRecord *rec in [tb copy]) {
+                if (rec.originalFrame.size.height <= kFCBigBlockH) continue;
+                @try {
+                    FCRestoreZeroRecord(rec);
+                    if (rec.view) rec.view.hidden = NO;
+                } @catch (NSException *e) { }
+                [gone addObject:rec];
+                restored++;
+            }
+            [tb removeObjectsInArray:gone];
+        }
+        if (restored) FCLog(@"大块免压：还原 %lu 处已压大位", (unsigned long)restored);
+    }
     for (FCFlattenRecord *rec in gFCFlattened) {
         if (rec.zeroCollapsed && rec.view) {
             CGRect f = rec.view.frame;
@@ -2383,18 +2423,24 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // 穿透换成 DX view（引擎非 H5），但祖先链仍可能挂空壳 WK → 误拦死。改为看命中元素引擎。
     FCEngine hitEngine = FCEngineOfView(hit);
     BOOL trulyH5 = (hitEngine == FCEngineH5);
-    if (fromWeb && trulyH5) {
-        // v42：把下一步直接写在提示里——老大不用猜该干什么。
-        FCShowBadgeMsg(@"H5内元素·网页拾取失败。请先「暂停拦截」→下拉刷新→再点选");
-        return;
+    // v44：真机「超级88领券中心」始终去不掉的根因就在这里——引擎把它判成 H5，
+    // 旧逻辑直接 return，结果一条规则都没存，用户点多少次都白点。
+    // 改为：真 H5 内容仍然不隐藏（隐藏=藏整个网页），但 cls:/pos: 指纹照存，
+    // 由扫描阶段的几何匹配去认领它，不依赖引擎判定。
+    BOOL h5Only = (fromWeb && trulyH5);
+    if (h5Only) {
+        FCLog(@"点选降级：引擎判 H5，只记指纹不隐藏（%@ %.0fx%.0f @y%.0f）",
+              NSStringFromClass([card class]), markRect.size.width, markRect.size.height,
+              markRect.origin.y);
+    } else {
+        card.hidden = YES;
+        if (!gFCPickHidden) gFCPickHidden = [NSHashTable weakObjectsHashTable];
+        [gFCPickHidden addObject:card];
+        gFCNativeHits++;
+        if (ruleText.length >= 2) FCAddUserRule(ruleText);
+        // v29：DX 动态化卡片存模板规则——Deep 档源头 setData: 按此拦截，根治「删了被重绘」
+        if (tplName.length) FCAddUserRule([@"tpl:" stringByAppendingString:tplName]);
     }
-    card.hidden = YES;
-    if (!gFCPickHidden) gFCPickHidden = [NSHashTable weakObjectsHashTable];
-    [gFCPickHidden addObject:card];
-    gFCNativeHits++;
-    if (ruleText.length >= 2) FCAddUserRule(ruleText);
-    // v29：DX 动态化卡片存模板规则——Deep 档源头 setData: 按此拦截，根治「删了被重绘」
-    if (tplName.length) FCAddUserRule([@"tpl:" stringByAppendingString:tplName]);
     // v18：跳过 webview 私有类(WKContentView 等)，从卡片往上找真正的宿主自定义类
     NSUInteger clsAdded = 0;
     UIView *curC = card;
@@ -2419,9 +2465,12 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     }
     CGSize scr = [UIScreen mainScreen].bounds.size;
     CGRect nr = [card convertRect:card.bounds toView:nil];
-    // v24：不存全屏 pos 规则（占屏≥90% 说明点中了根容器，存了必误伤/黑屏）
+    // v44：门槛与 FCIsUnsafeClassRule 对齐——旧条件要求「宽和高都 <90%屏」，
+    // 而淘宝运营位几乎都满宽（430/430=100%），于是所有满宽卡片都存不了 pos 规则，
+    // 点选永远无效（真机「超级88领券中心」430x142 就是这个死法）。
+    // 根容器的特征是「宽 ≥90% 屏 **且** 高 ≥90% 屏」同时成立，只满足一个是正常卡片。
     if (nr.size.width >= 40 && nr.size.height >= 18 &&
-        nr.size.width < scr.width * 0.90 && nr.size.height < scr.height * 0.90) {
+        !(nr.size.width >= scr.width * 0.90 && nr.size.height >= scr.height * 0.90)) {
         FCAddUserRule([NSString stringWithFormat:@"pos:%.3f,%.3f,%.3f,%.3f",
             nr.origin.x/scr.width, nr.origin.y/scr.height,
             nr.size.width/scr.width, nr.size.height/scr.height]);
@@ -2430,9 +2479,16 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // v20：网页降级提示(含"网页"/"H5")保持原样；引擎提示(如"DX动态·")不再重复"原生"二字
     BOOL enginePrefix = [prefix rangeOfString:@"网页"].location == NSNotFound &&
                         [prefix rangeOfString:@"H5"].location == NSNotFound && prefix.length > 0;
-    NSString *msg = enginePrefix
-        ? [NSString stringWithFormat:@"%@已记%lu类+位置", prefix, (unsigned long)clsAdded]
-        : [NSString stringWithFormat:@"%@原生·已记%lu类+位置", prefix, (unsigned long)clsAdded];
+    NSString *msg;
+    if (h5Only) {
+        // v44：明确告知「已记住」而不是「失败」——之前提示失败，用户以为没生效反复点
+        msg = [NSString stringWithFormat:@"判定H5·已记%lu类+位置(不回退隐藏)",
+               (unsigned long)clsAdded];
+    } else {
+        msg = enginePrefix
+            ? [NSString stringWithFormat:@"%@已记%lu类+位置", prefix, (unsigned long)clsAdded]
+            : [NSString stringWithFormat:@"%@原生·已记%lu类+位置", prefix, (unsigned long)clsAdded];
+    }
     // v29：把模板名带进浮标提示——老大截图即可确认源头拦截规则已存
     if (tplName.length) msg = [NSString stringWithFormat:@"%@|模板已记", msg];
     FCShowBadgeMsg(msg);
@@ -3248,7 +3304,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v43 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v44 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -3732,7 +3788,7 @@ static void FCUpdateBadge(void) {
     CGFloat whiteH = FCWhiteSpaceEstimate();
     NSString *big = FCBigBlockPassOn() ? @" 大块免压" : @"";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv43%@ 规则%lu 内%lu 挡%lu 原%lu 压%lu 白%.0fpt%@ | 点我操作 | %@",
+        @"FCv44%@ 规则%lu 内%lu 挡%lu 原%lu 压%lu 白%.0fpt%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBlockedUnique, (unsigned long)gFCNativeHits,
@@ -3746,7 +3802,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv43 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv44 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3757,7 +3813,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v43"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v44"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -4112,7 +4168,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v43 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v44 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
