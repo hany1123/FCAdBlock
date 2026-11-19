@@ -1561,6 +1561,8 @@ static CGSize FCRowSizeTrampoline(id self, SEL _cmd, CGSize size, float hp, floa
 // v47：真机 v46 的取证——代理 MTTableViewHolder 没有 heightForRow、rowH=-1(automatic)，
 // 而 MTDinamicXCell 自己**没有**重写 systemLayoutSizeFittingSize（定义在 UITableViewCell）。
 // 于是「改 delegate 行高」和「改已有实现」两条路都走不通，行高永远塌不了，压完就留一块白。
+static void FCHookRowSizeSel(Class cls, SEL sel);   // v47：前向声明（下面是新增方法，定义在它之后）
+
 // 解法：给 App 自己的 cell 类**新增**一个同名方法（class_addMethod），此时父类（系统）
 // 的实现一个字都没动，只是子类有了自己的版本：被点名的实例返回 0 高，其它实例原样转给父类。
 static void FCEnsureCellSizeHook(Class cellCls) {
