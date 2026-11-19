@@ -126,6 +126,10 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 @property (nonatomic, strong) NSArray<FCNetRecord *> *rows;
 @property (nonatomic, copy)   NSString *filter;
 @property (nonatomic, strong) FCNetRecord *currentDetailRecord;
+@property (nonatomic, strong) FCNetAnalysis *analysis;      // v54：当前分析结果
+@property (nonatomic, assign) BOOL showingAnalysis;         // v54：详情页正在显示分析报告
+@property (nonatomic, strong) UIButton *applyBtn;           // v54：「添加建议规则」
+@property (nonatomic, weak)   UIAlertController *patternAlert;   // v54：规则向导第1步弹窗
 - (void)reloadRows;
 - (void)fcPresent:(UIViewController *)vc;   // v52：延后一个 runloop 再 present
 - (void)fcPresent:(UIViewController *)vc attempt:(NSInteger)n;
@@ -141,6 +145,11 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 - (void)syncToggleTitle;
 - (void)refreshStatus;
 - (void)fcMode;
+- (void)fcAnalyze;                          // v54：一键分析当前记录
+- (void)fcApplySuggestions;                 // v54：把分析建议加成规则
+- (void)patternFieldChanged:(UITextField *)tf;   // v54：正则实时回测
+- (NSString *)patternHintFor:(NSString *)pattern;
+- (void)fcPreviewPattern:(NSString *)pattern;    // v54：列出实际命中的 URL 样本
 - (void)fcAddRuleStep1;
 - (void)fcAddRuleStep2:(NSString *)pattern;
 - (void)fcMockRule:(NSString *)pattern;
@@ -235,11 +244,24 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.detailBar = [[UIView alloc] initWithFrame:CGRectMake(0, top, w, 40)];
     self.detailBar.backgroundColor = [UIColor whiteColor];
     self.detailBar.hidden = YES;
-    UIButton *back = mk(@"← 返回列表", @selector(fcBack));
-    back.frame = CGRectMake(8, 7, 100, 26);
+    UIButton *back = mk(@"← 返回", @selector(fcBack));
+    back.frame = CGRectMake(8, 7, 72, 26);
     [self.detailBar addSubview:back];
-    UIButton *copyOne = mk(@"复制这条", @selector(fcCopyOne));
-    copyOne.frame = CGRectMake(w - 108, 7, 100, 26);
+    // v54：一键分析——放在最显眼的位置，这是本轮的主要入口
+    UIButton *analyze = mk(@"🔍 分析", @selector(fcAnalyze));
+    analyze.frame = CGRectMake(88, 7, 76, 26);
+    analyze.backgroundColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    [analyze setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.detailBar addSubview:analyze];
+    // v54：分析结果页才出现——把建议规则一键加进规则引擎
+    self.applyBtn = mk(@"＋ 添加建议", @selector(fcApplySuggestions));
+    self.applyBtn.frame = CGRectMake(w - 168, 7, 96, 26);
+    self.applyBtn.backgroundColor = [UIColor colorWithRed:0.15 green:0.6 blue:0.3 alpha:1];
+    [self.applyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    self.applyBtn.hidden = YES;
+    [self.detailBar addSubview:self.applyBtn];
+    UIButton *copyOne = mk(@"复制", @selector(fcCopyOne));
+    copyOne.frame = CGRectMake(w - 66, 7, 58, 26);
     [self.detailBar addSubview:copyOne];
     [self.view addSubview:self.detailBar];
 
@@ -362,10 +384,70 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 }
 
 - (void)fcCopyOne {
+    // v54：分析页上「复制」复制的是分析报告，不是原始报文
+    if (self.showingAnalysis && self.analysis.report.length) {
+        [UIPasteboard generalPasteboard].string = self.analysis.report;
+        [self toast:@"已复制分析报告"];
+        return;
+    }
     FCNetRecord *r = self.currentDetailRecord;
     if (!r) return;
     [UIPasteboard generalPasteboard].string = FCNetDetailText(r);
     [self toast:@"已复制这条（含头与体）"];
+}
+
+// ===== v54：一键分析 =====
+// 为什么放在详情页而不是列表长按：老大看的是「这一条」，分析也必须针对这一条，
+// 列表上多一个手势反而容易误触。
+- (void)fcAnalyze {
+    FCNetRecord *r = self.currentDetailRecord;
+    if (!r) { [self toast:@"没有选中的记录"]; return; }
+    self.analysis = FCNetAnalyzeRecord(r);
+    self.showingAnalysis = YES;
+    self.detail.text = self.analysis.report;
+    self.detail.contentOffset = CGPointZero;
+    self.applyBtn.hidden = NO;
+    // 建议多于「只有阻断」时才值得提示，否则老大点了也只有一个选项
+    if (self.analysis.suggestedRules.count > 1) {
+        [self toast:[NSString stringWithFormat:@"分析完成·%lu 条建议",
+                     (unsigned long)self.analysis.suggestedRules.count]];
+    }
+}
+
+- (void)fcApplySuggestions {
+    if (!self.showingAnalysis) { [self fcAnalyze]; return; }
+    NSArray<NSDictionary *> *rules = self.analysis.suggestedRules;
+    if (!rules.count) { [self toast:@"没有可添加的建议"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"添加到规则"
+        message:@"选中即刻生效（不需要重新抓包）"
+        preferredStyle:UIAlertControllerStyleActionSheet];
+
+    for (NSUInteger i = 0; i < rules.count; i++) {
+        NSDictionary *rule = rules[i];
+        NSString *title = FCNetRuleExplain(rule);
+        if (title.length > 56) title = [[title substringToIndex:56] stringByAppendingString:@"…"];
+        [ac addAction:[UIAlertAction actionWithTitle:title style:UIAlertActionStyleDefault
+            handler:^(UIAlertAction *a){
+                FCNetAddRule(rule);
+                [self toast:@"已添加该规则"];
+            }]];
+    }
+    if (rules.count > 1) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"全部添加" style:UIAlertActionStyleDestructive
+            handler:^(UIAlertAction *a){
+                for (NSDictionary *rule in rules) FCNetAddRule(rule);
+                [self toast:[NSString stringWithFormat:@"已添加 %lu 条规则",
+                             (unsigned long)rules.count]];
+            }]];
+    }
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (ac.popoverPresentationController) {
+        ac.popoverPresentationController.sourceView = self.detailBar;
+        ac.popoverPresentationController.sourceRect = self.applyBtn.frame;
+    }
+    [self fcPresent:ac];
 }
 
 - (void)fcBack {
@@ -377,6 +459,10 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.statusLabel.hidden = NO;
     self.detail.text = nil;
     self.currentDetailRecord = nil;
+    // v54：退出详情时清掉分析状态，否则下次点开别的记录还带着上一份报告
+    self.analysis = nil;
+    self.showingAnalysis = NO;
+    self.applyBtn.hidden = YES;
     [self reloadRows];   // v53：回来时重算空状态与计数
 }
 
@@ -445,29 +531,124 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 }
 
 - (void)fcAddRuleStep1 {
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"第 1 步：URL 匹配"
-                              message:@"填正则，留空表示匹配全部请求（危险）"
-                              preferredStyle:UIAlertControllerStyleAlert];
+    // v54：不再让老大从零写正则。拿最新一条记录自动泛化出正则（域名泛子域、数字段→\d+、
+    // 长 token→字符类、query 丢弃），进弹窗时已填好，并当场告诉他这条正则会命中几条。
+    NSString *auto = [self suggestedURLPattern];
+    NSString *seed = auto.length ? auto : @"";
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:(auto.length ? @"第 1 步：URL 正则（已自动生成）" : @"第 1 步：URL 正则")
+                         message:[self patternHintFor:seed]
+                  preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.placeholder = @"例：api\\.example\\.com/v1/ad";
+        tf.text = seed;
+        tf.placeholder = @"正则，匹配完整 URL";
         tf.font = [UIFont fontWithName:@"Menlo" size:12];
-        tf.text = [self suggestedURLPattern];
+        tf.autocapitalizationType = UITextAutocapitalizationTypeNone;
+        tf.autocorrectionType = UITextAutocorrectionTypeNo;
+        tf.spellCheckingType = UITextSpellCheckingTypeNo;
+        tf.clearButtonMode = UITextFieldViewModeWhileEditing;
+        [tf addTarget:self action:@selector(patternFieldChanged:)
+            forControlEvents:UIControlEventEditingChanged];
     }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    self.patternAlert = ac;
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel
+                 handler:^(UIAlertAction *a){ self.patternAlert = nil; }]];
+    // 「试匹配」：UIAlertController 的 message 在呈现后改不一定刷新（系统内部不保证），
+    // 所以另给一个确定能看结果的入口——列出实际命中的 URL 样本。
+    [ac addAction:[UIAlertAction actionWithTitle:@"试匹配" style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     self.patternAlert = nil;
+                     [self fcPreviewPattern:(ac.textFields.firstObject.text ?: @"")];
+                 }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"下一步" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){
-                     NSString *p = ac.textFields.firstObject.text ?: @"";
-                     [self fcAddRuleStep2:p];
+                     self.patternAlert = nil;
+                     [self fcAddRuleStep2:(ac.textFields.firstObject.text ?: @"")];
                  }]];
     [self fcPresent:ac];   // v52：延后一帧，避开「正在 presenting」冲突
 }
 
+// 边打字边回测。改 message 是「尽力而为」：能刷新最好，不刷新还有「试匹配」兜底。
+- (void)patternFieldChanged:(UITextField *)tf {
+    UIAlertController *ac = self.patternAlert;
+    if (!ac) return;
+    ac.message = [self patternHintFor:(tf.text ?: @"")];
+}
+
+- (NSString *)patternHintFor:(NSString *)pattern {
+    NSUInteger total = FCNetRecordCount();
+    if (!pattern.length) {
+        return (total
+                ? [NSString stringWithFormat:@"留空 = 匹配全部 %lu 条请求（危险）", (unsigned long)total]
+                : @"留空 = 匹配全部请求（危险）");
+    }
+    if (!FCNetPatternIsValid(pattern)) return @"⚠️ 正则语法错误，这条存不了（查括号和反斜杠）";
+    if (!total) return @"✓ 正则可保存；当前还没记录，抓一会儿再回来看命中";
+    NSUInteger hit = FCNetPatternHitCount(pattern);
+    if (hit == 0) return @"命中 0 条，保存后不会生效（可能漏了路径段或转了义）";
+    if (hit >= total && total > 1) {
+        return [NSString stringWithFormat:
+                @"命中全部 %lu 条，范围过宽（建议在路径里带上接口名）", (unsigned long)total];
+    }
+    if (hit > 8) {
+        return [NSString stringWithFormat:
+                @"命中 %lu/%lu 条，偏宽；确认是不是只想改这一族接口",
+                (unsigned long)hit, (unsigned long)total];
+    }
+    return [NSString stringWithFormat:@"✓ 命中 %lu/%lu 条，可保存",
+            (unsigned long)hit, (unsigned long)total];
+}
+
+// 列出实际命中的 URL（最多 6 条），让老大用眼睛确认正则抓的是不是他要的那族接口。
+- (void)fcPreviewPattern:(NSString *)pattern {
+    NSArray<NSString *> *hits = pattern.length ? FCNetPatternHits(pattern) : @[];
+    NSString *title;
+    NSString *body;
+    if (!FCNetPatternIsValid(pattern) && pattern.length) {
+        title = @"正则无效";
+        body = @"括号 / 反斜杠 / 字符类有问题，改好再试。";
+    } else if (!hits.count) {
+        title = @"命中 0 条";
+        body = (FCNetRecordCount()
+                ? @"当前记录里没有 URL 匹配这条正则。\n可把路径段删短一点再试。"
+                : @"还没有采集到记录，先去触发几个请求。");
+    } else {
+        NSUInteger n = hits.count;
+        NSUInteger total = FCNetRecordCount();
+        title = [NSString stringWithFormat:@"命中 %lu 条（共 %lu 条记录）",
+                 (unsigned long)FCNetPatternHitCount(pattern), (unsigned long)total];
+        NSMutableArray *lines = [NSMutableArray array];
+        for (NSUInteger i = 0; i < n && i < 6; i++) {
+            NSString *u = hits[i];
+            if (u.length > 110) u = [[u substringToIndex:110] stringByAppendingString:@"…"];
+            [lines addObject:u];
+        }
+        if (n > 6) [lines addObject:[NSString stringWithFormat:@"… 另有 %lu 条", (unsigned long)(n - 6)]];
+        body = [lines componentsJoinedByString:@"\n"];
+    }
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:title
+                              message:body preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"返回修改" style:UIAlertActionStyleCancel
+                 handler:^(UIAlertAction *a){ [self fcAddRuleStep1]; }]];
+    if (hits.count) {
+        [ac addAction:[UIAlertAction actionWithTitle:@"就用这条" style:UIAlertActionStyleDefault
+                     handler:^(UIAlertAction *a){ [self fcAddRuleStep2:pattern]; }]];
+    }
+    [self fcPresent:ac];
+}
+
 - (NSString *)suggestedURLPattern {
-    // 用最新一条记录给个起点，省得老大从零写正则
+    // v54：改用自动泛化。旧的 FCNetSuggestedRuleForRecord 生成的常带死值（时间戳、设备号），
+    // 换个请求就匹配不上；FCNetAutoPatternForURL 才是按「这一族接口」归纳的。
     NSArray *all = FCNetRecords();
     FCNetRecord *r = all.lastObject;
     if (!r) return @"";
-    return FCNetSuggestedRuleForRecord(r) ?: @"";
+    NSString *p = FCNetAutoPatternForURL(r.url);
+    if (p.length && FCNetPatternHitCount(p) == 0) {
+        // 泛化后连自己都不命中（极少见，一般是 URL 里有怪异编码）→ 原串转义兜底
+        p = [NSRegularExpression escapedPatternForString:r.url];
+    }
+    return p ?: @"";
 }
 
 - (void)fcAddRuleStep2:(NSString *)pattern {

@@ -79,6 +79,32 @@ NSString *FCNetRuleExplain(NSDictionary *rule);   // 一行中文描述，给 UI
 // 给主模块用的：把抓到的请求做成「元素隐藏规则」的辅助（域名+路径）
 NSString * _Nullable FCNetSuggestedRuleForRecord(FCNetRecord *rec);
 
+// ===== v54：一键分析 =====
+// 分析一条记录，产出：可读报告 + 广告特征分 + 一组「点了就能用」的候选规则。
+// 规则字典的结构与 FCNetRules() 的元素一致，可直接 FCNetAddRule()。
+@interface FCNetAnalysis : NSObject
+@property (nonatomic, copy)   NSString *report;        // 完整可读报告（含结构树/评分/建议）
+@property (nonatomic, assign) NSInteger adScore;       // 广告特征分，0 = 没看出广告特征
+@property (nonatomic, copy)   NSString *verdict;       // 一句话判定
+@property (nonatomic, strong) NSArray<NSString *> *highlights;   // 关键发现（一行一条）
+@property (nonatomic, strong) NSArray<NSDictionary *> *suggestedRules;  // 可直接添加的规则
+@end
+
+FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec);
+
+// ===== v54：自动正则 =====
+// 把一条 URL 泛化成「能复用于同类请求」的正则：
+//   · scheme → https?
+//   · 子域泛化（api.example.com → ([a-z0-9-]+\.)*example\.com）
+//   · 路径里的纯数字 → \d+，长 token/UUID → [\w-]+
+//   · query 直接丢弃（变化最频繁，保留会让命中率归零）
+NSString *FCNetAutoPatternForURL(NSString * _Nullable url);
+
+// 回测：这条正则能命中当前已抓记录里的几条（返回命中的 URL，最多 20 条）
+NSArray<NSString *> *FCNetPatternHits(NSString * _Nullable pattern);
+NSUInteger FCNetPatternHitCount(NSString * _Nullable pattern);
+BOOL FCNetPatternIsValid(NSString * _Nullable pattern);
+
 // 启动时调一次：恢复开关状态、装好 NSURLProtocol
 void FCNetBootstrap(void);
 
