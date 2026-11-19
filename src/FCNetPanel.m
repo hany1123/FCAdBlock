@@ -126,6 +126,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 @property (nonatomic, strong) FCNetRecord *currentDetailRecord;
 - (void)reloadRows;
 - (void)fcPresent:(UIViewController *)vc;   // v52：延后一个 runloop 再 present
+- (void)fcPresent:(UIViewController *)vc attempt:(NSInteger)n;
 - (void)fcBack;                             // v52：回到列表（重开面板时复位）
 // 下面这些都被 @selector(...) 引用，先声明出来——否则编译器在 viewDidLoad 处
 // 还不知道它们存在，会报「undeclared selector」警告。
@@ -314,20 +315,21 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 // 表现就是点了「下一步」什么都没发生。这里等上一个弹窗真正退场再 present，
 // 最多等 6×0.12s；等不到就放弃（说明确实有别的东西挡着），绝不吞掉用户的操作意图。
 - (void)fcPresent:(UIViewController *)vc {
-    __block void (^tryPresent)(NSInteger);
-    __weak typeof(self) ws = self;
-    tryPresent = ^(NSInteger n) {
-        typeof(self) s = ws;
-        if (!s) return;
-        if (s.presentedViewController) {
-            if (n >= 6) return;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
-                           dispatch_get_main_queue(), ^{ tryPresent(n + 1); });
-            return;
-        }
-        [s presentViewController:vc animated:YES completion:nil];
-    };
-    tryPresent(0);
+    [self fcPresent:vc attempt:0];
+}
+
+- (void)fcPresent:(UIViewController *)vc attempt:(NSInteger)n {
+    if (self.presentedViewController) {
+        if (n >= 6) return;
+        __weak typeof(self) ws = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.12 * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            typeof(self) s = ws;
+            if (s) [s fcPresent:vc attempt:n + 1];
+        });
+        return;
+    }
+    [self presentViewController:vc animated:YES completion:nil];
 }
 
 #pragma mark 规则
