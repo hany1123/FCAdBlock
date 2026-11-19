@@ -455,7 +455,7 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     NSInteger urlScore = FCAdScoreForKey(rec.url ?: @"");
     if (urlScore > 0) {
         total += urlScore;
-        [hits addObject:[NSString stringWithFormat:@"URL 路径关键词 (+%ld)", (long)urlScore)];
+        [hits addObject:[NSString stringWithFormat:@"URL 路径关键词 (+%ld)", (long)urlScore]];
     }
     if (hits.count) {
         [rep appendFormat:@"命中 %lu 处：%@\n", (unsigned long)hits.count,
