@@ -41,23 +41,23 @@ static NSAttributedString *FCNetReportAttr(NSString *text) {
     NSArray<NSString *> *lines = [text componentsSeparatedByString:@"\n"];
     for (NSString *line in lines) {
         UIFont *f = base;
-        UIColor *col = FCInk;
+        UIColor *col = FCInk();
         NSString *trim = [line stringByTrimmingCharactersInSet:
                           [NSCharacterSet whitespaceCharacterSet]];
 
         if ([trim hasPrefix:@"▍"]) {                       // 小节标题
             f = [UIFont systemFontOfSize:13 weight:UIFontWeightBold];
-            col = FCDeep;
+            col = FCDeep();
         } else if ([trim hasPrefix:@"↳"]) {                // 原因 / 可改
-            col = FCOrange;
+            col = FCOrange();
         } else if ([trim containsString:@"★"] || [trim containsString:@"判定："] ||
                    [trim containsString:@"很可能是广告"]) {
-            col = FCRed;                                    // 广告特征命中
+            col = FCRed();                                    // 广告特征命中
             f = [UIFont systemFontOfSize:12 weight:UIFontWeightSemibold];
         } else if ([trim hasPrefix:@"✓"]) {
-            col = FCGreen;
+            col = FCGreen();
         } else if ([trim containsString:@"·可疑"]) {       // 低分但仍带广告词
-            col = FCOrange;
+            col = FCOrange();
         } else if ([trim hasPrefix:@"http"] || [trim hasPrefix:@"GET "] ||
                    [trim hasPrefix:@"POST "] || [trim hasPrefix:@"PUT "] ||
                    [trim hasPrefix:@"DELETE "]) {           // 接口地址
@@ -68,12 +68,12 @@ static NSAttributedString *FCNetReportAttr(NSString *text) {
             NSScanner *sc = [NSScanner scannerWithString:trim];
             NSInteger score = 0;
             if ([sc scanInteger:&score]) {
-                if (score >= 3)      { col = FCRed; }
-                else if (score > 0)  { col = FCOrange; }
-                else                 { col = FCMuted; }
+                if (score >= 3)      { col = FCRed(); }
+                else if (score > 0)  { col = FCOrange(); }
+                else                 { col = FCMuted(); }
             }
         } else if ([trim hasPrefix:@"⚠"]) {
-            col = FCOrange;
+            col = FCOrange();
         }
 
         NSString *body = line.length ? line : @" ";
