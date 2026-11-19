@@ -1,5 +1,23 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v50（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v51（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v51 相对 v50（老大 v50 真机截图：「这里会误判为导航栏」）
+//    【现场】两张截图，浮标都写着 `FCv50 顶部保护区(搜索/导航)不处理`：
+//      · 首页「关注 / 推荐 / 直播 / 超级88 / 穿搭」频道栏 `DXRootView 430x86`；
+//      · 我的淘宝「本月已省5.0元 / 会员中心 / 88VIP / 红包优惠券…」会员卡 `DXRootView 430x184`。
+//      两块都是运营位，都被保护区挡下 → 老大点都点不掉。
+//    【根因】v50 的判据是「满宽 && 高 ≤ 22%屏(205pt) && 下沿 ≤ 35%屏」，这两个条件
+//      86pt 和 184pt 都满足。**几何上分不开"导航条"和"运营条"**——它们都满宽、都靠上。
+//    【做法一·收紧几何】真正的高度是天然分开的：搜索框 44pt、频道栏 86pt、会员卡 184pt。
+//      判据改成「满宽 && 高 ≤ 70pt && 下沿 ≤ 20%屏」，一刀下去只有搜索框命中。
+//      **不能**附加「含输入控件」条件——淘宝搜索框是 DX 自绘的，里面不一定有 UITextField，
+//      加了反而让搜索框失去保护、退回 v48 那个"搜索框被压掉找不回"的状态。
+//    【做法二·新增内容保护】`FCRectContainsSearchField`：每轮扫描开头把「真·输入控件」
+//      （UITextField / UISearchTextField / UISearchBar，屏幕上部 30%）的矩形收一遍，
+//      命中矩形只要与其中之一相交就一律不压。这是防止「已存规则把搜索框包进去」的硬闸门，
+//      与几何保护区互补：几何拦"点选时误存"，内容拦"旧规则命中"。
+//    【做法三·两处口径必须一致】`FCSanitizeUserRules` 的自愈判据同步改成同一口径，
+//      否则会出现「保护住了但规则删不掉」（v49 就是这么来的）。
 //
 //  v50 相对 v49（老大 v49 真机：「部分元素刷新还是会恢复，页面会显示下再消失」）
 //    【症状合起来是一件事】只有几何（pos）规则时必然两个毛病：
@@ -559,8 +577,8 @@ static NSString *FCTemplateNameOfView(UIView *v);              // v50：pos 规�
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===50){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=50;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===51){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=51;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -707,12 +725,12 @@ static void FCSanitizeUserRules(void) {
                 CGFloat y = [p[1] doubleValue];
                 if (w >= 0.90 && h > 0.35) bad = YES;
                 // v49：顶部保护区的 pos 规则——老大要保留搜索框。
-                // 真机 v48：为了选下面的 banner 点到了搜索框，存下 pos:0.000,0.115,1.000,0.197，
-                // 搜索框整条被压掉，规则列表里那条 pos 看着和别的没区别、找不到也删不掉。
-                // 这里清掉它，FCRestoreFlattenedIfNeeded 下一轮就会把搜索框插回来。
-                // v50：口径同步放宽成「矮条 + 下沿 ≤ 35% 屏」——真机那条下沿 31.2%，
-                // v49 的 22% 没兜住，所以它一直留在列表里、搜索框一直被压。
-                else if (w >= 0.85 && y >= 0 && h <= 0.22 && (y + h) <= 0.35) bad = YES;
+                // v51：口径与 FCIsTopProtectedRect 对齐（满宽 && 高 ≤ 70pt && 下沿 ≤ 20%屏）。
+                // v49/v50 用过「22%~35% 屏」的宽松口径，结果把频道栏(86pt)、会员卡(184pt)
+                // 也当导航条，老大点都点不掉；这里必须同步收紧，否则「保护住了但规则删不掉」。
+                else if (w >= 0.85 && y >= 0 &&
+                         h * [UIScreen mainScreen].bounds.size.height <= 70.0 &&
+                         (y + h) <= 0.20) bad = YES;
             }
         }
         if (bad) { dropped++; continue; }
@@ -1433,6 +1451,9 @@ static NSUInteger gFCBlockedUnique = 0;   // 去重后的被挡节点数（浮�
 // v49：顶部保护区跳过的节点（去重，诊断显示「保护区 N」）
 static NSUInteger gFCTopProtectedSkips = 0;
 static NSHashTable *gFCTopProtectedSeen = nil;
+// v51：被「内容保护」拦下的节点（矩形内含输入控件）——诊断显示「输入保护 N」
+static NSUInteger gFCSearchGuardSkips = 0;
+static NSHashTable *gFCSearchGuardSeen = nil;
 // v42：被源头拦截过的 DXRootView 弱表——实例级标记 kFCBlockedRoot 是关联对象，遍历不到；
 // 「暂停拦截」时必须能逐个清标记，否则这些 root 会带着旧标记被 setData hook 继续 return。
 static NSHashTable *gFCBlockedRoots = nil;
@@ -1459,21 +1480,73 @@ static BOOL FCSystemHookOn(void) {
     return [[NSUserDefaults standardUserDefaults] boolForKey:FCSystemHookKey];
 }
 
-// v49：顶部保护区——搜索框/导航条所在的那一条不压。
-// 真机 v48 教训：老大为了选下面的 banner，点到了搜索框区域，存下 pos:0,0.115,1,0.197，
-// 结果整个搜索框被压没了，而规则列表里那条 pos 看起来和别的位置规则一模一样，找不到、也删不掉。
-// v50 修正判据：v49 用「下沿 ≤ 22% 屏」，而真机那条规则的下沿是 31.2% 屏（107~291pt / 932pt）
-// → 没兜住，搜索框照样被压、规则也清不掉。改成「矮条 + 起点靠上」：
-//   满宽(≥85%屏) && 高 ≤ 22%屏 && 下沿 ≤ 35%屏 && y ≥ 0
-// 实测只命中搜索框那条，不会波及 y313~403 的运营位（规则8）与 y429 起的板块。
+// v51：本轮的「真·输入控件」屏幕矩形（每轮扫描开头刷新一次，见 FCRefreshSearchRects）。
+// 为什么要它：光靠几何永远分不开「搜索框」和「运营条」——真机 v50 里
+// 「关注/推荐/超级88/穿搭」频道栏 430x86 和「本月已省5.0元/会员中心/88VIP」会员卡 430x184
+// 都是满宽、都靠上、都够矮，全被判成导航栏保护掉了，老大点都点不掉。
+// 唯一可靠的硬区别是**里面有没有输入控件**：导航/搜索条有，运营条没有。
+static NSMutableArray<NSValue *> *gFCSearchRects = nil;
+static NSUInteger gFCSearchRectCount = 0;   // 诊断显示用
+
+static void FCRefreshSearchRects(void) {
+    if (!gFCSearchRects) gFCSearchRects = [NSMutableArray array];
+    [gFCSearchRects removeAllObjects];
+    Class searchTF = NSClassFromString(@"UISearchTextField");
+    Class searchBar = NSClassFromString(@"UISearchBar");
+    for (UIWindow *w in FCAllWindows()) {
+        NSString *wc = NSStringFromClass([w class]);
+        if ([wc hasPrefix:@"FCBadge"] || [wc hasPrefix:@"FCPanel"] || [wc hasPrefix:@"FCDiag"]) continue;
+        if (w.hidden || w.alpha < 0.01) continue;
+        NSMutableArray<UIView *> *q = [NSMutableArray arrayWithObject:w];
+        NSUInteger idx = 0;
+        while (idx < q.count && idx < 900 && gFCSearchRects.count < 40) {
+            UIView *v = q[idx++];
+            BOOL isField = [v isKindOfClass:[UITextField class]] ||
+                           (searchTF && [v isKindOfClass:searchTF]) ||
+                           (searchBar && [v isKindOfClass:searchBar]);
+            if (isField && !v.hidden && v.alpha > 0.01) {
+                CGRect r = [v convertRect:v.bounds toView:nil];
+                // 只收屏幕上部 30% 的——搜索框保护只关心这一带，少收点省遍历
+                if (r.size.width >= 20 && r.size.height >= 8 &&
+                    r.origin.y >= 0 && r.origin.y < [UIScreen mainScreen].bounds.size.height * 0.30)
+                    [gFCSearchRects addObject:[NSValue valueWithCGRect:r]];
+            }
+            for (UIView *s in v.subviews) [q addObject:s];
+        }
+    }
+    gFCSearchRectCount = gFCSearchRects.count;
+    // 日志限次：每轮扫描都会刷，NSLog 会淹掉别的证据
+    static NSUInteger sRefLogs = 0;
+    if (sRefLogs < 3) { sRefLogs++; FCLog(@"输入控件取证：本轮 %lu 个", (unsigned long)gFCSearchRectCount); }
+}
+// 这个屏幕矩形里是否含真·输入控件（搜索框内层 / 搜索框本体）
+static BOOL FCRectContainsSearchField(CGRect r) {
+    if (!gFCSearchRects.count) return NO;
+    if (r.size.width < 1 || r.size.height < 1) return NO;
+    for (NSValue *v in gFCSearchRects) {
+        if (CGRectIntersectsRect(r, v.CGRectValue)) return YES;
+    }
+    return NO;
+}
+
+// v49/v50/v51：顶部保护区——只有真正的搜索/导航条不压也不记规则。
+// 真机演进：
+//   v48 老大为了选下面的 banner 点到搜索框，存下 pos:0,0.115,1,0.197 → 搜索框被压、规则认不出；
+//   v49 用「下沿 ≤22% 屏」→ 没兜住（真实下沿 31.2%）；
+//   v50 放宽成「高 ≤22%屏 && 下沿 ≤35%屏」→ 兜住了，但**顺带把频道栏(86pt)和会员卡(184pt)
+//       也当成导航栏保护**，老大点不掉；
+//   v51 收紧到「高 ≤ 70pt && 下沿 ≤ 20%屏」。
+//        真机三种条的高度是天然分开的：搜索框 44pt、频道栏 86pt、会员卡 184pt
+//        → 70pt 这条线一刀切下去，只有搜索框命中，运营条全部放开、可以正常点选删除。
+//        注意：这里**不能**附加「含输入控件」条件——淘宝搜索框是 DX 自绘的，
+//        里面不一定有 UITextField，加了反而让搜索框失去保护。内容检测只用在压0 那道闸门上。
 static BOOL FCIsTopProtectedRect(CGRect r) {
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
     if (r.size.width < sw * 0.85) return NO;
-    if (r.size.height < 1) return NO;
-    if (r.size.height > sh * 0.22) return NO;
+    if (r.size.height < 1 || r.size.height > 70.0) return NO;
     if (r.origin.y < 0) return NO;
-    return CGRectGetMaxY(r) <= sh * 0.35;
+    return CGRectGetMaxY(r) <= sh * 0.20;
 }
 
 // v45：向上找「所在表格行」——我的淘宝/丰巢这类列表页，每个板块 = 一个 UITableViewCell
@@ -2330,6 +2403,7 @@ static void FCApplyNativeRules(void) {
     FCPruneBlockedCellShells();            // v37：外壳 cell 复用自愈——坑位内容恢复正常就还原外壳
     FCPruneRotorCells();                   // v38：轮播空壳自愈——内部冒出正常文字就还原（独立口径）
     FCReapplyAllZeroFrames();              // v32：每轮重新压制——对抗 DX 重设 frame
+    FCRefreshSearchRects();                // v51：刷新本轮「输入控件」矩形，供搜索框保护用
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     static char kHiddenByFC;
     for (UIWindow *w in FCAllWindows()) {
@@ -2466,6 +2540,22 @@ static void FCApplyNativeRules(void) {
                 if (hit) break;
             }
             if (hit) {
+                // v51：内容保护——命中矩形里含真·输入控件就绝不压。
+                // 这是「搜索框被误压」的最后一道硬闸门：哪怕规则矩形把搜索框整条包进去了
+                // （真机那条 pos:0.000,0.115,1.000,0.197 高 184pt 就是这种），也一律不动。
+                // 与几何保护区互补：几何拦「点选时误存」，内容拦「已存的规则命中」。
+                if (FCRectContainsSearchField(r)) {
+                    gFCSearchGuardSkips++;
+                    if (!gFCSearchGuardSeen) gFCSearchGuardSeen = [NSHashTable weakObjectsHashTable];
+                    if (![gFCSearchGuardSeen containsObject:v]) {
+                        [gFCSearchGuardSeen addObject:v];
+                        FCLog(@"输入控件保护：跳过 %@ %.0fx%.0f @y%.0f（规则 %@）",
+                              vcls, r.size.width, r.size.height, r.origin.y,
+                              hitRule.length ? hitRule : @"-");
+                    }
+                    for (UIView *sub in v.subviews) [q addObject:sub];
+                    continue;
+                }
                 // v49：顶部保护区——搜索框/导航所在的那一条不压。
                 // 只拦 pos 规则命中的（cls:/文案规则是用户明确指定类型的，照常生效）。
                 // 为什么单独拦：老大要「搜索框保留」，而 pos 规则最容易在点选 banner 时被顺手存到。
@@ -4132,8 +4222,12 @@ static void FCAppendZeroedList(void) {
     {
         CGFloat sh2 = [UIScreen mainScreen].bounds.size.height;
         FCAppendDiagText([NSString stringWithFormat:
-            @"[顶部保护区] 跳过 %lu 个节点（满宽 且 y+高 ≤ %.0fpt(屏高22%%) 一律不压）",
-            (unsigned long)gFCTopProtectedSkips, sh2 * 0.22]);
+            @"[顶部保护区] 跳过 %lu 个节点（满宽 && 高≤70pt && 下沿≤%.0fpt(屏高20%%) 才算搜索/导航条）",
+            (unsigned long)gFCTopProtectedSkips, sh2 * 0.20]);
+        // v51：内容保护——矩形内含输入控件（真正的搜索输入框）就一律不压
+        FCAppendDiagText([NSString stringWithFormat:
+            @"[输入控件保护] 本轮找到 %lu 个输入控件 / 拦下 %lu 个含输入控件的命中",
+            (unsigned long)gFCSearchRectCount, (unsigned long)gFCSearchGuardSkips]);
     }
     if (!out.count) FCAppendDiagText(@"[压0清单] 无高度≥100的压0记录");    else {
         FCAppendDiagText([NSString stringWithFormat:@"[压0清单] 高度≥100的压0记录 %lu 条:",
@@ -4228,7 +4322,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v50 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v51 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -4725,7 +4819,7 @@ static void FCUpdateBadge(void) {
     NSString *sys = @"";
 #endif
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv50%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
+        @"FCv51%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
         (unsigned long)FCUserRules().count, whiteH, big, sys, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -4737,7 +4831,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv50 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv51 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -4748,7 +4842,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v50"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v51"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
