@@ -1,5 +1,26 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v49（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v50（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v50 相对 v49（老大 v49 真机：「部分元素刷新还是会恢复，页面会显示下再消失」）
+//    【症状合起来是一件事】只有几何（pos）规则时必然两个毛病：
+//      · 压0 只能在扫描 tick 里发生 → DX 每次重建先渲染出来、约 0.12s 后才被压掉 = 闪一下；
+//      · pos 靠容差（±7/±14/±20pt）匹配 → 布局一移位（某板块消失导致整体上移）就失配 = 恢复。
+//      两个症状同时消失只有一个办法：拿到**模板名**，让 `setTemplateItem:` 在渲染前就拦。
+//    【根因一·首页板块从来没被压过】`FCRowZeroCapable` 从 v45 起只认 `UITableViewCell`。
+//      真机 v49 诊断：`[高度] DXRootView | 201x265 @y613 | 宿主=AliIFCollectionView`——
+//      首页双列卡片在集合里，不是表格行 → 判「不能归零」→ 大块免压（阈值 120pt）永远挡住
+//      （265/333pt 全超阈值）→ 压0 一次都没发生，点选当场 hidden 有效、刷新就回来。
+//      修：认 `UICollectionViewCell`；同时把「升级到整行」扩成「升级到整行/整项」，
+//      集合项阈值 40% 屏（333pt/932=35.7%，用 30% 会漏）。
+//    【根因二·27 条规则只有 4 条是 tpl】`FCTemplateNameOfView` 只沿祖先链向上找 DXRootView。
+//      而目标一旦升级成整行 cell，DXRootView 在 cell **内部**，向上永远返回 nil →
+//      点选只能退化成 pos 规则。修：加一条向下 BFS（限 160 节点），并且
+//      压0 成功后自动把该节点背后的模板名追加成 `tpl:` 规则（`FCMaybeUpgradeRuleToTpl`，
+//      规则数 ≥34 时停手，留余量给用户手动加）——下一轮重建就由源头拦截接管，不闪也不回弹。
+//    【根因三·搜索框那条规则清不掉】v49 的顶部保护区判据是「下沿 ≤ 22% 屏」，
+//      而真机那条 `pos:0.000,0.115,1.000,0.197` 下沿是 31.2% 屏（107~291pt / 932pt）
+//      → 既没被保护、也没被自愈清掉，搜索框一直被压。改成「满宽 && 高 ≤ 22%屏 && 下沿 ≤ 35%屏」，
+//      实测只命中搜索框那条，不波及 y313~403 的运营位（规则8）与 y429 起的板块。
 //
 //  v49 相对 v48（老大原话：「先放宽硬性约束，验证技术上的可行性，增加系统hook开关兜底」；
 //  另反馈两点：首页也是「点选时消失、返回又恢复」；搜索框要保留但规则里找不到、恢复不了）
@@ -531,14 +552,15 @@ static void FCMarkRowZero(UIView *cell);                      // v45：把所在
 static void FCPruneRowMarks(void);                            // v45：每轮校验行号归属，防止压错正常行
 static void FCUnmarkRowZero(UIView *cell);                     // v46：撤销行高归零登记（规则被删/记录还原时）
 static void FCMarkCollectionItem(UIView *cell);                // v49：集合视图 cell 登记（Deep 才有实现）
+static NSString *FCTemplateNameOfView(UIView *v);              // v50：pos 规则自动升级 tpl 要用（定义在后面）
 
 #pragma mark - H5 脚本模板
 
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===49){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=49;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===50){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=50;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -688,7 +710,9 @@ static void FCSanitizeUserRules(void) {
                 // 真机 v48：为了选下面的 banner 点到了搜索框，存下 pos:0.000,0.115,1.000,0.197，
                 // 搜索框整条被压掉，规则列表里那条 pos 看着和别的没区别、找不到也删不掉。
                 // 这里清掉它，FCRestoreFlattenedIfNeeded 下一轮就会把搜索框插回来。
-                else if (w >= 0.85 && y >= 0 && (y + h) <= 0.22) bad = YES;
+                // v50：口径同步放宽成「矮条 + 下沿 ≤ 35% 屏」——真机那条下沿 31.2%，
+                // v49 的 22% 没兜住，所以它一直留在列表里、搜索框一直被压。
+                else if (w >= 0.85 && y >= 0 && h <= 0.22 && (y + h) <= 0.35) bad = YES;
             }
         }
         if (bad) { dropped++; continue; }
@@ -1438,14 +1462,18 @@ static BOOL FCSystemHookOn(void) {
 // v49：顶部保护区——搜索框/导航条所在的那一条不压。
 // 真机 v48 教训：老大为了选下面的 banner，点到了搜索框区域，存下 pos:0,0.115,1,0.197，
 // 结果整个搜索框被压没了，而规则列表里那条 pos 看起来和别的位置规则一模一样，找不到、也删不掉。
-// 判定：满宽（>=85%屏）且整个矩形都落在顶部 22% 屏内 —— 这一带是搜索/导航，不是运营位。
+// v50 修正判据：v49 用「下沿 ≤ 22% 屏」，而真机那条规则的下沿是 31.2% 屏（107~291pt / 932pt）
+// → 没兜住，搜索框照样被压、规则也清不掉。改成「矮条 + 起点靠上」：
+//   满宽(≥85%屏) && 高 ≤ 22%屏 && 下沿 ≤ 35%屏 && y ≥ 0
+// 实测只命中搜索框那条，不会波及 y313~403 的运营位（规则8）与 y429 起的板块。
 static BOOL FCIsTopProtectedRect(CGRect r) {
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
     if (r.size.width < sw * 0.85) return NO;
     if (r.size.height < 1) return NO;
+    if (r.size.height > sh * 0.22) return NO;
     if (r.origin.y < 0) return NO;
-    return CGRectGetMaxY(r) <= sh * 0.22;
+    return CGRectGetMaxY(r) <= sh * 0.35;
 }
 
 // v45：向上找「所在表格行」——我的淘宝/丰巢这类列表页，每个板块 = 一个 UITableViewCell
@@ -1461,28 +1489,46 @@ static UITableViewCell *FCEnclosingRowCell(UIView *v) {
     return nil;
 }
 
+// v50：向上找「所在的行/项 cell」——表格行与集合项统一。
+// 首页板块（AliIFCollectionView 里的双列卡片）只有走这条才能拿到真正占高度的那一层。
+static UIView *FCEnclosingRowItemCell(UIView *v) {
+    UIView *cur = v;
+    int guard = 0;
+    while (cur && guard++ < 7) {
+        if ([cur isKindOfClass:[UITableViewCell class]] ||
+            [cur isKindOfClass:[UICollectionViewCell class]]) return cur;
+        cur = cur.superview;
+    }
+    return nil;
+}
+
 // v45：这个 view 压0 之后，能不能把「占的位置」也一起还回来？
 // 表格行可以（把行高改成 0），其它容器不行（只能留白）。这个判断决定「大块免压」要不要跳过它：
 // 免压的本意是「别制造大留白」，而能归零的行压了不会留白，就不该被跳过。
 static BOOL FCRowZeroCapable(UIView *v) {
 #ifdef FC_DEEP_HOOKS
     if (!v) return NO;
-    UITableViewCell *rc = [v isKindOfClass:[UITableViewCell class]]
-        ? (UITableViewCell *)v : FCEnclosingRowCell(v);
-    if (!rc) return NO;
-    UITableView *tv = nil;
-    UIView *p = rc.superview;
-    int g = 0;
-    while (p && g++ < 8) {
-        if ([p isKindOfClass:[UITableView class]]) { tv = (UITableView *)p; break; }
-        p = p.superview;
+    // v50 关键修复：v45 只认 UITableViewCell，而**首页板块全在 AliIFCollectionView 里**
+    // （真机 v49 诊断：`[高度] DXRootView | 201x265 @y613 | 宿主=AliIFCollectionView`）。
+    // 于是集合里的 265/333pt 卡片一律被判「不能归零」→ 大块免压（阈值 120pt）永远挡住 →
+    // 压0 从来没发生过，点选当场 hidden 有效、刷新就恢复。这就是老大说的
+    // 「部分元素刷新还是会恢复」的真身。集合 item 和表格行一样能归零，一并认。
+    UIView *cell = nil;
+    UIView *cur = v; int g = 0;
+    while (cur && g++ < 8) {
+        if ([cur isKindOfClass:[UITableViewCell class]] ||
+            [cur isKindOfClass:[UICollectionViewCell class]]) { cell = cur; break; }
+        cur = cur.superview;
     }
-    if (!tv) return NO;
-    // v45：只要它是表格行就算「可压」——不再要求 delegate 一定实现 heightForRow。
-    // 理由：真机优先级是「先让它消失」。若 delegate 没实现（表格用 automaticDimension），
-    // 行高归零做不了、会留白，但那是「去掉了留白」而不是「压根去不掉」；诊断
-    // `[行高归零]` 会如实报「未接管代理」，下一版再针对性处理。
-    return YES;
+    if (!cell) return NO;
+    UIView *host = nil;
+    cur = cell.superview; g = 0;
+    while (cur && g++ < 8) {
+        if ([cur isKindOfClass:[UITableView class]] ||
+            [cur isKindOfClass:[UICollectionView class]]) { host = cur; break; }
+        cur = cur.superview;
+    }
+    return host != nil;
 #else
     (void)v;
     return NO;
@@ -2255,6 +2301,27 @@ static void FCRestoreFlattenedIfNeeded(NSArray<NSString *> *rules) {
     }
 }
 
+// v50：把「几何认领」自动升级成「模板认领」。
+// 老大 v49 原话「部分元素刷新还是会恢复，页面会显示下再消失」——这两个症状是同一件事：
+//   · 只有 pos 规则时，只能靠扫描 tick 压 → DX 每次重建都先渲染出内容、0.12s 后才被压掉 → 闪
+//   · pos 靠几何匹配（容差 ±7/±14/±20pt）→ 布局一移位（某板块消失导致整体上移）就失配 → 恢复
+// 拿到模板名追加 tpl: 规则后，`setTemplateItem:` hook 在**渲染前**就 return，新实例同样被拦，
+// 于是既不闪也不恢复。规则总数接近上限（40）时不再自动加，避免把用户手动规则挤掉。
+static void FCMaybeUpgradeRuleToTpl(UIView *target, NSString *hitRule) {
+    if (!target) return;
+    if ([hitRule hasPrefix:@"tpl:"]) return;        // 已经是模板认领
+    if (FCIsBuiltinAdKey(hitRule)) return;          // 内置关键词本来就走类名通道
+    if (FCUserRules().count >= 38) return;          // 规则上限 40，留 2 条余量给用户手动加
+    static NSMutableSet *sAutoTplDone = nil;
+    if (!sAutoTplDone) sAutoTplDone = [NSMutableSet set];
+    NSString *tpl = FCTemplateNameOfView(target);
+    if (tpl.length < 4) return;
+    if ([sAutoTplDone containsObject:tpl]) return;  // 本次运行已经加过，别每轮重复
+    [sAutoTplDone addObject:tpl];
+    FCAddUserRule([@"tpl:" stringByAppendingString:tpl]);
+    FCLog(@"规则升级 tpl：%@（原 %@）", tpl, hitRule.length ? hitRule : @"-");
+}
+
 static void FCApplyNativeRules(void) {
     NSArray *rules = FCEffectiveRules();   // v11：用户规则 + 内置运营广告关键词
     if (!gFCFlattened) gFCFlattened = [NSMutableArray array];
@@ -2435,13 +2502,18 @@ static void FCApplyNativeRules(void) {
                 // v45：命中点若是落在表格行里，升级成「整行」再压——只压那行文字的话，
                 // 文字没了、行高 142pt 还在，浮标显示「规则命中 1」但页面上一片白
                 // （老大连着几版反馈「去不掉」的真身）。守卫：行不能太高、不能塞满正常内容。
+                // v50：集合项同样要升级——首页双列卡片（201x265 / 201x333）在
+                // AliIFCollectionView 里，只压内部子视图的话 item 尺寸不动，一样留白。
+                // 集合项阈值放到 40% 屏（真机 333pt/932=35.7%，30% 会漏掉）。
                 {
-                    UITableViewCell *rowCell = FCEnclosingRowCell(target);
-                    if (rowCell) {
-                        CGRect rr = [rowCell convertRect:rowCell.bounds toView:nil];
+                    UIView *rowItem = FCEnclosingRowItemCell(target);
+                    if (rowItem) {
+                        CGRect rr = [rowItem convertRect:rowItem.bounds toView:nil];
                         CGFloat shh = [UIScreen mainScreen].bounds.size.height;
-                        if (rr.size.height <= shh * 0.30 && FCCellLiveTextCount(rowCell, 0) <= 12) {
-                            target = rowCell;
+                        BOOL isItem = [rowItem isKindOfClass:[UICollectionViewCell class]];
+                        CGFloat cap = isItem ? 0.40 : 0.30;
+                        if (rr.size.height <= shh * cap && FCCellLiveTextCount(rowItem, 0) <= 12) {
+                            target = rowItem;
                         }
                     }
                 }
@@ -2475,6 +2547,9 @@ static void FCApplyNativeRules(void) {
                     gFCZeroApplied++;
                     // v45：压的是整行就登记行高归零——否则内容没了、行高还在 = 白块
                     FCMarkRowZero(target);
+                    // v50：顺手把这枚节点背后的模板名抓出来存成 tpl 规则——下一次重建
+                    // 就由 setTemplateItem: 在渲染前拦掉，不再「显示下再消失 / 刷新又恢复」
+                    FCMaybeUpgradeRuleToTpl(target, hitRule);
                     // v26：若父容器被删空（只剩背景无文字），连同空壳一起移除，消除留白框
                     FCRemoveEmptyShellIfNeeded(targetParent, hitRule);
                     // 父视图是 stack/collection 时触发布局重算，下方元素自动补齐
@@ -2792,22 +2867,45 @@ static void FCTplBridgePut(UIView *view, NSString *name) {
     [gFCTplBridge setObject:name forKey:view];
 }
 
+// v49：从某个 DXRootView 实例取模板名（bridge 优先，其次 data，最后 templateItem 描述）
+static NSString *FCTplFromRoot(UIView *root) {
+    if (!root) return nil;
+    NSString *n = gFCTplBridge ? [gFCTplBridge objectForKey:root] : nil;
+    if (n.length) return n;
+    @try { n = FCTplNameFromData([root valueForKey:@"data"]); } @catch (NSException *e) { }
+    if (n.length) return n;
+    @try { n = FCTplNameFromItem([root valueForKey:@"templateItem"]); } @catch (NSException *e) { }
+    return n.length ? n : nil;
+}
+
 // v29/v30：点选命中元素向上找承载它的 DXRootView，取该卡片正在渲染的模板名
+// v50 关键修复：**加一条向下查找**。目标一旦被升级成整行/整项 cell，DXRootView 就在它
+// 内部而不是祖先链上，向上找永远返回 nil——这就是真机 v49 里 27 条规则只有 4 条是 tpl、
+// 其余全是 pos 的真身。而只有 pos 规则时：DX 每次重建必须先渲染出来、等下一个扫描 tick
+// 才压掉（老大说的「页面会显示下再消失」）；布局一移位 pos 匹配不上就恢复显示
+// （「部分元素刷新还是会恢复」）。拿到模板名就能升级成 tpl 规则，setTemplateItem: 在
+// 渲染前就拦掉，两个症状一起消失。
 static NSString *FCTemplateNameOfView(UIView *v) {
     Class dxRoot = NSClassFromString(@"DXRootView");
-    if (!dxRoot) return nil;
+    if (!dxRoot || !v) return nil;
     UIView *cur = v;
     for (int depth = 0; cur && depth < 30; depth++) {
         if ([cur isKindOfClass:dxRoot]) {
-            // v30 首选：hook 建立的实例映射，最可靠
-            NSString *n = gFCTplBridge ? [gFCTplBridge objectForKey:cur] : nil;
-            if (n.length) return n;
-            @try { n = FCTplNameFromData([cur valueForKey:@"data"]); } @catch (NSException *e) { }
-            if (n.length) return n;
-            @try { n = FCTplNameFromItem([cur valueForKey:@"templateItem"]); } @catch (NSException *e) { }
+            NSString *n = FCTplFromRoot(cur);
             if (n.length) return n;
         }
         cur = cur.superview;
+    }
+    // 向下 BFS（限 160 个节点，防止在大树上炸开）
+    NSMutableArray *q = [NSMutableArray arrayWithObject:v];
+    NSUInteger idx = 0;
+    while (idx < q.count && idx < 160) {
+        UIView *x = q[idx++];
+        if ([x isKindOfClass:dxRoot]) {
+            NSString *n = FCTplFromRoot(x);
+            if (n.length) return n;
+        }
+        for (UIView *s in x.subviews) [q addObject:s];
     }
     return nil;
 }
@@ -3116,15 +3214,19 @@ static void FCPickNative(UIView *hit, CGPoint screenP, NSString *fallbackHint) {
     // 老大看到的就是「点不掉 / 点掉了变白块」。隐藏整行 + 行高归零才是真「去掉」。
     BOOL escalatedToRow = NO;
     {
-        UITableViewCell *rowCell = FCEnclosingRowCell(card);
-        if (rowCell) {
-            CGRect rr = [rowCell convertRect:rowCell.bounds toView:nil];
+        // v50：集合项也升级（首页双列卡片在 AliIFCollectionView 里），阈值 40% 屏
+        UIView *rowItem = FCEnclosingRowItemCell(card);
+        if (rowItem) {
+            CGRect rr = [rowItem convertRect:rowItem.bounds toView:nil];
             CGFloat shh = [UIScreen mainScreen].bounds.size.height;
-            if (rr.size.height <= shh * 0.30 && FCCellLiveTextCount(rowCell, 0) <= 12) {
-                card = rowCell;
+            BOOL isItem = [rowItem isKindOfClass:[UICollectionViewCell class]];
+            CGFloat cap = isItem ? 0.40 : 0.30;
+            if (rr.size.height <= shh * cap && FCCellLiveTextCount(rowItem, 0) <= 12) {
+                card = rowItem;
                 escalatedToRow = YES;
-                FCLog(@"点选升级到整行：%@ %.0fx%.0f @y%.0f",
-                      NSStringFromClass([rowCell class]), rr.size.width, rr.size.height, rr.origin.y);
+                FCLog(@"点选升级到整%@：%@ %.0fx%.0f @y%.0f",
+                      isItem ? @"项" : @"行",
+                      NSStringFromClass([rowItem class]), rr.size.width, rr.size.height, rr.origin.y);
             }
         }
     }
@@ -4126,7 +4228,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v49 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v50 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -4623,7 +4725,7 @@ static void FCUpdateBadge(void) {
     NSString *sys = @"";
 #endif
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv49%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
+        @"FCv50%@ 规则%lu 白%.0fpt%@%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
         (unsigned long)FCUserRules().count, whiteH, big, sys, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
@@ -4635,7 +4737,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv49 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv50 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -4646,7 +4748,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v49"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v50"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
