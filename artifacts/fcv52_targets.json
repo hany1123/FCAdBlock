@@ -1,5 +1,5 @@
 {
-  "_note": "v52 复核靶点：yes=必须出现的字符串，no=必须不出现。v52 新增通用化（规则包/路径指纹）与进程内网络抓包模块；Pure 档仍必须零 hook。",
+  "_note": "v52 复核靶点：yes=必须出现，no=必须不出现。v52 新增通用化（规则包/路径指纹）与进程内网络抓包模块；Pure 档仍必须零 hook。\n注：Pure 的 no 只放「行为断言」——method_setImplementation / class_replaceMethod / FCNetInstallHooks / FCHookDataTaskCH 这类只有真 hook 才会留下的符号。\nselector 名字字面量不算：@selector(tableView:heightForRowAtIndexPath:) 只是 respondsToSelector: 的参数，dataTaskWithRequest: 是 NSURLProtocol 接管层自己发请求用的，Pure 档本来就有。",
   "FCAdBlock_Pure_v52.dylib": {
     "yes": [
       "@rpath/FCAdBlock.dylib",
@@ -127,14 +127,12 @@
       "libsubstrate",
       "u16:H5内元素",
       "method_setImplementation",
-      "tableView:heightForRowAtIndexPath:",
       "_heightForRowAtIndexPath:",
       "layoutAttributesForItemAtIndexPath:",
       "systemLayoutSizeFittingSize:withHorizontalFittingPriority:verticalFittingPriority:",
       "u16:系统hook：已接管",
       "layoutAttributesForElementsInRect:",
       "collectionView:layout:sizeForItemAtIndexPath:",
-      "dataTaskWithRequest:",
       "FCNetInstallHooks",
       "FCHookDataTaskCH"
     ]
