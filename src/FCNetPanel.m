@@ -130,6 +130,10 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 @property (nonatomic, assign) BOOL showingAnalysis;         // v54：详情页正在显示分析报告
 @property (nonatomic, strong) UIButton *applyBtn;           // v54：「添加建议规则」
 @property (nonatomic, weak)   UIAlertController *patternAlert;   // v54：规则向导第1步弹窗
+// v55：全站一键分析
+@property (nonatomic, strong) FCNetGlobalAnalysis *globalAnalysis;
+@property (nonatomic, assign) BOOL showingGlobal;            // 详情页正在显示「全站」报告
+@property (nonatomic, strong) UIButton *analyzeAllBtn;       // 列表页的大按钮
 - (void)reloadRows;
 - (void)fcPresent:(UIViewController *)vc;   // v52：延后一个 runloop 再 present
 - (void)fcPresent:(UIViewController *)vc attempt:(NSInteger)n;
@@ -146,6 +150,8 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 - (void)refreshStatus;
 - (void)fcMode;
 - (void)fcAnalyze;                          // v54：一键分析当前记录
+- (void)fcAnalyzeAll;                       // v55：分析当前全部抓包数据（不用选记录）
+- (void)fcApplyGlobal;                      // v55：一键处理全站建议
 - (void)fcApplySuggestions;                 // v54：把分析建议加成规则
 - (void)patternFieldChanged:(UITextField *)tf;   // v54：正则实时回测
 - (NSString *)patternHintFor:(NSString *)pattern;
@@ -201,21 +207,30 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     [self.view addSubview:self.toggleBtn];
     [self syncToggleTitle];
 
+    // v55：一键分析——老大要的是「没有基础的人也能傻瓜式完成」，所以放一个整行大按钮，
+    // 不需要先理解列表、不需要先选中某条记录、不需要懂 JSON。
+    self.analyzeAllBtn = mk(@"🧠 一键分析全部流量（给建议）", @selector(fcAnalyzeAll));
+    self.analyzeAllBtn.frame = CGRectMake(8, top + 70, w - 16, 32);
+    self.analyzeAllBtn.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
+    self.analyzeAllBtn.backgroundColor = [UIColor colorWithRed:0.95 green:0.5 blue:0.12 alpha:1];
+    [self.analyzeAllBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    [self.view addSubview:self.analyzeAllBtn];
+
     // v53：状态行——上一版面板什么都没显示，老大只能说「没有记录」，
     // 分不清是「没开采集」「开了但一条没抓到」还是「抓到了但列表是空的」。
-    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, top + 68, w - 20, 14)];
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, top + 108, w - 20, 14)];
     self.statusLabel.font = [UIFont systemFontOfSize:10];
     self.statusLabel.textColor = [UIColor colorWithRed:0.42 green:0.45 blue:0.5 alpha:1];
     [self.view addSubview:self.statusLabel];
 
     // 搜索框
-    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, top + 86, w, 36)];
+    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, top + 126, w, 36)];
     self.search.placeholder = @"过滤：方法 / 域名 / 路径 / 状态码";
     self.search.delegate = self;
     self.search.backgroundImage = [[UIImage alloc] init];
     [self.view addSubview:self.search];
 
-    CGFloat listTop = top + 126;   // v53：多了一行状态，列表相应下移
+    CGFloat listTop = top + 166;   // v55：多了一键分析大按钮，列表相应下移
     self.table = [[UITableView alloc] initWithFrame:CGRectMake(0, listTop, w, self.view.bounds.size.height - listTop)
                                               style:UITableViewStylePlain];
     self.table.dataSource = self;
@@ -236,6 +251,8 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
         @"① 确认上面按钮显示「采集：开」\n"
         @"② 回到 App 里点几下、下拉刷新，制造网络请求\n"
         @"③ 图片/脚本/字体等静态资源不记录（只看 API 接口）\n\n"
+        @"抓到之后点橙色「一键分析全部流量」，\n"
+        @"我会直接告诉你能关掉哪些广告。\n\n"
         @"若已产生请求仍无记录，点「模式」看是否处于安全模式。";
     self.emptyLabel.hidden = YES;
     [self.view addSubview:self.emptyLabel];
@@ -253,9 +270,9 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     analyze.backgroundColor = [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
     [analyze setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     [self.detailBar addSubview:analyze];
-    // v54：分析结果页才出现——把建议规则一键加进规则引擎
+    // v54：分析结果页才出现——把建议规则一键加进规则引擎（v55：全站模式下变「一键处理」）
     self.applyBtn = mk(@"＋ 添加建议", @selector(fcApplySuggestions));
-    self.applyBtn.frame = CGRectMake(w - 168, 7, 96, 26);
+    self.applyBtn.frame = CGRectMake(w - 200, 7, 124, 26);
     self.applyBtn.backgroundColor = [UIColor colorWithRed:0.15 green:0.6 blue:0.3 alpha:1];
     [self.applyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     self.applyBtn.hidden = YES;
@@ -384,6 +401,12 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 }
 
 - (void)fcCopyOne {
+    // v55：全站报告页上「复制」复制整篇报告
+    if (self.showingGlobal && self.globalAnalysis.report.length) {
+        [UIPasteboard generalPasteboard].string = self.globalAnalysis.report;
+        [self toast:@"已复制全站分析报告"];
+        return;
+    }
     // v54：分析页上「复制」复制的是分析报告，不是原始报文
     if (self.showingAnalysis && self.analysis.report.length) {
         [UIPasteboard generalPasteboard].string = self.analysis.report;
@@ -396,17 +419,86 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     [self toast:@"已复制这条（含头与体）"];
 }
 
-// ===== v54：一键分析 =====
-// 为什么放在详情页而不是列表长按：老大看的是「这一条」，分析也必须针对这一条，
-// 列表上多一个手势反而容易误触。
+// ===== v55：全站一键分析 =====
+// 和 v54 的「看某一条」不同，这里连记录都不用选：分析当前抓到的**全部**流量，
+// 自己归组、打分、排序，直接告诉老大「有几个接口可疑、能关几处开关、下一步点什么」。
+// （v54 的单条分析仍在：详情页「🔍 分析」——为什么放在详情页而不是列表长按？
+//   因为用户看的是「这一条」，分析也必须针对这一条，列表上多一个手势反而容易误触。）
+- (void)fcAnalyzeAll {
+    FCNetGlobalAnalysis *g = FCNetAnalyzeAllRecords();
+    self.globalAnalysis = g;
+    self.showingGlobal = YES;
+    self.analysis = nil;
+    self.showingAnalysis = NO;
+
+    self.detail.text = g.report;
+    self.detail.contentOffset = CGPointZero;
+    self.detail.hidden = NO;
+    self.detailBar.hidden = NO;
+    self.table.hidden = YES;
+    self.search.hidden = YES;
+    self.toggleBtn.hidden = YES;
+    self.analyzeAllBtn.hidden = YES;
+    self.statusLabel.hidden = YES;
+    self.emptyLabel.hidden = YES;
+
+    self.applyBtn.hidden = (g.rules.count == 0);
+    [self.applyBtn setTitle:(g.rules.count
+                             ? [NSString stringWithFormat:@"一键处理 %lu 处",
+                                (unsigned long)g.rules.count]
+                             : @"无需处理")
+                   forState:UIControlStateNormal];
+
+    if (!g.recordCount) {
+        [self toast:@"还没有记录，先回 App 刷新几次"];
+    } else if (!g.rules.count) {
+        [self toast:@"没找到能自动处理的广告开关"];
+    } else {
+        [self toast:[NSString stringWithFormat:@"%lu 个可疑接口 · %lu 处可关",
+                     (unsigned long)g.suspectCount, (unsigned long)g.rules.count]];
+    }
+}
+
+// 一键处理：**只关开关、不阻断接口**。阻断会让页面缺块甚至白屏，
+// 对「没基础的人」来说是不可接受的副作用，这条路只能留在详情页手动做。
+- (void)fcApplyGlobal {
+    NSArray<NSDictionary *> *rules = self.globalAnalysis.rules;
+    if (!rules.count) { [self toast:@"没有可处理的项目"]; return; }
+
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"一键处理"
+        message:[NSString stringWithFormat:
+                 @"会把 %lu 处广告开关/列表改成关闭。\n\n"
+                 @"只关开关，不断接口——最坏结果是某块内容空着，不会白屏。\n"
+                 @"随时可以在「规则」里删掉，删了就立刻恢复。",
+                 (unsigned long)rules.count]
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"开始处理" style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     for (NSDictionary *r in rules) FCNetAddRule(r);
+                     [self.applyBtn setTitle:@"已处理" forState:UIControlStateNormal];
+                     self.applyBtn.enabled = NO;
+                     [self toast:[NSString stringWithFormat:
+                                  @"已关闭 %lu 处 · 回 App 刷新看效果",
+                                  (unsigned long)rules.count]];
+                 }]];
+    [self fcPresent:ac];
+}
+
 - (void)fcAnalyze {
+    if (self.showingGlobal) { [self fcAnalyzeAll]; return; }   // 全站报告页上点「分析」= 重算
     FCNetRecord *r = self.currentDetailRecord;
     if (!r) { [self toast:@"没有选中的记录"]; return; }
     self.analysis = FCNetAnalyzeRecord(r);
     self.showingAnalysis = YES;
+    self.showingGlobal = NO;                  // v55：单条模式
+    self.globalAnalysis = nil;
     self.detail.text = self.analysis.report;
     self.detail.contentOffset = CGPointZero;
     self.applyBtn.hidden = NO;
+    self.applyBtn.enabled = YES;
+    [self.applyBtn setTitle:@"＋ 添加建议" forState:UIControlStateNormal];
     // 建议多于「只有阻断」时才值得提示，否则老大点了也只有一个选项
     if (self.analysis.suggestedRules.count > 1) {
         [self toast:[NSString stringWithFormat:@"分析完成·%lu 条建议",
@@ -415,6 +507,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 }
 
 - (void)fcApplySuggestions {
+    if (self.showingGlobal) { [self fcApplyGlobal]; return; }   // v55：全站报告 → 一键处理
     if (!self.showingAnalysis) { [self fcAnalyze]; return; }
     NSArray<NSDictionary *> *rules = self.analysis.suggestedRules;
     if (!rules.count) { [self toast:@"没有可添加的建议"]; return; }
@@ -456,13 +549,19 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.table.hidden = NO;
     self.search.hidden = NO;
     self.toggleBtn.hidden = NO;
+    self.analyzeAllBtn.hidden = NO;   // v55
     self.statusLabel.hidden = NO;
     self.detail.text = nil;
     self.currentDetailRecord = nil;
     // v54：退出详情时清掉分析状态，否则下次点开别的记录还带着上一份报告
     self.analysis = nil;
     self.showingAnalysis = NO;
+    // v55：全站报告也要清，并把「一键处理」按钮复位（否则下次进单条分析还是「已处理」）
+    self.globalAnalysis = nil;
+    self.showingGlobal = NO;
     self.applyBtn.hidden = YES;
+    self.applyBtn.enabled = YES;
+    [self.applyBtn setTitle:@"＋ 添加建议" forState:UIControlStateNormal];
     [self reloadRows];   // v53：回来时重算空状态与计数
 }
 
@@ -780,6 +879,7 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.search.hidden = YES;
     self.toggleBtn.hidden = YES;
     self.statusLabel.hidden = YES;   // v53：详情层全屏覆盖，状态行先收起
+    self.analyzeAllBtn.hidden = YES; // v55：详情层压住大按钮，顺手收起来免得透出来
     self.emptyLabel.hidden = YES;
     // v54：换了记录就把上一份分析报告丢掉，否则「＋ 添加建议」会把 A 接口的规则
     // 加到 B 接口的头上（规则里的 url 是 A 的正则，用户完全看不出错）

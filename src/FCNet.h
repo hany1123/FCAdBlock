@@ -105,6 +105,35 @@ NSArray<NSString *> *FCNetPatternHits(NSString * _Nullable pattern);
 NSUInteger FCNetPatternHitCount(NSString * _Nullable pattern);
 BOOL FCNetPatternIsValid(NSString * _Nullable pattern);
 
+// ===== v55：全站一键分析 =====
+// v54 的 FCNetAnalyzeRecord 分析「选中的一条」，要求用户先会挑记录、会看 JSON。
+// 这个接口把**整个抓包结果**一次性分析完：按「接口族」归组、打分、排序、给可执行建议，
+// 让完全不懂技术的人也能只点一个按钮就走完「分析 → 处理 → 验证」。
+//
+// 一条硬约束：全局建议里**绝不含「阻断」**。阻断一个接口会让页面缺块甚至白屏，
+// 只有用户明确知道自己在断什么时才允许（详情页手动加）。一键处理只做「关开关」——
+// 把广告布尔位改成 false、把广告数组清空，最坏结果是某块内容空着，不会崩。
+@interface FCNetGroupStat : NSObject
+@property (nonatomic, copy)   NSString *pattern;   // 这一族接口的正则（自动生成）
+@property (nonatomic, copy)   NSString *sample;    // 代表 URL
+@property (nonatomic, copy)   NSString *why;       // 为什么可疑（人话，逐条逗号分隔）
+@property (nonatomic, assign) NSUInteger hits;     // 抓到几次
+@property (nonatomic, assign) NSInteger score;     // 广告特征分
+@property (nonatomic, strong) NSArray<NSDictionary *> *rules;   // 这一族可执行的建议（不含阻断）
+@end
+
+@interface FCNetGlobalAnalysis : NSObject
+@property (nonatomic, copy)   NSString *report;      // 完整可读报告（结论 / 最可疑 / 三步走 / 排行）
+@property (nonatomic, copy)   NSString *verdict;     // 一句话结论
+@property (nonatomic, strong) NSArray<FCNetGroupStat *> *groups;   // 按分数降序
+@property (nonatomic, strong) NSArray<NSDictionary *> *rules;      // 汇总建议（去重、已限量、不含阻断）
+@property (nonatomic, assign) NSUInteger recordCount;
+@property (nonatomic, assign) NSUInteger groupCount;
+@property (nonatomic, assign) NSUInteger suspectCount;   // 有广告嫌疑的接口族数
+@end
+
+FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void);
+
 // 启动时调一次：恢复开关状态、装好 NSURLProtocol
 void FCNetBootstrap(void);
 

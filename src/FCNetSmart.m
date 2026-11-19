@@ -500,3 +500,279 @@ FCNetAnalysis *FCNetAnalyzeRecord(FCNetRecord *rec) {
     a.suggestedRules = rules;
     return a;
 }
+
+#pragma mark - v55：全站一键分析
+
+// 全站分析要遍历全部记录，可能有几百条。FCNetAnalyzeRecord 会拼整篇报告字符串，
+// 逐条调用太重，所以这里单独一个「只算分 + 只产出规则」的轻量版：
+// 不拼报告、JSON 节点预算 150、每个接口最多出 3 条规则。
+#define FC_GLOBAL_MAX_SCORE_RECORDS   160   // 最多细算多少条请求（其余只按 URL 粗算）
+#define FC_GLOBAL_MAX_RULES           12    // 一键处理最多加多少条规则
+#define FC_GLOBAL_MAX_RULES_PER_GROUP 3
+
+@implementation FCNetGroupStat
+@end
+
+@implementation FCNetGlobalAnalysis
+@end
+
+// 返回这条记录的广告特征分；同时把「能直接执行的规则」塞进 rulesOut、
+// 把「为什么可疑」塞进 whyOut（都是人话，给不懂技术的人看）。
+static NSInteger FCScoreRecordQuick(FCNetRecord *rec, NSString *pattern,
+                                    NSMutableArray *rulesOut, NSMutableArray *whyOut) {
+    NSInteger total = 0;
+
+    NSInteger us = FCAdScoreForKey(rec.url ?: @"");
+    if (us > 0) {
+        total += us;
+        if (whyOut) [whyOut addObject:@"网址里带广告词"];
+    }
+
+    if (!rec.respBody.length || !rec.respBody) return total;
+    id resp = [NSJSONSerialization JSONObjectWithData:rec.respBody options:0 error:nil];
+    if (![resp isKindOfClass:[NSDictionary class]] && ![resp isKindOfClass:[NSArray class]]) {
+        return total;
+    }
+
+    NSMutableArray *flat = [NSMutableArray array];
+    int budget = 150;
+    FCWalkJSON(resp, @"", flat, 0, &budget);
+
+    // 先累总分，再把「高分字段」挑出来。低分字段只贡献分数，不生成规则——
+    // 给每个 banner 字段都写一条规则会把规则表塞满，反而让人看不懂。
+    NSMutableArray *hot = [NSMutableArray array];
+    for (NSDictionary *node in flat) {
+        NSInteger sc = [node[@"score"] integerValue];
+        if (sc <= 0) continue;
+        total += sc;
+        if (sc >= 3) [hot addObject:node];
+    }
+    if (!hot.count) return total;
+
+    [hot sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        NSInteger x = [a[@"score"] integerValue];
+        NSInteger y = [b[@"score"] integerValue];
+        if (x == y) return NSOrderedSame;
+        return (x > y) ? NSOrderedAscending : NSOrderedDescending;
+    }];
+
+    NSString *bodyText = [[NSString alloc] initWithData:rec.respBody encoding:NSUTF8StringEncoding];
+    if (!bodyText.length) return total;
+
+    NSMutableSet *done = [NSMutableSet set];
+    NSUInteger made = 0;
+    for (NSDictionary *node in hot) {
+        if (made >= FC_GLOBAL_MAX_RULES_PER_GROUP) break;
+        NSString *key = node[@"key"];
+        NSString *type = node[@"type"];
+        NSString *sample = node[@"sample"];
+        if (!key.length || [done containsObject:key]) continue;
+        [done addObject:key];
+
+        // ① 开关类：原值是 true（JSON 里 NSNumber 的 description 是 "1"）
+        if ([type isEqualToString:@"值"] && [sample isEqualToString:@"1"]) {
+            NSString *span = FCSpanForKey(bodyText, key);
+            if (!span.length) continue;
+            NSRange cd = [span rangeOfString:@":"];
+            if (cd.location == NSNotFound) continue;
+            NSString *head = [span substringToIndex:cd.location];
+            if (!head.length) continue;
+            [rulesOut addObject:@{
+                @"name": [NSString stringWithFormat:@"%@ 关掉", key],
+                @"url": pattern ?: @"", @"method": @"*", @"enabled": @YES,
+                @"respBodyFind": span,
+                @"respBodyReplace": [head stringByAppendingString:@":false"],
+            }];
+            if (whyOut) [whyOut addObject:[NSString stringWithFormat:@"%@ 是开着的", key]];
+            made++;
+            continue;
+        }
+        // ② 列表类：整段置空 —— 广告内容基本都在这种数组里
+        if ([type isEqualToString:@"数组"]) {
+            NSString *span = FCSpanForKey(bodyText, key);
+            if (!span.length || ![span hasSuffix:@"]"]) continue;
+            NSString *repl = [NSString stringWithFormat:@"\"%@\":[]", key];
+            if (span.length <= repl.length) continue;
+            [rulesOut addObject:@{
+                @"name": [NSString stringWithFormat:@"%@ 清空", key],
+                @"url": pattern ?: @"", @"method": @"*", @"enabled": @YES,
+                @"respBodyFind": span, @"respBodyReplace": repl,
+            }];
+            if (whyOut) [whyOut addObject:[NSString stringWithFormat:@"%@ 里有内容", key]];
+            made++;
+        }
+    }
+    return total;
+}
+
+FCNetGlobalAnalysis *FCNetAnalyzeAllRecords(void) {
+    FCNetGlobalAnalysis *g = [FCNetGlobalAnalysis new];
+    g.groups = @[];
+    g.rules = @[];
+
+    NSArray<FCNetRecord *> *recs = FCNetRecords();
+    g.recordCount = recs.count;
+    if (!recs.count) {
+        g.verdict = @"还没抓到数据";
+        g.report = @"还没有抓到任何请求，所以没法分析。\n\n"
+                    @"按这三步来：\n"
+                    @"① 确认上面的大按钮显示「采集：开（正在记录流量）」\n"
+                    @"② 回到 App 里点几下、往下拉刷新几次\n"
+                    @"③ 再回来点这个按钮\n\n"
+                    @"（图片/视频/脚本这类资源不记录，只记录 App 和后端之间的接口请求）";
+        return g;
+    }
+
+    // ---------- 按「接口族」归组 ----------
+    // 归组用的是自动泛化正则，所以 /ad/list?ts=1 和 /ad/list?ts=2 会落到同一族，
+    // 不会出现「同一个接口在列表里算成十个」的情况。
+    NSMutableDictionary<NSString *, NSMutableArray *> *byKey = [NSMutableDictionary dictionary];
+    for (FCNetRecord *r in recs) {
+        NSString *p = FCNetAutoPatternForURL(r.url ?: @"");
+        if (!p.length) p = r.url.length ? r.url : @"(无法解析)";
+        NSMutableArray *arr = byKey[p];
+        if (!arr) { arr = [NSMutableArray array]; byKey[p] = arr; }
+        [arr addObject:r];
+    }
+    g.groupCount = byKey.count;
+
+    // ---------- 每个族挑「最能说明问题」的一条细算 ----------
+    NSMutableArray<FCNetGroupStat *> *stats = [NSMutableArray array];
+    NSUInteger scored = 0;
+    for (NSString *p in byKey) {
+        NSArray<FCNetRecord *> *arr = byKey[p];
+        FCNetGroupStat *best = nil;
+        for (FCNetRecord *r in arr) {
+            if (scored >= FC_GLOBAL_MAX_SCORE_RECORDS) break;
+            scored++;
+            NSMutableArray *rr = [NSMutableArray array];
+            NSMutableArray *why = [NSMutableArray array];
+            NSInteger s = FCScoreRecordQuick(r, p, rr, why);
+            if (!best || s > best.score) {
+                FCNetGroupStat *st = [FCNetGroupStat new];
+                st.pattern = p;
+                st.sample = r.url ?: @"";
+                st.hits = arr.count;
+                st.score = s;
+                st.rules = rr;
+                st.why = [why componentsJoinedByString:@"、"];
+                best = st;
+            }
+        }
+        if (best) [stats addObject:best];
+    }
+
+    [stats sortUsingComparator:^NSComparisonResult(FCNetGroupStat *a, FCNetGroupStat *b) {
+        if (a.score != b.score) return (a.score > b.score) ? NSOrderedAscending : NSOrderedDescending;
+        if (a.hits != b.hits) return (a.hits > b.hits) ? NSOrderedAscending : NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    g.groups = stats;
+
+    // ---------- 汇总建议（去重 + 限量，且永不含阻断） ----------
+    NSMutableArray<NSDictionary *> *rules = [NSMutableArray array];
+    NSMutableSet *sig = [NSMutableSet set];
+    NSUInteger suspects = 0;
+    for (FCNetGroupStat *st in stats) {
+        if (st.score >= 3) suspects++;
+        if (st.score <= 0) continue;
+        for (NSDictionary *r in st.rules) {
+            if (rules.count >= FC_GLOBAL_MAX_RULES) break;
+            NSString *s = [NSString stringWithFormat:@"%@|%@|%@",
+                           r[@"url"] ?: @"", r[@"respBodyFind"] ?: @"", r[@"name"] ?: @""];
+            if ([sig containsObject:s]) continue;
+            [sig addObject:s];
+            [rules addObject:r];
+        }
+        if (rules.count >= FC_GLOBAL_MAX_RULES) break;
+    }
+    g.rules = rules;
+    g.suspectCount = suspects;
+
+    // ---------- 写报告：结论 → 最可疑 → 三步走 → 排行 ----------
+    NSMutableString *rep = [NSMutableString string];
+    [rep appendString:@"===== 结论 =====\n"];
+    [rep appendFormat:@"共抓到 %lu 条请求，归成 %lu 个接口。\n",
+     (unsigned long)g.recordCount, (unsigned long)g.groupCount];
+    if (!rules.count) {
+        g.verdict = @"没发现可以一键处理的广告";
+        [rep appendString:@"没有发现明显的广告开关或广告列表，暂时没有能自动改的地方。\n\n"
+                       @"这种情况通常有三种原因：\n"
+                       @"  · 广告还没加载（回 App 刷新几次，广告出来后再分析）\n"
+                       @"  · 广告内容混在别的字段里，没有被识别出来\n"
+                       @"  · 这个 App 的广告走的是图片/视频，不是接口数据\n"];
+    } else {
+        g.verdict = [NSString stringWithFormat:@"发现 %lu 个可疑接口，可关闭 %lu 处广告开关",
+                     (unsigned long)suspects, (unsigned long)rules.count];
+        [rep appendFormat:@"其中 %lu 个接口很像广告来源，我找到了 **%lu 处能直接改的地方**。\n",
+         (unsigned long)suspects, (unsigned long)rules.count];
+    }
+
+    // 最可疑的 5 个
+    [rep appendString:@"\n===== 最可疑的接口 =====\n"];
+    NSUInteger shown = 0;
+    for (FCNetGroupStat *st in stats) {
+        if (st.score <= 0 || shown >= 5) break;
+        shown++;
+        NSString *u = st.sample;
+        if (u.length > 78) u = [[u substringToIndex:78] stringByAppendingString:@"…"];
+        [rep appendFormat:@"%ld 分 · 抓到 %lu 次\n  %@\n", (long)st.score,
+         (unsigned long)st.hits, u];
+        if (st.why.length) [rep appendFormat:@"  为什么可疑：%@\n", st.why];
+        if (st.rules.count) {
+            NSMutableArray *names = [NSMutableArray array];
+            for (NSDictionary *r in st.rules) {
+                NSString *n = r[@"name"];
+                if (n.length) [names addObject:n];
+            }
+            if (names.count) {
+                [rep appendFormat:@"  我能帮你：%@\n", [names componentsJoinedByString:@" / "]];
+            }
+        }
+        [rep appendString:@"\n"];
+    }
+    if (!shown) [rep appendString:@"（没有分数为正的接口，见上面结论里的三种原因）\n"];
+
+    // 三步走
+    [rep appendString:@"===== 你要做的（不用懂代码） =====\n"];
+    if (rules.count) {
+        [rep appendFormat:@"1. 点右上角「一键处理」——我把上面 %lu 处开关改成关闭\n",
+         (unsigned long)rules.count];
+        [rep appendString:@"2. 回到 App，下拉刷新页面，看广告有没有少\n"
+                       @"3. 少了 → 完事；还有 → 回来再点一次「全站分析」，把新出现的加进去\n"
+                       @"   完全没用 → 点上面「规则」，把刚加的删掉，不会有副作用\n"];
+    } else {
+        [rep appendString:@"1. 回 App 把广告刷出来（多点几个页面）\n"
+                       @"2. 回来再点「全站分析」\n"];
+    }
+    [rep appendString:@"\n说明：我不会自动帮你「阻断」接口。阻断会让页面缺块甚至白屏，\n"
+                   @"      风险太大。确实想彻底断掉某个接口，进那条记录的详情页手动加。\n"];
+
+    // 排行
+    [rep appendString:@"\n===== 接口排行（分数高的在上面） =====\n"];
+    [rep appendString:@"分   次数  接口\n"];
+    NSUInteger rank = 0;
+    for (FCNetGroupStat *st in stats) {
+        if (rank >= 20) break;
+        rank++;
+        NSString *u = st.sample ?: @"";
+        NSURLComponents *c = [NSURLComponents componentsWithString:u];
+        NSString *shortU = u;
+        if (c.host.length) {
+            shortU = [NSString stringWithFormat:@"%@%@", c.host, c.path ?: @"/"];
+        }
+        if (shortU.length > 52) shortU = [[shortU substringToIndex:52] stringByAppendingString:@"…"];
+        [rep appendFormat:@"%4ld  %4lu  %@\n", (long)st.score, (unsigned long)st.hits, shortU];
+    }
+    if (stats.count > 20) {
+        [rep appendFormat:@"…另有 %lu 个接口（分数都在 %ld 以下）\n",
+         (unsigned long)(stats.count - 20), (long)(stats.count ? stats[19].score : 0)];
+    }
+    if (scored >= FC_GLOBAL_MAX_SCORE_RECORDS) {
+        [rep appendFormat:@"\n（记录太多，只细算了前 %lu 条请求；其余按网址粗算）\n",
+         (unsigned long)FC_GLOBAL_MAX_SCORE_RECORDS];
+    }
+
+    g.report = rep;
+    return g;
+}
