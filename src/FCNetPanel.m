@@ -533,10 +533,10 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 - (void)fcAddRuleStep1 {
     // v54：不再让老大从零写正则。拿最新一条记录自动泛化出正则（域名泛子域、数字段→\d+、
     // 长 token→字符类、query 丢弃），进弹窗时已填好，并当场告诉他这条正则会命中几条。
-    NSString *auto = [self suggestedURLPattern];
-    NSString *seed = auto.length ? auto : @"";
+    NSString *autoPat = [self suggestedURLPattern];   // 注意：不能叫 auto，clang 当关键字
+    NSString *seed = autoPat.length ? autoPat : @"";
     UIAlertController *ac = [UIAlertController
-        alertControllerWithTitle:(auto.length ? @"第 1 步：URL 正则（已自动生成）" : @"第 1 步：URL 正则")
+        alertControllerWithTitle:(autoPat.length ? @"第 1 步：URL 正则（已自动生成）" : @"第 1 步：URL 正则")
                          message:[self patternHintFor:seed]
                   preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
@@ -781,6 +781,11 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.toggleBtn.hidden = YES;
     self.statusLabel.hidden = YES;   // v53：详情层全屏覆盖，状态行先收起
     self.emptyLabel.hidden = YES;
+    // v54：换了记录就把上一份分析报告丢掉，否则「＋ 添加建议」会把 A 接口的规则
+    // 加到 B 接口的头上（规则里的 url 是 A 的正则，用户完全看不出错）
+    self.analysis = nil;
+    self.showingAnalysis = NO;
+    self.applyBtn.hidden = YES;
 }
 
 @end
