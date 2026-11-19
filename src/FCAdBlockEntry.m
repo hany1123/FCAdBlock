@@ -1,5 +1,24 @@
 //
-//  FCAdBlockEntry.m —— 通用去广告插件 v42（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//  FCAdBlockEntry.m —— 通用去广告插件 v43（丰巢 HiveConsumer + 淘宝 Taobao4iPhone）
+//
+//  v43 相对 v42（老大 v42 真机：点选能用了、挡的数字也不再涨，但首页顶部出现 ~580pt 大白块）：
+//    【现象】浮标 `规则9 挡0 压33`，首页 tab 栏以下到商品流之间整片空白。
+//    【根因】不是回归 bug，是「压0 只让内容消失、不减坑位高度」这条硬约束在规则变多后被放大：
+//    9 条规则里有 4 条压的是大运营位（gongge 四宫格 155pt、88 活动卡 135pt×2、直播卡 155pt），
+//    每压一块就留一块等高空白，叠起来正好 ~580pt。
+//    【修法·三项，都不动布局层】
+//      ① 规则质量门槛 FCRuleIsJunk：拒绝点选误触产生的垃圾规则——含逗号/顿号/竖线的复合串
+//        （真机「猜你喜欢,已选中」= tab 标题+状态词被拼成一串）、纯状态词（待使用/返回顶部/
+//        已选中/去使用…）。这类规则拦不到广告，只会误伤含相同字串的正常容器。
+//      ② 留白可见化：`FCWhiteSpaceEstimate()` 按「其祖先无压0记录」去重累加被压坑位高度，
+//        浮标直接显示 `白~580pt`，诊断新增 `[留白] 合计 Npt（约 X% 屏高）` 与每条
+//        `[压0清单] … 留白155pt 父=Cls`——压哪条值不值，一眼可判。
+//      ③ 大块免压开关（持久化 `FCAdBlockBigBlockPass_v1`，默认关）：打开后高度 >120pt 的
+//        运营位在四个入口（用户规则 / 源头模板 / 外壳 cell / 轮播空壳）一律跳过，
+//        小广告（商品流推广卡 60~100pt）照常压，几乎不留白。
+//    【已知边界】压0 无法真正减高度：UICollectionView 的 item 高度由 layout/dataSource 给，
+//    改子视图 frame 不影响它。要根治只能在宿主布局层动手（hook 系统布局类违反本工程铁律，
+//    故不做）。当前策略是「压得准、留白看得见、大块可跳过」。
 //
 //  v42 相对 v41（老大 v41 真机：不闪退了、白块也没了，但**无法选择广告元素**，且
 //  浮标上「挡」的数字一直往上涨）：
@@ -450,8 +469,8 @@ static void FCPerformPendingRelayout(void);                   // v41：扫描 ti
 static NSString * const FCJSAdCardsTemplate =
 @"(function(){var W=window;W.__fcadUserRules=%@;"
 // v13：版本号——规则/词表热更新时必须重建 sweep（闭包里的 K 是旧词表，幂等 return 会让它永不更新）
-"if(W.__fcadLoaded&&W.__fcadVer===42){if(W.__fcadSweep){W.__fcadSweep();}return;}"
-"W.__fcadLoaded=1;W.__fcadVer=42;W.__fcadHits=0;"
+"if(W.__fcadLoaded&&W.__fcadVer===43){if(W.__fcadSweep){W.__fcadSweep();}return;}"
+"W.__fcadLoaded=1;W.__fcadVer=43;W.__fcadHits=0;"
 "var K=['百元券包','100元寄件券包','寄件券包','限量1折','限量2折','限量7折','寄件省钱卡','查价领返现','换季洗羽绒','换季洗','洗护券','5元立减券','69.9元','马上抢','立即抢购','9.9洗衣','领福利','立省30','顺丰专享券包'];"
 "function keys(e){var a=[];function add(s){if(s&&(''+s).length>=2&&a.indexOf(''+s)<0)a.push(''+s);}"
 "add((e.innerText||e.textContent||'').trim());"
@@ -630,10 +649,35 @@ static NSString *FCJSSafe(NSString *s) {
     return s;
 }
 
+// v43：规则质量门槛——拦掉「点选误触」产生的垃圾规则。
+// 真机实证：v42 点选把 9 条规则存进了这批垃圾——
+//   「猜你喜欢,已选中」（tab 标题 + 状态词被拼成一串，命中只会误伤容器）
+//   「待使用」「返回顶部」（按钮状态词，隐藏了也没意义）
+// 这类规则既拦不到广告，又可能命中含相同字串的正常容器，必须在入口拦住。
+static BOOL FCRuleIsJunk(NSString *rule) {
+    if (rule.length < 2) return YES;
+    BOOL fingerprint = [rule hasPrefix:@"tpl:"] || [rule hasPrefix:@"cls:"] ||
+                       [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"sel:"] ||
+                       [rule hasPrefix:@"img:"];
+    if (fingerprint) return NO;                       // 指纹类规则不参与文字门槛
+    // 复合串：点选时多个 label 的文本被拼在一起，一定不是单个广告标题
+    NSCharacterSet *sep = [NSCharacterSet characterSetWithCharactersInString:@"，,、;；|｜/／"];
+    if ([rule rangeOfCharacterFromSet:sep].location != NSNotFound) return YES;
+    static NSArray<NSString *> *junkWords = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        junkWords = @[@"待使用", @"去使用", @"已选中", @"返回顶部", @"更多", @"全部",
+                      @"设置", @"消息", @"客服", @"立即领取", @"查看更多", @"展开", @"收起"];
+    });
+    return [junkWords containsObject:rule];
+}
+
 static void FCAddUserRule(NSString *raw) {
     NSString *rule = FCJSSafe(raw);
     if (rule.length < 2) return;
     if (FCIsUnsafeClassRule(rule)) { FCLog(@"拒绝危险 class 规则：%@", rule); return; }   // v7
+    // v43：入口拦垃圾规则（误点产生的复合串/状态词），避免越点越乱
+    if (FCRuleIsJunk(rule)) { FCLog(@"拒绝垃圾规则（误点产物）：%@", rule); return; }
     NSMutableArray *a = [NSMutableArray arrayWithArray:FCUserRules()];
     BOOL isFingerprint = [rule hasPrefix:@"sel:"] || [rule hasPrefix:@"cls:"] ||
                          [rule hasPrefix:@"pos:"] || [rule hasPrefix:@"img:"] ||
@@ -1264,6 +1308,22 @@ static NSHashTable *gFCBlockedRoots = nil;
 // v42：全局暂停开关——老大随时能「一键恢复原样」再点选广告。
 // 暂停期间：不压0、不拦模板、不隐藏；已拦的还原并清标记。刷新页面后广告原样出现。
 static BOOL gFCPaused = NO;
+// v43：大块免压——高度超过阈值（120pt）的运营位不压0。
+// 存在意义：压0 只让内容消失、不减坑位高度，压一块 155pt 的运营位就等于留 155pt 白。
+// 小广告（商品流推广卡 60~100pt）压了几乎不留白，大块（四宫格/活动卡）压了就一大片空。
+// 默认关（保持原有行为），用户在菜单里按需打开。
+static NSString * const FCBigBlockKey = @"FCAdBlockBigBlockPass_v1";   // 用户开关，持久化
+static const CGFloat kFCBigBlockH = 120.0;
+
+static BOOL FCBigBlockPassOn(void) {
+    return [[NSUserDefaults standardUserDefaults] boolForKey:FCBigBlockKey];
+}
+
+// v43：判断某个屏幕矩形是否该被「大块免压」跳过
+static BOOL FCShouldSkipBigBlock(CGRect screenRect) {
+    if (!FCBigBlockPassOn()) return NO;
+    return screenRect.size.height > kFCBigBlockH;
+}
 // v42：点选当场 hidden=YES 的卡片。点选时扫描是冻结的，这些 view 进不了 gFCFlattened，
 // 规则清掉后没人会把它恢复 → 退出点选统一 hidden=NO，交给扫描按规则重新接管。
 static NSHashTable *gFCPickHidden = nil;
@@ -1419,6 +1479,36 @@ static void FCRestoreAllBlockedForPicking(void) {
     }
     FCLog(@"还原全部拦截：%lu 处视图 + %lu 个源头标记（gFCPaused=%d）",
           (unsigned long)n, (unsigned long)cleared, (int)gFCPaused);
+}
+
+// v43：估算「被压掉的坑位高度合计」= 当前页面上留下了多少空白。
+// 用途：老大一眼看到代价。压一个 155pt 的运营位就是 155pt 白，规则越多白越大。
+// 去重口径：只累加「祖先没有压0记录」的节点，否则「源头容器 + 外层外壳」会算两遍。
+static BOOL FCViewHasZeroedAncestor(UIView *v) {
+    UIView *p = v.superview;
+    int guard = 0;
+    while (p && guard++ < 10) {
+        if (objc_getAssociatedObject(p, &kFCZeroRec)) return YES;
+        p = p.superview;
+    }
+    return NO;
+}
+
+static CGFloat FCWhiteSpaceEstimate(void) {
+    CGFloat h = 0;
+    NSMutableArray *tables = [NSMutableArray array];
+    if (gFCFlattened) [tables addObject:gFCFlattened];
+    if (gFCSourceZeroed) [tables addObject:gFCSourceZeroed];
+    if (gFCShellZeroed) [tables addObject:gFCShellZeroed];
+    if (gFRotorZeroed) [tables addObject:gFRotorZeroed];
+    for (NSArray *tb in tables) {
+        for (FCFlattenRecord *rec in tb) {
+            if (!rec.zeroCollapsed || !rec.view) continue;
+            if (FCViewHasZeroedAncestor(rec.view)) continue;
+            h += rec.originalFrame.size.height;
+        }
+    }
+    return h;
 }
 
 // v32：每轮扫描开头重新施加所有压0压制——DX 引擎下一帧重设 frame 后由这里压回。
@@ -1648,6 +1738,15 @@ static void FCApplyNativeRules(void) {
                 // 的卡片容器还在 → 留白方块。改为移除 FCCardShellForHide 找到的整块卡片。
                 // 用记录表保住 view（否则释放），规则删除时 FCRestoreFlattenedIfNeeded 插回。
                 UIView *target = FCCardShellForHide(v);
+                // v43：大块免压——超过阈值就不压，整枝也不再往下扫（否则压一堆小的同样留白）
+                {
+                    CGRect tr = target ? [target convertRect:target.bounds toView:nil] : CGRectZero;
+                    if (FCShouldSkipBigBlock(tr)) {
+                        FCLog(@"大块免压(规则): %@ %.0fpt > %.0f",
+                              NSStringFromClass([target class]), tr.size.height, kFCBigBlockH);
+                        continue;
+                    }
+                }
                 UIView *targetParent = target.superview;   // v26：移除后用于空壳父容器判定
                 BOOL alreadyFlattened = NO;
                 for (FCFlattenRecord *rec in gFCFlattened) if (rec.view == target) { alreadyFlattened = YES; break; }
@@ -2021,6 +2120,11 @@ static void FCZeroSourceRoot(UIView *root, NSString *tpl) {
     if (!root || !root.superview || !tpl.length) return;
     CGRect r = [root convertRect:root.bounds toView:nil];
     if (r.size.width < 1 || r.size.height < 1) return;   // 还没布局，交给下一轮
+    // v43：大块免压——源头容器往往就是 135/155pt 的活动卡，压了必留一大片白
+    if (FCShouldSkipBigBlock(r)) {
+        FCLog(@"大块免压(源头): %@ %.0fpt", tpl, r.size.height);
+        return;
+    }
     if (!gFCSourceZeroed) gFCSourceZeroed = [NSMutableArray array];
     for (FCFlattenRecord *rec in gFCSourceZeroed) if (rec.view == root) return;  // 已压，幂等
     FCFlattenRecord *rec = [FCFlattenRecord new];
@@ -2114,6 +2218,11 @@ static void FCZeroBlockedCellShell(UIView *root) {
     CGFloat sh = [UIScreen mainScreen].bounds.size.height;
     CGFloat sw = [UIScreen mainScreen].bounds.size.width;
     if (r.size.width < sw * 0.75 || r.size.height < 80 || r.size.height > sh * 0.32) return;
+    // v43：大块免压——外壳 cell 就是最终留白的那一层，压了直接换回等高的白
+    if (FCShouldSkipBigBlock(r)) {
+        FCLog(@"大块免压(外壳): %@ %.0fpt", NSStringFromClass([cell class]), r.size.height);
+        return;
+    }
     // 空壳判定：除被拦内容外若还有 >2 条有效文字，说明 cell 里有正常内容，不压（双保险）
     if (FCCellLiveTextCount(cell, 0) > 2) return;
     if (!gFCShellZeroed) gFCShellZeroed = [NSMutableArray array];
@@ -3053,11 +3162,14 @@ static void FCAppendZeroedList(void) {
         if (orig.size.height < 100) continue;
         UIView *v = rec.view;
         CGRect now = v ? [v convertRect:v.bounds toView:nil] : CGRectZero;
+        // v43：加「留白」——该记录原来占多少高度，就是压了以后留下多少空白
         [out addObject:[NSString stringWithFormat:
-            @"[压0清单] %@ | 原%.0f,%.0f %.0fx%.0f → 今 %.0fx%.0f a%.2f | %@",
+            @"[压0清单] %@ | 原%.0f,%.0f %.0fx%.0f → 今 %.0fx%.0f a%.2f | 留白%.0fpt 父=%@ | %@",
             NSStringFromClass([v class]), orig.origin.x, orig.origin.y,
             orig.size.width, orig.size.height, now.size.width, now.size.height,
-            v ? v.alpha : -1, rec.rule.length ? rec.rule : @"-"]];
+            v ? v.alpha : -1, orig.size.height,
+            v.superview ? NSStringFromClass([v.superview class]) : @"-",
+            rec.rule.length ? rec.rule : @"-"]];
     }
     for (FCFlattenRecord *rec in (gFCSourceZeroed ?: @[])) {
         CGRect orig = rec.originalFrame;
@@ -3065,10 +3177,21 @@ static void FCAppendZeroedList(void) {
         UIView *v = rec.view;
         CGRect now = v ? [v convertRect:v.bounds toView:nil] : CGRectZero;
         [out addObject:[NSString stringWithFormat:
-            @"[压0清单·源] %@ | 原%.0f,%.0f %.0fx%.0f → 今 %.0fx%.0f a%.2f | %@",
+            @"[压0清单·源] %@ | 原%.0f,%.0f %.0fx%.0f → 今 %.0fx%.0f a%.2f | 留白%.0fpt 父=%@ | %@",
             NSStringFromClass([v class]), orig.origin.x, orig.origin.y,
             orig.size.width, orig.size.height, now.size.width, now.size.height,
-            v ? v.alpha : -1, rec.rule.length ? rec.rule : @"-"]];
+            v ? v.alpha : -1, orig.size.height,
+            v.superview ? NSStringFromClass([v.superview class]) : @"-",
+            rec.rule.length ? rec.rule : @"-"]];
+    }
+    // v43：留白合计——直接回答「现在页面空了多少」
+    {
+        CGFloat wh = FCWhiteSpaceEstimate();
+        CGFloat sh = [UIScreen mainScreen].bounds.size.height;
+        FCAppendDiagText([NSString stringWithFormat:
+            @"[留白] 合计 %.0fpt（约 %.0f%% 屏高，大块免压=%@，阈值%.0fpt）",
+            wh, sh > 0 ? wh / sh * 100 : 0,
+            FCBigBlockPassOn() ? @"开" : @"关", kFCBigBlockH]);
     }
     if (!out.count) FCAppendDiagText(@"[压0清单] 无高度≥100的压0记录");
     else {
@@ -3125,7 +3248,7 @@ static void FCAppendHeightOwnerDiag(void) {
 
 // 异步收集：原生视图树 + 每个 WKWebView 的 DOM 摘要，全部写进诊断文本框
 static void FCFillDiagnose(void) {
-    FCAppendDiagText(@"===== FC 页面诊断 v42 =====");
+    FCAppendDiagText(@"===== FC 页面诊断 v43 =====");
     FCAppendDiagText([NSString stringWithFormat:@"顶层VC: %@", NSStringFromClass([FCHostTopVC() class]) ?: @"-"]);
     NSArray<NSString *> *diagUserRules = FCUserRules();
     FCAppendDiagText([NSString stringWithFormat:@"用户规则 %lu 条 / 内置命中 %lu / 被挡节点 %lu（累计动作 %lu 轮）%@",
@@ -3605,12 +3728,15 @@ static void FCUpdateBadge(void) {
     NSUInteger zeroNow = 0;
     for (FCFlattenRecord *rec in gFCFlattened) if (rec.zeroCollapsed) zeroNow++;
     // v42：挡=去重节点数（不再每 tick 往上涨）；暂停时整体灰显提示
+    // v43：加「白」= 被压掉的坑位高度合计——把代价摆到浮标上，老大一眼看到压这条值不值
+    CGFloat whiteH = FCWhiteSpaceEstimate();
+    NSString *big = FCBigBlockPassOn() ? @" 大块免压" : @"";
     gFCBadgeLabel.text = [NSString stringWithFormat:
-        @"FCv42%@ 规则%lu 内%lu 挡%lu 原%lu 压%lu H5%lu | 点我操作 | %@",
+        @"FCv43%@ 规则%lu 内%lu 挡%lu 原%lu 压%lu 白%.0fpt%@ | 点我操作 | %@",
         gFCPaused ? @"(暂停)" : @"",
         (unsigned long)FCUserRules().count, (unsigned long)gFCBuiltinHits,
         (unsigned long)gFCBlockedUnique, (unsigned long)gFCNativeHits,
-        (unsigned long)zeroNow, (unsigned long)gFCH5Hits, top];
+        (unsigned long)zeroNow, whiteH, big, top];
     gFCBadgeBar.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.55];
 }
 
@@ -3620,7 +3746,7 @@ static void FCShowBadgeMsg(NSString *msg) {
         gFCBadgeCollapsed = NO;
         [gFCBadgeWindow expandBadgeFrame];
     }
-    gFCBadgeLabel.text = [@"FCv42 " stringByAppendingString:msg];
+    gFCBadgeLabel.text = [@"FCv43 " stringByAppendingString:msg];
     gFCBadgeBar.backgroundColor = [[UIColor colorWithRed:0.1 green:0.5 blue:0.2 alpha:0.85] colorWithAlphaComponent:0.85];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.6 * NSEC_PER_SEC)),
                    dispatch_get_main_queue(), ^{ FCUpdateBadge(); });
@@ -3631,7 +3757,7 @@ static void FCShowActionMenu(void) {
     UIViewController *top = FCTopViewController();
     if (!top) top = FCHostTopVC();   // v23：黑屏/异常时 keyWindow 取不到，遍历宿主 window 兜底
     if (!top) { FCShowBadgeMsg(@"无顶层页面"); return; }
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v42"
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"FCAdBlock v43"
                               message:@"选择操作" preferredStyle:UIAlertControllerStyleActionSheet];
     [ac addAction:[UIAlertAction actionWithTitle:@"点选广告元素" style:UIAlertActionStyleDefault
                  handler:^(UIAlertAction *a){ FCPickModeEnter(); }]];
@@ -3649,6 +3775,18 @@ static void FCShowActionMenu(void) {
                          gFCBadgeCollapsed = NO;
                          FCShowBadgeMsg(@"已恢复拦截·规则即刻生效");
                      }
+                     FCUpdateBadge();
+                 }]];
+    // v43：大块免压——压0 只删内容不减高度，压一块 155pt 的运营位就换回 155pt 白。
+    // 打开后高度 >120pt 的运营位整块跳过，页面不再出现大片空白。
+    [ac addAction:[UIAlertAction actionWithTitle:(FCBigBlockPassOn() ? @"关闭「大块免压」" : @"开启「大块免压」(>120pt，不压大位)")
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     BOOL on = !FCBigBlockPassOn();
+                     [[NSUserDefaults standardUserDefaults] setBool:on forKey:FCBigBlockKey];
+                     [[NSUserDefaults standardUserDefaults] synchronize];
+                     FCShowBadgeMsg(on ? @"大块免压已开·>120pt 运营位不再压(需重进页面生效)"
+                                       : @"大块免压已关·恢复全压(需重进页面生效)");
                      FCUpdateBadge();
                  }]];
     [ac addAction:[UIAlertAction actionWithTitle:@"管理规则（查看/编辑/新增）" style:UIAlertActionStyleDefault
@@ -3974,7 +4112,7 @@ static void FCInstallDeepHooks(void) {
 __attribute__((constructor))
 static void FCAdBlockInit(void) {
     @autoreleasepool {
-        FCLog(@"v42 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
+        FCLog(@"v43 载入，Bundle=%@", [[NSBundle mainBundle] bundleIdentifier]);
         gFCAttempts = [NSMapTable weakToStrongObjectsMapTable];
         FCSanitizeRulesOnce();   // v7：启动即清理历史危险 class 规则，救回被误伤的页面
         dispatch_async(dispatch_get_main_queue(), ^{
