@@ -227,7 +227,7 @@ void FCNetClearRecords(void) {
 @property (nonatomic, assign) BOOL fcStopped;   // v52：已 stopLoading，回调里不再打扰 client
 // 这两个方法定义在下面，这里先声明——否则 startLoading 里调用时编译器按 id 处理，
 // applyResponseRules 返回 NSData* 会被当成 id，虽然能编过但类型丢了，容易埋坑。
-- (void)applyRequestRules:(NSDictionary *)rule to:(NSMutableURLRequest *)m note:(FCNetRecord **)noteOut;
+- (void)applyRequestRules:(NSDictionary *)rule to:(NSMutableURLRequest *)m;
 - (NSData *)applyResponseRules:(NSDictionary *)rule data:(NSData *)data
                           resp:(NSURLResponse *)resp rec:(FCNetRecord *)rec;
 @end
@@ -309,7 +309,7 @@ void FCNetClearRecords(void) {
 
     // ③ 应用请求改写后自己发
     NSMutableURLRequest *m = [origin mutableCopy];
-    [self applyRequestRules:rule to:m note:&rec];
+    [self applyRequestRules:rule to:m];
     [NSURLProtocol setProperty:@YES forKey:kFCNetHandled inRequest:m];
 
     NSTimeInterval t0 = CFAbsoluteTimeGetCurrent();
@@ -348,7 +348,7 @@ void FCNetClearRecords(void) {
     if (self.fcTask) [self.fcTask resume];
 }
 
-- (void)applyRequestRules:(NSDictionary *)rule to:(NSMutableURLRequest *)m note:(FCNetRecord **)noteOut {
+- (void)applyRequestRules:(NSDictionary *)rule to:(NSMutableURLRequest *)m {
     if (![rule isKindOfClass:[NSDictionary class]]) return;
     NSDictionary *setH = rule[@"reqHeadersSet"];
     if ([setH isKindOfClass:[NSDictionary class]]) {
@@ -396,7 +396,10 @@ void FCNetClearRecords(void) {
 
 #ifdef FC_DEEP_HOOKS
 
-static NSMutableDictionary<NSString *, NSValue *> *gOrigIMPs = nil;   // Method → 原 IMP
+// v52：键是 NSValue(Method 指针)，不是 NSString——所以这里不能写
+// NSMutableDictionary<NSString *, NSValue *>，那样 objectForKey: 只收 NSString，
+// 传 NSValue 会直接 -Werror 编译失败。
+static NSMutableDictionary *gOrigIMPs = nil;   // NSValue(Method) → NSValue(原 IMP)
 static NSMutableSet *gHookedKeys = nil;
 
 static BOOL FCNetHookMethod(Class cls, SEL sel, IMP tramp, NSUInteger argc) {
