@@ -41,7 +41,6 @@
       "u16:开启网络取证",
       "u16:请求",
       "u16:诊断结束",
-      "u16:H5内元素",
       "u16:压0",
       "u16:空壳压0",
       "u16:源头压0容器",
@@ -83,7 +82,8 @@
       "DynamicLibraries",
       "MSHook",
       "_logos_",
-      "libsubstrate"
+      "libsubstrate",
+      "u16:H5内元素"
     ]
   },
   "FCAdBlock_Deep_v44.dylib": {
@@ -142,7 +142,8 @@
       "DynamicLibraries",
       "MSHook",
       "_logos_",
-      "libsubstrate"
+      "libsubstrate",
+      "u16:H5内元素"
     ]
   }
 }
