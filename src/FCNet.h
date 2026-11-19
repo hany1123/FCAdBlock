@@ -44,6 +44,20 @@ NS_ASSUME_NONNULL_BEGIN
 void FCNetSetEnabled(BOOL on);
 BOOL FCNetEnabled(void);
 
+// v53：采集模式
+//   NO （默认）= 接管模式：接管所有 http(s) API 请求，能拿到请求体/响应头/响应体，也能改写。
+//                代价是请求由我们重发（HTTP/2→1.1、自动跟随重定向、自动解 gzip）。
+//                静态资源（图片/脚本/字体/音视频）不接管，避免拖慢首屏。
+//   YES        = 安全模式：完全不接管，一条都不记录，App 网络行为零影响。
+//                这是「接管导致某个 App 出错」时的应急逃生口。
+// 上一版「面板没有记录」的根因是采集被绑在「命中规则才接管」上，这个开关是配套逃生口。
+BOOL FCNetListenOnly(void);
+void FCNetSetListenOnly(BOOL on);
+
+// 统计（面板顶部显示，用来区分「没开」「开了没抓到」「抓到了」）
+NSUInteger FCNetHandledCount(void);      // 累计接管并采集的请求数
+NSUInteger FCNetStaticSkipCount(void);   // 累计因静态资源而跳过的请求数
+
 // 采集记录（最近 N 条，环形）
 NSArray<FCNetRecord *> *FCNetRecords(void);
 NSUInteger FCNetRecordCount(void);

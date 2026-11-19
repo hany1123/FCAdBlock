@@ -33,6 +33,16 @@ static NSObject *FCNetLock(void) {
 static NSString * const kFCNetEnabledKey = @"FCNetEnabled_v1";
 static NSString * const kFCNetRulesKey   = @"FCNetRules_v1";
 static NSString * const kFCNetHandled    = @"FCNetHandled";      // request 标记，防递归
+static NSString * const kFCNetListenKey  = @"FCNetListenOnly_v1";// v53：安全模式（只旁听）
+
+// v53：两个计数——面板上直接显示，用来区分「没开」「开了没抓到」「抓到了」
+static NSUInteger gNetHandledCount = 0;      // 累计接管采集
+static NSUInteger gNetStaticSkip   = 0;      // 累计跳过（静态资源）
+static BOOL gNetListenOnly = NO;
+
+#ifdef FC_DEEP_HOOKS
+static void FCNetInstallHooks(void);   // 定义在下方，这里先声明（SetEnabled 里要用）
+#endif
 
 static const NSUInteger kMaxRecords   = 100;
 static const NSUInteger kMaxBodyBytes = 256 * 1024;
@@ -67,10 +77,90 @@ static NSDictionary<NSString *, NSString *> *FCNetHeaders(NSDictionary *raw) {
     return out;
 }
 
+// v53：静态资源判定——图片/脚本/字体/音视频不接管。
+// 接管意味着「我们自己重发一次」，对几百 KB 的图片纯属浪费，还会拖慢首屏。
+// 老大真正要看的是 API 接口的 body，静态资源跳过不影响使用。
+static BOOL FCNetIsStaticResource(NSString *url) {
+    if (!url.length) return NO;
+    NSString *p = url.lowercaseString;
+    NSRange q = [p rangeOfString:@"?"];
+    if (q.location != NSNotFound) p = [p substringToIndex:q.location];
+    static NSArray<NSString *> *exts = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ exts = @[
+        @".png", @".jpg", @".jpeg", @".gif", @".webp", @".svg", @".ico", @".heic", @".avif",
+        @".css", @".js", @".map",
+        @".woff", @".woff2", @".ttf", @".otf",
+        @".mp4", @".mp3", @".m4a", @".aac", @".wav",
+        @".zip", @".7z", @".apk", @".ipa",
+    ]; });
+    for (NSString *e in exts) if ([p hasSuffix:e]) return YES;
+    return NO;
+}
+
+// v53：把请求体读出来。很多 App 用 HTTPBodyStream 提交 POST（尤其大 body），
+// 这时 HTTPBody 是 nil——直接重发会把 body 丢掉，App 侧表现为「提交失败/参数丢了」。
+// stream 只能顺序读一次，读完要设回 HTTPBody 并把 stream 清掉。
+static NSData *FCNetBodyOfRequest(NSURLRequest *req) {
+    if (!req) return nil;
+    if (req.HTTPBody.length) return req.HTTPBody;
+    NSInputStream *st = req.HTTPBodyStream;
+    if (!st) return nil;
+    [st open];
+    NSMutableData *buf = [NSMutableData data];
+    uint8_t tmp[8192];
+    NSInteger n = 0;
+    while ((n = [st read:tmp maxLength:sizeof(tmp)]) > 0) {
+        [buf appendBytes:tmp length:(NSUInteger)n];
+        if (buf.length > kMaxBodyBytes * 4) break;   // 上限保护，别为超大上传把内存吃爆
+    }
+    [st close];
+    return buf.length ? buf : nil;
+}
+
+// v53：净化响应头。我们重发请求用的是 NSURLSession，它会自动 gzip 解压并剥离分块，
+// 所以我们拿到的 data 是「已解压」的；但原响应头里还写着 Content-Encoding: gzip
+// 和原始的 Content-Length —— 原样回给 App，App 会去解压一段已经解压过的数据 → 解析失败。
+// 这是接管模式最隐蔽的一个坑：不改的话表现为「一开抓包，App 里页面全白」。
+static NSHTTPURLResponse *FCNetSanitizedResponse(NSHTTPURLResponse *hr, NSUInteger bodyLen) {
+    if (!hr) return nil;
+    NSMutableDictionary *h = [NSMutableDictionary dictionaryWithDictionary:[hr allHeaderFields] ?: @{}];
+    [h removeObjectForKey:@"Content-Encoding"];
+    [h removeObjectForKey:@"content-encoding"];
+    [h removeObjectForKey:@"Content-Length"];
+    [h removeObjectForKey:@"content-length"];
+    [h setObject:[NSString stringWithFormat:@"%lu", (unsigned long)bodyLen]
+          forKey:@"Content-Length"];
+    NSHTTPURLResponse *out = [[NSHTTPURLResponse alloc] initWithURL:hr.URL
+                                                        statusCode:hr.statusCode
+                                                       HTTPVersion:@"HTTP/1.1"
+                                                      headerFields:h];
+    return out ?: hr;
+}
+
+// v53：去重——同一个请求会被两条路各记一次（NSURLProtocol 的「协议」+ Deep 档
+// URLSession hook 的「会话」），不去重的话老大看到的是每条请求两行、以为抓重了。
+// 判据：method+url 相同、时间差 2 秒内、且**来源不同** → 视为同一次请求。
+// 来源相同不去重（那是 App 真的重复请求，比如轮询，必须如实显示）。
+static BOOL FCNetIsCrossSourceDup(FCNetRecord *rec) {
+    if (!rec.url.length) return NO;
+    NSTimeInterval now = rec.date.timeIntervalSince1970;
+    for (NSInteger i = (NSInteger)gRecords.count - 1; i >= 0; i--) {
+        FCNetRecord *e = gRecords[(NSUInteger)i];
+        if (fabs(now - e.date.timeIntervalSince1970) >= 2.0) break;   // 从尾部往前，超出窗口就停
+        if (![e.method isEqualToString:rec.method ?: @""]) continue;
+        if (![e.url isEqualToString:rec.url]) continue;
+        if ([e.source isEqualToString:rec.source ?: @""]) continue;
+        return YES;
+    }
+    return NO;
+}
+
 static void FCNetPushRecord(FCNetRecord *rec) {
     if (!rec) return;
     @synchronized (FCNetLock()) {
         if (!gRecords) gRecords = [NSMutableArray array];
+        if (FCNetIsCrossSourceDup(rec)) return;   // v53：跨来源重复，丢弃
         rec.rid = ++gNetRid;
         [gRecords addObject:rec];
         if (gRecords.count > kMaxRecords)
@@ -195,17 +285,42 @@ void FCNetSetEnabled(BOOL on) {
     [[NSUserDefaults standardUserDefaults] synchronize];
     if (on) {
         if (!gRecords) gRecords = [NSMutableArray array];
-        // NSURLProtocol 注册是合法 API（不是 hook），Pure 档也能用
+        // NSURLProtocol 注册是合法 API（不是 hook），Pure 档也能用。
+        // v53：不再只在「开」的时候注册——注册本身无副作用（canInit 里看 gNetOn），
+        // 总是注册可以避免「先开面板再点开关」的时序问题。
         static dispatch_once_t once;
         dispatch_once(&once, ^{
-            [NSURLProtocol registerClass:NSClassFromString(@"FCNetProtocol")];
+            Class proto = NSClassFromString(@"FCNetProtocol");
+            if (proto) [NSURLProtocol registerClass:proto];
+            NSLog(@"[FCAdBlock] 网络采集：NSURLProtocol 注册 %@", proto ? @"成功" : @"失败(类不存在)");
         });
+#ifdef FC_DEEP_HOOKS
+        // v53 关键修复：上一版只在 FCNetBootstrap 里装 hook，而 Bootstrap 在采集关闭时
+        // 直接 return 了 —— 结果「先启动 App、再点开采集」时 hook 从来没装过，
+        // Deep 档也只能靠 NSURLProtocol，走 delegate 的请求一条都看不到。
+        static dispatch_once_t onceHook;
+        dispatch_once(&onceHook, ^{ FCNetInstallHooks(); });
+#endif
     } else {
         // 关掉采集不清记录——老大可能只是想停一下再看
     }
 }
 
 BOOL FCNetEnabled(void) { return gNetOn; }
+
+BOOL FCNetListenOnly(void) { return gNetListenOnly; }
+void FCNetSetListenOnly(BOOL on) {
+    gNetListenOnly = on;
+    [[NSUserDefaults standardUserDefaults] setBool:on forKey:kFCNetListenKey];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+NSUInteger FCNetHandledCount(void) {
+    @synchronized (FCNetLock()) { return gNetHandledCount; }
+}
+NSUInteger FCNetStaticSkipCount(void) {
+    @synchronized (FCNetLock()) { return gNetStaticSkip; }
+}
 
 NSArray<FCNetRecord *> *FCNetRecords(void) {
     @synchronized (FCNetLock()) { return gRecords ? [gRecords copy] : @[]; }
@@ -241,8 +356,26 @@ void FCNetClearRecords(void) {
     if (![scheme isEqualToString:@"http"] && ![scheme isEqualToString:@"https"]) return NO;
     // 防递归：我们自己发出去的请求带着这个标记
     if ([NSURLProtocol propertyForKey:kFCNetHandled inRequest:request]) return NO;
-    if (request.URL.absoluteString.length > 4000) return NO;
-    return FCNetRuleForRequest(request) != nil;   // 只有需要改写才接管
+    NSString *url = request.URL.absoluteString;
+    if (url.length > 4000) return NO;
+
+    // ① 命中改写规则 → 必须接管，否则改不了
+    if (FCNetRuleForRequest(request)) return YES;
+
+    // ② 安全模式（应急逃生）：不接管、不采集，完全放行
+    if (gNetListenOnly) return NO;
+
+    // ③ 静态资源跳过：图片/脚本/字体/音视频接管等于白重发一遍，拖慢首屏
+    if (FCNetIsStaticResource(url)) {
+        __sync_fetch_and_add(&gNetStaticSkip, 1);
+        return NO;
+    }
+
+    // ④ 其余一律接管 —— 这才是「采集」的本体。
+    //    v52 这里写的是 `return FCNetRuleForRequest(request) != nil;`，
+    //    等于「没建改写规则就一条都不记」→ 老大看到的面板永远是空的。
+    //    采集和改写是两件事：采集无条件做，改写才看规则。
+    return YES;
 }
 
 + (NSURLRequest *)canonicalRequestForRequest:(NSURLRequest *)request { return request; }
@@ -257,6 +390,8 @@ void FCNetClearRecords(void) {
 - (void)startLoading {
     NSURLRequest *origin = self.request;
     NSDictionary *rule = FCNetRuleForRequest(origin);
+    @synchronized (FCNetLock()) { gNetHandledCount++; }   // v53：接管计数，面板上能看见
+
     FCNetRecord *rec = [FCNetRecord new];
     rec.date = [NSDate date];
     rec.method = origin.HTTPMethod.length ? origin.HTTPMethod.uppercaseString : @"GET";
@@ -264,7 +399,10 @@ void FCNetClearRecords(void) {
     rec.host = origin.URL.host;
     rec.path = origin.URL.path.length ? origin.URL.path : @"/";
     rec.reqHeaders = FCNetHeaders([origin allHTTPHeaderFields]);
-    rec.reqBody = FCNetClip(origin.HTTPBody);
+    // v53：HTTPBodyStream 形式的 POST 也要读出来。很多 App 提交 JSON/表单走 stream，
+    // 这时 HTTPBody 是 nil——记录里没有 body，下面重发还会把 body 丢掉（App 表现为提交失败）。
+    NSData *reqBody = FCNetBodyOfRequest(origin);
+    rec.reqBody = FCNetClip(reqBody);
     rec.source = @"协议";
     // v52：name 可能被存成非字符串（早期版本/手改配置），直接当 NSString 用会崩
     NSString *rname = [rule[@"name"] isKindOfClass:[NSString class]] ? rule[@"name"] : nil;
@@ -310,6 +448,14 @@ void FCNetClearRecords(void) {
     // ③ 应用请求改写后自己发
     NSMutableURLRequest *m = [origin mutableCopy];
     [self applyRequestRules:rule to:m];
+    // v53：原请求是 HTTPBodyStream 时，mutableCopy 出来的 m 里 HTTPBody 仍是 nil，
+    // 直接重发 = body 丢了。把读出来的 body 塞回去，并清掉 stream。
+    if (!m.HTTPBody.length && reqBody.length) {
+        m.HTTPBody = reqBody;
+        m.HTTPBodyStream = nil;
+        [m setValue:[NSString stringWithFormat:@"%lu", (unsigned long)reqBody.length]
+            forHTTPHeaderField:@"Content-Length"];
+    }
     [NSURLProtocol setProperty:@YES forKey:kFCNetHandled inRequest:m];
 
     NSTimeInterval t0 = CFAbsoluteTimeGetCurrent();
@@ -327,6 +473,14 @@ void FCNetClearRecords(void) {
                 NSHTTPURLResponse *hr = (NSHTTPURLResponse *)resp;
                 rec.status = hr.statusCode;
                 rec.respHeaders = FCNetHeaders([hr allHeaderFields]);
+                // 记录里保留的是服务器原始头（更真实）；但 sharedSession 已自动解压 gzip，
+                // 标注一下，免得老大看到 Content-Encoding: gzip 却看到明文 body 而困惑
+                NSDictionary *oh = [hr allHeaderFields];
+                if (oh[@"Content-Encoding"] || oh[@"content-encoding"]) {
+                    rec.note = rec.note.length
+                        ? [rec.note stringByAppendingString:@" / 响应体已解压(gzip)"]
+                        : @"响应体已解压(gzip)";
+                }
             }
             NSData *finalData = data;
             // ④ 响应改写（在回给 App 之前）
@@ -340,8 +494,18 @@ void FCNetClearRecords(void) {
                 [self_.client URLProtocol:self_ didFailWithError:err];
                 return;
             }
-            if (resp) [self_.client URLProtocol:self_ didReceiveResponse:resp
-                             cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            if (resp) {
+                // v53：净化响应头。finalData 已经被系统解压、去掉分块，
+                // 原头里的 Content-Encoding: gzip 与原始 Content-Length 若原样回给 App，
+                // App 会去解压一段已经解压过的数据 → 解析失败。
+                // 真机表现就是「一开抓包，App 里接口全挂、页面空白」，非常隐蔽。
+                NSURLResponse *outResp = resp;
+                if ([resp isKindOfClass:[NSHTTPURLResponse class]]) {
+                    outResp = FCNetSanitizedResponse((NSHTTPURLResponse *)resp, finalData.length);
+                }
+                [self_.client URLProtocol:self_ didReceiveResponse:outResp
+                       cacheStoragePolicy:NSURLCacheStorageNotAllowed];
+            }
             if (finalData.length) [self_.client URLProtocol:self_ didLoadData:finalData];
             [self_.client URLProtocolDidFinishLoading:self_];
         }];
@@ -442,6 +606,10 @@ static NSURLSessionDataTask *FCHookDataTaskCH(id self, SEL _cmd, NSURLRequest *r
     if (FCNetRuleForRequest(req)) {
         return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(self, _cmd, req, completion);
     }
+    // v53：静态资源不记（图片/脚本会挤爆 100 条环形，把真正的 API 顶掉）
+    if (FCNetIsStaticResource(req.URL.absoluteString)) {
+        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *, id))orig)(self, _cmd, req, completion);
+    }
     NSString *method = req.HTTPMethod.length ? req.HTTPMethod.uppercaseString : @"GET";
     NSTimeInterval t0 = CFAbsoluteTimeGetCurrent();
     void (^wrapped)(NSData *, NSURLResponse *, NSError *) = ^(NSData *d, NSURLResponse *r, NSError *e) {
@@ -476,8 +644,14 @@ static NSURLSessionDataTask *FCHookDataTask(id self, SEL _cmd, NSURLRequest *req
         // 同上：交给 NSURLProtocol 接管，不打标记
         return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))orig)(self, _cmd, req);
     }
+    // v53：静态资源不记
+    if (FCNetIsStaticResource(req.URL.absoluteString)) {
+        return ((NSURLSessionDataTask *(*)(id, SEL, NSURLRequest *))orig)(self, _cmd, req);
+    }
     // 走 delegate 的请求：这里只能记下请求侧，响应体靠 NSURLProtocol 旁听补不齐，
     // 所以在记录里明确标注「仅请求」，避免老大以为响应体是空的。
+    // 注意：这里**不能**用 FCNetBodyOfRequest 读 HTTPBodyStream——stream 只能读一次，
+    // 读完下面 orig 调用就拿到空 body，等于把 App 的请求弄坏了。只取 HTTPBody。
     FCNetRecord *rec = [FCNetRecord new];
     rec.date = [NSDate date];
     rec.method = req.HTTPMethod.length ? req.HTTPMethod.uppercaseString : @"GET";
@@ -493,12 +667,16 @@ static NSURLSessionDataTask *FCHookDataTask(id self, SEL _cmd, NSURLRequest *req
 }
 
 static void FCNetInstallHooks(void) {
-    Class sess = [NSURLSession class];
-    BOOL a = FCNetHookMethod(sess, @selector(dataTaskWithRequest:completionHandler:),
-                             (IMP)FCHookDataTaskCH, 4);
-    BOOL b = FCNetHookMethod(sess, @selector(dataTaskWithRequest:), (IMP)FCHookDataTask, 3);
-    NSLog(@"[FCAdBlock] 网络采集hook：completion=%@ 纯task=%@",
-          a ? @"装" : @"无", b ? @"装" : @"无");
+    // v53：Bootstrap 与「打开采集」两处都会调，用 once 保证只装一次（否则日志刷两遍）
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        Class sess = [NSURLSession class];
+        BOOL a = FCNetHookMethod(sess, @selector(dataTaskWithRequest:completionHandler:),
+                                 (IMP)FCHookDataTaskCH, 4);
+        BOOL b = FCNetHookMethod(sess, @selector(dataTaskWithRequest:), (IMP)FCHookDataTask, 3);
+        NSLog(@"[FCAdBlock] 网络采集hook：completion=%@ 纯task=%@",
+              a ? @"装" : @"无", b ? @"装" : @"无");
+    });
 }
 
 #endif  // FC_DEEP_HOOKS
@@ -507,14 +685,21 @@ static void FCNetInstallHooks(void) {
 
 void FCNetBootstrap(void) {
     gNetOn = [[NSUserDefaults standardUserDefaults] boolForKey:kFCNetEnabledKey];
-    if (!gNetOn) return;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        [NSURLProtocol registerClass:NSClassFromString(@"FCNetProtocol")];
-    });
+    gNetListenOnly = [[NSUserDefaults standardUserDefaults] boolForKey:kFCNetListenKey];
+
+    // v53：注册与装 hook 都**无条件**做。
+    // v52 在这里 `if (!gNetOn) return;`，结果「先启动 App、再进面板点开采集」时
+    // hook 一次都没装过，Deep 档也只能靠 NSURLProtocol，走 delegate 的请求全看不到。
+    // 注册/装 hook 本身没有副作用（真正的门在 canInitWithRequest: 与 gNetOn 判断里），
+    // 所以启动时装好，之后开开关就是立即生效。
+    Class proto = NSClassFromString(@"FCNetProtocol");
+    if (proto) [NSURLProtocol registerClass:proto];
+    NSLog(@"[FCAdBlock] 网络模块 Bootstrap：采集=%@ 模式=%@ 协议注册=%@",
+          gNetOn ? @"开" : @"关",
+          gNetListenOnly ? @"安全(不接管)" : @"接管(采集全量)",
+          proto ? @"成功" : @"失败(类不存在)");
 #ifdef FC_DEEP_HOOKS
-    static dispatch_once_t once2;
-    dispatch_once(&once2, ^{ FCNetInstallHooks(); });
+    FCNetInstallHooks();
 #endif
 }
 

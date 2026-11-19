@@ -119,6 +119,8 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 @property (nonatomic, strong) UITableView *table;
 @property (nonatomic, strong) UISearchBar *search;
 @property (nonatomic, strong) UIButton *toggleBtn;
+@property (nonatomic, strong) UILabel *statusLabel;    // v53：接管/记录/跳过 计数
+@property (nonatomic, strong) UILabel *emptyLabel;     // v53：空状态说明
 @property (nonatomic, strong) UITextView *detail;
 @property (nonatomic, strong) UIView *detailBar;
 @property (nonatomic, strong) NSArray<FCNetRecord *> *rows;
@@ -137,6 +139,8 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
 - (void)fcCopyOne;
 - (void)fcToggle;
 - (void)syncToggleTitle;
+- (void)refreshStatus;
+- (void)fcMode;
 - (void)fcAddRuleStep1;
 - (void)fcAddRuleStep2:(NSString *)pattern;
 - (void)fcMockRule:(NSString *)pattern;
@@ -170,9 +174,9 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
         [b addTarget:self action:act forControlEvents:UIControlEventTouchUpInside];
         return b;
     };
-    NSArray *titles = @[@"关闭", @"清空", @"规则", @"复制"];
-    NSArray *sels = @[@"fcClose", @"fcClear", @"fcRules", @"fcCopyAll"];
-    CGFloat bw = (w - 16 - 3 * 6) / 4.0;
+    NSArray *titles = @[@"关闭", @"清空", @"规则", @"复制", @"模式"];
+    NSArray *sels = @[@"fcClose", @"fcClear", @"fcRules", @"fcCopyAll", @"fcMode"];
+    CGFloat bw = (w - 16 - 4 * 6) / 5.0;
     for (NSUInteger i = 0; i < titles.count; i++) {
         UIButton *b = mk(titles[i], NSSelectorFromString(sels[i]));
         b.frame = CGRectMake(x, 7, bw, 26);
@@ -188,14 +192,21 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     [self.view addSubview:self.toggleBtn];
     [self syncToggleTitle];
 
+    // v53：状态行——上一版面板什么都没显示，老大只能说「没有记录」，
+    // 分不清是「没开采集」「开了但一条没抓到」还是「抓到了但列表是空的」。
+    self.statusLabel = [[UILabel alloc] initWithFrame:CGRectMake(10, top + 68, w - 20, 14)];
+    self.statusLabel.font = [UIFont systemFontOfSize:10];
+    self.statusLabel.textColor = [UIColor colorWithRed:0.42 green:0.45 blue:0.5 alpha:1];
+    [self.view addSubview:self.statusLabel];
+
     // 搜索框
-    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, top + 72, w, 36)];
+    self.search = [[UISearchBar alloc] initWithFrame:CGRectMake(0, top + 86, w, 36)];
     self.search.placeholder = @"过滤：方法 / 域名 / 路径 / 状态码";
     self.search.delegate = self;
     self.search.backgroundImage = [[UIImage alloc] init];
     [self.view addSubview:self.search];
 
-    CGFloat listTop = top + 112;
+    CGFloat listTop = top + 126;   // v53：多了一行状态，列表相应下移
     self.table = [[UITableView alloc] initWithFrame:CGRectMake(0, listTop, w, self.view.bounds.size.height - listTop)
                                               style:UITableViewStylePlain];
     self.table.dataSource = self;
@@ -203,6 +214,22 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.table.rowHeight = 48;
     self.table.separatorInset = UIEdgeInsetsMake(0, 12, 0, 12);
     [self.view addSubview:self.table];
+
+    // v53：空状态说明——列表为空时告诉老大「为什么空、该做什么」，
+    // 而不是让他面对一个白板猜。
+    self.emptyLabel = [[UILabel alloc] initWithFrame:CGRectMake(24, listTop + 40, w - 48, 160)];
+    self.emptyLabel.numberOfLines = 0;
+    self.emptyLabel.textAlignment = NSTextAlignmentCenter;
+    self.emptyLabel.font = [UIFont systemFontOfSize:12];
+    self.emptyLabel.textColor = [UIColor colorWithRed:0.55 green:0.57 blue:0.62 alpha:1];
+    self.emptyLabel.text =
+        @"还没有记录\n\n"
+        @"① 确认上面按钮显示「采集：开」\n"
+        @"② 回到 App 里点几下、下拉刷新，制造网络请求\n"
+        @"③ 图片/脚本/字体等静态资源不记录（只看 API 接口）\n\n"
+        @"若已产生请求仍无记录，点「模式」看是否处于安全模式。";
+    self.emptyLabel.hidden = YES;
+    [self.view addSubview:self.emptyLabel];
 
     // 详情层（默认隐藏）
     self.detailBar = [[UIView alloc] initWithFrame:CGRectMake(0, top, w, 40)];
@@ -253,6 +280,30 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
         self.rows = all;
     }
     [self.table reloadData];
+    [self refreshStatus];
+    // v53：空状态只在「没有过滤条件 + 确实没记录」时出现，
+    // 搜索无结果时不要误导成「没抓到」。
+    BOOL showEmpty = (self.rows.count == 0);
+    self.emptyLabel.hidden = !showEmpty;
+    if (showEmpty && !self.detail.hidden) self.emptyLabel.hidden = YES;
+}
+
+// v53：状态行。四个数字分别对应「有没有在干活」的四个环节，
+// 老大截图一眼就能看出卡在哪一环：
+//   接管 0        → 采集没开，或 App 还没发出 http(s) 请求
+//   接管 >0 记录 0 → 接管了但记录被去重/裁剪，或面板刷新没触发
+//   跳过静态 >0    → 确实在跑，只是这条是图片/脚注
+- (void)refreshStatus {
+    NSString *mode = @"采集已关";
+    if (FCNetEnabled()) {
+        mode = FCNetListenOnly() ? @"安全模式（不接管）" : @"接管采集中";
+    }
+    self.statusLabel.text = [NSString stringWithFormat:
+        @"%@ · 接管 %lu · 记录 %lu · 跳过静态 %lu",
+        mode,
+        (unsigned long)FCNetHandledCount(),
+        (unsigned long)FCNetRecordCount(),
+        (unsigned long)FCNetStaticSkipCount()];
 }
 
 #pragma mark 动作
@@ -268,6 +319,37 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     FCNetSetEnabled(!FCNetEnabled());
     [self syncToggleTitle];
     [self reloadRows];
+}
+
+// v53：采集模式切换
+- (void)fcMode {
+    BOOL listen = FCNetListenOnly();
+    UIAlertController *ac = [UIAlertController
+        alertControllerWithTitle:@"采集模式"
+        message:(listen
+            ? @"当前：安全模式（不接管）。一条都不会记录，App 完全不受影响。"
+            : @"当前：接管模式。能看到完整请求/响应，也能改写与阻断。")
+        preferredStyle:UIAlertControllerStyleActionSheet];
+    [ac addAction:[UIAlertAction actionWithTitle:@"接管模式（采集全量·可改写）"
+                 style:UIAlertActionStyleDefault
+                 handler:^(UIAlertAction *a){
+                     FCNetSetListenOnly(NO);
+                     [self reloadRows];
+                     [self toast:@"已切到接管模式"];
+                 }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"安全模式（完全不接管·零风险）"
+                 style:UIAlertActionStyleDestructive
+                 handler:^(UIAlertAction *a){
+                     FCNetSetListenOnly(YES);
+                     [self reloadRows];
+                     [self toast:@"已切到安全模式·不再记录"];
+                 }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    if (ac.popoverPresentationController) {
+        ac.popoverPresentationController.sourceView = self.view;
+        ac.popoverPresentationController.sourceRect = CGRectMake(self.view.bounds.size.width / 2, 60, 1, 1);
+    }
+    [self fcPresent:ac];
 }
 
 - (void)fcCopyAll {
@@ -292,8 +374,10 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.table.hidden = NO;
     self.search.hidden = NO;
     self.toggleBtn.hidden = NO;
+    self.statusLabel.hidden = NO;
     self.detail.text = nil;
     self.currentDetailRecord = nil;
+    [self reloadRows];   // v53：回来时重算空状态与计数
 }
 
 - (void)toast:(NSString *)msg {
@@ -514,6 +598,8 @@ static NSString *FCNetDetailText(FCNetRecord *r) {
     self.table.hidden = YES;
     self.search.hidden = YES;
     self.toggleBtn.hidden = YES;
+    self.statusLabel.hidden = YES;   // v53：详情层全屏覆盖，状态行先收起
+    self.emptyLabel.hidden = YES;
 }
 
 @end
